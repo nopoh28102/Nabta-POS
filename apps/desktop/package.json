@@ -1,6 +1,6 @@
 {
   "name": "@nabta/desktop",
-  "version": "0.1.49",
+  "version": "0.1.50",
   "private": true,
   "description": "نبتة — تطبيق نقاط بيع عربي محلي",
   "author": "Nabta POS",
@@ -14,8 +14,8 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.electron.json && esbuild src/electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist-electron/preload.cjs && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
-    "package:win": "node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish never",
-    "release:win": "node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish always"
+    "package:win": "pnpm --filter @nabta/server... build && node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish never",
+    "release:win": "pnpm --filter @nabta/server... build && node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish always"
   },
   "dependencies": {
     "@nabta/contracts": "workspace:*",
