@@ -1,4 +1,4 @@
-name: إصدار ويندوز
+name: إصدار ويندوز — SignPath Foundation
 
 on:
   push:
@@ -7,13 +7,39 @@ on:
 
 permissions:
   contents: write
+  actions: read
+
+concurrency:
+  group: signpath-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release-windows:
     runs-on: windows-latest
+    timeout-minutes: 300
     steps:
       - name: جلب المصدر
         uses: actions/checkout@v4
+
+      - name: تحقق من الإعدادات ونسخة الوسم
+        id: version
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_APP_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
+        run: |
+          foreach ($key in @("SIGNPATH_API_TOKEN", "SIGNPATH_ORGANIZATION_ID", "SIGNPATH_PROJECT_SLUG", "SIGNPATH_SIGNING_POLICY_SLUG", "SIGNPATH_APP_ARTIFACT_CONFIGURATION_SLUG", "SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG")) {
+            if (-not [Environment]::GetEnvironmentVariable($key)) { throw "Missing GitHub Actions SignPath configuration: $key" }
+          }
+          $version = (Get-Content apps/desktop/package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag must match desktop package version: expected v$version, received $env:GITHUB_REF_NAME"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: إعداد Node.js
         uses: actions/setup-node@v4
@@ -28,10 +54,144 @@ jobs:
       - name: تثبيت الاعتمادات
         run: pnpm install --frozen-lockfile
 
-      - name: اختبارات البناء
+      - name: اختبارات TypeScript
         run: pnpm typecheck
 
-      - name: إنشاء ونشر الإصدار
-        run: pnpm --filter @nabta/desktop release:win
+      - name: اختبار سلامة بيانات التحديث الموقّع
+        run: node --test tests/signpath-release.test.mjs
+
+      - name: بناء التطبيق والخادم المحلي
+        shell: pwsh
+        run: |
+          pnpm --filter @nabta/server... build
+          if ($LASTEXITCODE -ne 0) { throw "Server build failed" }
+          node scripts/generate-icon-assets.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Icon generation failed" }
+          pnpm --filter @nabta/desktop build
+          if ($LASTEXITCODE -ne 0) { throw "Desktop build failed" }
+          node scripts/prepare-server-runtime.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Embedded server preparation failed" }
+
+      - name: تجهيز نسخة التطبيق غير المعبأة في NSIS
+        run: pnpm --filter @nabta/desktop exec electron-builder --win --x64 --dir --publish never
+
+      - name: تحديد ناشر تحديثات ويندوز
+        shell: pwsh
+        run: |
+          node scripts/windows/prepare-signpath-app-update.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Failed to set updater publisher" }
+          if (-not (Test-Path "apps/desktop/release/win-unpacked/نبتة.exe")) {
+            throw "Expected app executable نبتة.exe; inspect electron-builder output and SignPath XML before releasing"
+          }
+
+      - name: رفع التطبيق غير الموقّع إلى SignPath
+        id: upload-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: nabta-app-unsigned
+          path: apps/desktop/release/win-unpacked/نبتة.exe
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: توقيع ملف التطبيق (يتطلب الموافقة اليدوية)
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_APP_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-app.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parameters: |
+            version: ${{ toJSON(steps.version.outputs.version) }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signpath-app
+
+      - name: إدراج التطبيق الموقّع والتحقق منه
+        shell: pwsh
+        run: |
+          $source = "signpath-app/نبتة.exe"
+          $destination = "apps/desktop/release/win-unpacked/نبتة.exe"
+          if (-not (Test-Path $source)) { throw "SignPath did not return the signed app EXE" }
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+          $signature = Get-AuthenticodeSignature -LiteralPath $destination
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "SignPath Foundation") {
+            throw "Application EXE must have a valid SignPath Foundation Authenticode signature"
+          }
+
+      - name: إنشاء مثبّت NSIS من التطبيق الموقّع
+        shell: pwsh
+        run: |
+          pnpm --filter @nabta/desktop exec electron-builder --win nsis --x64 --prepackaged ./release/win-unpacked --publish never -c.nsis.differentialPackage=false
+          if ($LASTEXITCODE -ne 0) { throw "NSIS packaging failed" }
+
+      - name: تحديد ملف التثبيت والتحقق منه
+        id: installer
+        shell: pwsh
+        env:
+          NABTA_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $file = "Nabta-POS-$($env:NABTA_VERSION)-x64.exe"
+          $path = "apps/desktop/release/$file"
+          if (-not (Test-Path $path)) { throw "Expected installer not found: $path" }
+          "filename=$file" >> $env:GITHUB_OUTPUT
+          "path=$path" >> $env:GITHUB_OUTPUT
+          if (-not (Test-Path "apps/desktop/release/latest.yml")) { throw "latest.yml is missing" }
+
+      - name: رفع مثبّت NSIS إلى SignPath
+        id: upload-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: nabta-installer-unsigned
+          path: ${{ steps.installer.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: توقيع مثبّت NSIS (يتطلب الموافقة اليدوية)
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_INSTALLER_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-installer.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parameters: |
+            version: ${{ toJSON(steps.version.outputs.version) }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signpath-installer
+
+      - name: اعتماد ملف التثبيت الموقّع وتحديث بصمته
+        shell: pwsh
+        env:
+          INSTALLER_FILENAME: ${{ steps.installer.outputs.filename }}
+        run: |
+          $source = Join-Path "signpath-installer" $env:INSTALLER_FILENAME
+          $destination = Join-Path "apps/desktop/release" $env:INSTALLER_FILENAME
+          if (-not (Test-Path $source)) { throw "SignPath did not return the signed NSIS installer" }
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+          $signature = Get-AuthenticodeSignature -LiteralPath $destination
+          if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "SignPath Foundation") {
+            throw "Installer must have a valid SignPath Foundation Authenticode signature"
+          }
+          $appSignature = Get-AuthenticodeSignature -LiteralPath "apps/desktop/release/win-unpacked/نبتة.exe"
+          if ($appSignature.Status -ne "Valid") { throw "Packed application signature is missing" }
+          node scripts/windows/finalize-signpath-release.mjs $destination "apps/desktop/release/latest.yml"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot safely publish invalid updater metadata" }
+
+      - name: نشر ملف EXE الموقّع و latest.yml معًا
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALLER_FILENAME: ${{ steps.installer.outputs.filename }}
+          NABTA_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = Join-Path "apps/desktop/release" $env:INSTALLER_FILENAME
+          $manifest = "apps/desktop/release/latest.yml"
+          $notes = "Signed Windows installer. Free code signing provided by SignPath.io, certificate by SignPath Foundation. Code signing policy: https://github.com/nopoh28102/Nabta-POS/blob/main/CODE_SIGNING_POLICY.md"
+          gh release create "$env:GITHUB_REF_NAME" "$installer" "$manifest" --verify-tag --title "Nabta POS $env:NABTA_VERSION" --notes "$notes"
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publishing failed" }
