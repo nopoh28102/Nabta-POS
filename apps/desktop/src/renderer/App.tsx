@@ -1048,13 +1048,21 @@ function PosScreen({
     () => ["الكل", ...new Set(products.map((product) => product.category))],
     [products],
   );
-  const visible = products.filter(
-    (product) =>
-      (category === "الكل" || product.category === category) &&
-      (!query ||
-        [product.nameAr, ...product.barcodes].some((value) =>
-          value.includes(query),
-        )),
+  // A cashier can scan and edit the cart while the local catalog contains
+  // thousands of items.  Filtering belongs only to catalog inputs; without
+  // this memo the same full scan runs again for every cart, payment and modal
+  // state update, which makes the register feel sluggish.
+  const visible = useMemo(
+    () =>
+      products.filter(
+        (product) =>
+          (category === "الكل" || product.category === category) &&
+          (!query ||
+            [product.nameAr, ...product.barcodes].some((value) =>
+              value.includes(query),
+            )),
+      ),
+    [category, products, query],
   );
   const catalogPageCount = Math.max(
     1,

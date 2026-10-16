@@ -258,16 +258,25 @@ export async function importBackup(db: Database, config: AppConfig, requestedBy:
  * It never touches the live data directory; replacing live data remains an offline owner operation. */
 export async function verifyBackupRestore(db: Database, _config: AppConfig, backupId: string): Promise<{ verified: true; schemaVersion: string }> {
   if (db.kind !== "embedded") throw new ApiError(422, "RESTORE_VERIFY_UNSUPPORTED", "اختبار الاستعادة التلقائي متاح لقاعدة نبتة المحلية فقط");
-  const record = await db.query<{ path: string }>("SELECT path FROM backup_runs WHERE id = $1", [backupId]);
+  const record = await db.query<{ path: string; sha256: string | null }>("SELECT path, sha256 FROM backup_runs WHERE id = $1", [backupId]);
   if (!record.rows[0]) throw new ApiError(404, "BACKUP_NOT_FOUND", "النسخة الاحتياطية غير موجودة في السجل");
   const archivePath = resolve(record.rows[0].path);
   if (!isAbsolute(record.rows[0].path) || basename(archivePath) !== basename(record.rows[0].path) || extname(archivePath).toLowerCase() !== ".dump") {
     throw new ApiError(422, "BACKUP_PATH_UNSAFE", "مسار النسخة الاحتياطية غير آمن");
   }
+  if (!record.rows[0].sha256 || !/^[a-f0-9]{64}$/i.test(record.rows[0].sha256)) {
+    throw new ApiError(422, "BACKUP_HASH_MISSING", "لا توجد بصمة سليمة مسجلة لهذه النسخة الاحتياطية");
+  }
   const isolatedDir = await mkdtemp(resolve(tmpdir(), "nabta-restore-verify-"));
   let restored: PGlite | null = null;
   try {
-    const archive = new Blob([await readFile(archivePath)]);
+    // Read exactly once: the bytes whose checksum is verified are the same
+    // bytes handed to PGlite.  This prevents a changed archive from being
+    // reported as successfully restorable after it was originally backed up.
+    const archiveBytes = await readFile(archivePath);
+    const actualHash = createHash("sha256").update(archiveBytes).digest("hex");
+    if (actualHash !== record.rows[0].sha256.toLowerCase()) throw new Error("backup checksum mismatch");
+    const archive = new Blob([archiveBytes]);
     restored = new PGlite(isolatedDir, { extensions: { pgcrypto }, loadDataDir: archive });
     await restored.waitReady;
     const state = await restored.query<{ setup_completed: boolean }>("SELECT setup_completed FROM system_state WHERE singleton");

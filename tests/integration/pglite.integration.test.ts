@@ -309,6 +309,26 @@ describe("embedded PGlite server", () => {
     expect(verification.json()).toMatchObject({ verified: true, schemaVersion: "010_automatic_backup_policy" });
   }, 30_000);
 
+  it("rejects a backup whose archived bytes no longer match its recorded checksum", async () => {
+    config.BACKUP_DIR = await mkdtemp(resolve(tmpdir(), "nabta-backup-integrity-"));
+    const backup = await runBackup(db, config, null);
+    await writeFile(backup.path, "tampered backup", "utf8");
+
+    const verification = await app.inject({
+      method: "POST",
+      url: `/v1/backups/${backup.id}/verify`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(verification.statusCode, verification.body).toBe(422);
+    expect(verification.json()).toMatchObject({ code: "RESTORE_VERIFY_FAILED" });
+
+    const row = await db.query<{ status: string; error_message: string | null }>(
+      "SELECT status, error_message FROM backup_runs WHERE id = $1",
+      [backup.id],
+    );
+    expect(row.rows[0]).toMatchObject({ status: "FAILED", error_message: expect.stringContaining("backup checksum mismatch") });
+  }, 30_000);
+
   it("saves a backup to an owner-selected path and imports a selected archive safely", async () => {
     config.BACKUP_DIR = await mkdtemp(resolve(tmpdir(), "nabta-managed-backups-"));
     const selectedDirectory = await mkdtemp(resolve(tmpdir(), "nabta-selected-backup-"));
