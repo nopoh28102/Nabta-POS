@@ -84,6 +84,9 @@ importers:
       electron-builder:
         specifier: 26.15.3
         version: 26.15.3(electron-builder-squirrel-windows@26.15.3)
+      esbuild:
+        specifier: 0.28.2
+        version: 0.28.2
       vite:
         specifier: 8.3.4
         version: 8.3.4(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)

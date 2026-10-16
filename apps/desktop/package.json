@@ -1,6 +1,6 @@
 {
   "name": "@nabta/desktop",
-  "version": "0.1.48",
+  "version": "0.1.49",
   "private": true,
   "description": "نبتة — تطبيق نقاط بيع عربي محلي",
   "author": "Nabta POS",
@@ -35,6 +35,7 @@
     "@vitejs/plugin-react": "6.1.2",
     "electron": "44.7.0",
     "electron-builder": "26.15.3",
+    "esbuild": "0.28.2",
     "vite": "8.3.4"
   },
   "build": {
