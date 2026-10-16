@@ -57,6 +57,9 @@ jobs:
       - name: اختبارات TypeScript
         run: pnpm typecheck
 
+      - name: اختبار سلامة بيانات التحديث الموقّع
+        run: node --test tests/signpath-release.test.mjs
+
       - name: بناء التطبيق والخادم المحلي
         shell: pwsh
         run: |
