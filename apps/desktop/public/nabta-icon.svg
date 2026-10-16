@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="نبتة">
+  <defs>
+    <linearGradient id="nabta-green" x1="22" y1="18" x2="228" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#29d993"/>
+      <stop offset="1" stop-color="#087555"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#nabta-green)"/>
+  <circle cx="128" cy="128" r="82" fill="#0a3028" fill-opacity=".24"/>
+  <path d="M129 183c4-45 27-81 69-105" fill="none" stroke="#fff" stroke-width="15" stroke-linecap="round"/>
+  <path d="M134 117c-27-2-48-19-56-43 29-4 52 12 61 38" fill="#d9ffe9"/>
+  <path d="M148 99c4-32 25-55 55-62 5 31-13 57-43 68" fill="#fff"/>
+  <circle cx="128" cy="184" r="10" fill="#d9ffe9"/>
+</svg>

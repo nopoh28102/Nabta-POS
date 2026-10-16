@@ -1,0 +1,38 @@
+name: إصدار ويندوز
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: جلب المصدر
+        uses: actions/checkout@v4
+
+      - name: إعداد Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: إعداد pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.2
+
+      - name: تثبيت الاعتمادات
+        run: pnpm install --frozen-lockfile
+
+      - name: اختبارات البناء
+        run: pnpm typecheck
+
+      - name: إنشاء ونشر الإصدار
+        run: pnpm --filter @nabta/desktop release:win
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

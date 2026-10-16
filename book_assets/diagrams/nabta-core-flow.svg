@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420" viewBox="0 0 1000 420" role="img" aria-labelledby="title desc">
+  <title id="title">مسار البيع الموثوق في نبتة</title><desc id="desc">المستخدم يمسح، الخادم يسعّر ويقفل المخزون، ثم تحفظ المعاملة أو تتراجع كلها.</desc>
+  <defs><style>text{font-family:Tahoma,Arial,sans-serif;fill:#123c36} .box{fill:#e3f1ed;stroke:#167360;stroke-width:3}.arrow{stroke:#167360;stroke-width:4;fill:none;marker-end:url(#m)}</style><marker id="m" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#167360"/></marker></defs>
+  <rect width="1000" height="420" rx="24" fill="#f5f8f7"/>
+  <g text-anchor="middle" font-size="22"><rect class="box" x="55" y="145" width="180" height="100" rx="18"/><text x="145" y="188">مسح الباركود</text><text x="145" y="220">وسلة محلية</text>
+  <rect class="box" x="290" y="145" width="180" height="100" rx="18"/><text x="380" y="188">Quote</text><text x="380" y="220">سعر حالي</text>
+  <rect class="box" x="525" y="145" width="180" height="100" rx="18"/><text x="615" y="188">قفل الصفوف</text><text x="615" y="220">FEFO ومخزون</text>
+  <rect class="box" x="760" y="80" width="180" height="100" rx="18"/><text x="850" y="123">Commit</text><text x="850" y="155">فاتورة ودفتر</text>
+  <rect class="box" x="760" y="240" width="180" height="100" rx="18"/><text x="850" y="283">Rollback</text><text x="850" y="315">لا أثر جزئي</text></g>
+  <path class="arrow" d="M235 195h50M470 195h50M705 175h45M705 215q40 75 50 75"/>
+</svg>

@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+onlyBuiltDependencies:
+  - '@serialport/bindings-cpp'
+  - electron
+  - electron-winstaller
+  - esbuild

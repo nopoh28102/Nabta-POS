@@ -1,0 +1,104 @@
+{
+  "name": "@nabta/desktop",
+  "version": "0.1.46",
+  "private": true,
+  "description": "نبتة — تطبيق نقاط بيع عربي محلي",
+  "author": "Nabta POS",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nopoh28102/Nabta-POS.git"
+  },
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.electron.json && esbuild src/electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist-electron/preload.cjs && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "package:win": "node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish never",
+    "release:win": "node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish always"
+  },
+  "dependencies": {
+    "@nabta/contracts": "workspace:*",
+    "@nabta/ui": "workspace:*",
+    "@serialport/parser-readline": "13.0.0",
+    "bwip-js": "4.11.4",
+    "electron-updater": "6.8.9",
+    "exceljs": "4.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "serialport": "13.0.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "44.7.0",
+    "electron-builder": "26.15.3",
+    "vite": "8.3.4"
+  },
+  "build": {
+    "appId": "eg.nabta.pos",
+    "publish": {
+      "provider": "github",
+      "owner": "nopoh28102",
+      "repo": "Nabta-POS",
+      "releaseType": "release",
+      "tagNamePrefix": "v"
+    },
+    "productName": "نبتة",
+    "artifactName": "Nabta-POS-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "icon": "build/icon.ico",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/@serialport/**"
+    ],
+    "compression": "maximum",
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico",
+      "signExecutable": false,
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "perMachine": true,
+      "runAfterFinish": true,
+      "allowElevation": true,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "نبتة"
+    },
+    "extraResources": [
+      {
+        "from": "server-runtime",
+        "to": "server-runtime"
+      },
+      {
+        "from": "build/drivers",
+        "to": "drivers"
+      }
+    ],
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
+  }
+}

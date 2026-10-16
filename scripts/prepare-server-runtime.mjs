@@ -1,0 +1,21 @@
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const target = path.join(root, "apps", "desktop", "server-runtime");
+await rm(target, { recursive: true, force: true });
+mkdir(path.dirname(target), { recursive: true });
+const command = process.platform === "win32" ? "pnpm.cmd" : "pnpm";
+const banner = `--banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\"`;
+const bundle = spawnSync(command, ["exec", "esbuild", "apps/server/dist/index.js", "--bundle", "--platform=node", "--format=esm", "--external:@electric-sql/pglite", "--outfile=apps/desktop/server-runtime/server-bundle.mjs", banner], { cwd: root, stdio: "inherit", shell: process.platform === "win32" });
+if (bundle.error || bundle.status !== 0) throw bundle.error ?? new Error(`server runtime bundle failed with ${bundle.status ?? bundle.signal}`);
+await cp(path.join(root, "migrations"), path.join(target, "migrations"), { recursive: true });
+await cp(path.join(root, "scripts", "windows", "embedded-server-runner.mjs"), path.join(target, "runner.mjs"));
+await cp(path.join(root, "apps", "server", "node_modules", "@electric-sql", "pglite"), path.join(target, "pglite"), { recursive: true, dereference: true });
+const bundlePath = path.join(target, "server-bundle.mjs");
+const bundleText = await readFile(bundlePath, "utf8");
+await writeFile(bundlePath, bundleText.replaceAll('"@electric-sql/pglite/contrib/pgcrypto"', '"./pglite/dist/contrib/pgcrypto.js"').replaceAll('"@electric-sql/pglite"', '"./pglite/dist/index.js"'));
+await writeFile(path.join(target, "package.json"), JSON.stringify({ type: "module" }, null, 2));
+await writeFile(path.join(target, "README.txt"), "Nabta embedded server runtime. Managed by the Windows installer.\r\n");

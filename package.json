@@ -1,0 +1,36 @@
+{
+  "name": "nabta-pos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "نبتة — نظام نقاط بيع محلي عربي للسوبر ماركت",
+  "license": "MIT",
+  "packageManager": "pnpm@10.6.2",
+  "engines": {
+    "node": ">=24.14.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm test:unit",
+    "test:unit": "pnpm --filter @nabta/domain build && node --test tests/engine.test.cjs && vitest run tests/domain.test.ts",
+    "test:integration": "pnpm --filter @nabta/domain build && pnpm --filter @nabta/contracts build && vitest run tests/integration",
+    "test:e2e": "pnpm build && playwright test",
+    "dev": "pnpm --filter @nabta/desktop dev",
+    "dev:server": "pnpm --filter @nabta/server dev",
+    "db:migrate": "pnpm --filter @nabta/server migrate",
+    "db:seed": "pnpm --filter @nabta/server seed",
+    "package:win": "pnpm --filter @nabta/desktop package:win",
+    "check": "pnpm typecheck && pnpm test:unit && pnpm build"
+  },
+  "devDependencies": {
+    "@nabta/contracts": "workspace:*",
+    "@nabta/domain": "workspace:*",
+    "@playwright/test": "1.64.0",
+    "@types/node": "24.10.0",
+    "@types/pg": "8.23.1",
+    "pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
+  }
+}

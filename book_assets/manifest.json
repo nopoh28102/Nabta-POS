@@ -1,0 +1,10 @@
+{
+  "project": "نبتة POS",
+  "language": "ar",
+  "assets": [
+    {"path": "diagrams/nabta-core-flow.svg", "type": "summary_diagram", "concept": "المعاملة الذرية"},
+    {"path": "diagrams/nabta-operation-flow.mmd", "type": "flowchart", "concept": "مسار البيع والانقطاع"},
+    {"path": "infographics/nabta-invariants.svg", "type": "infographic", "concept": "الثوابت المالية"},
+    {"path": "charts/nabta-summary.svg", "type": "concept_map", "concept": "مكونات النظام"}
+  ]
+}
