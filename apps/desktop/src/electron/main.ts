@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } from "electron";
 import type { MessageBoxOptions, OpenDialogOptions, SaveDialogOptions } from "electron";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, extname, resolve, sep } from "node:path";
@@ -11,8 +11,11 @@ import { pathToFileURL } from "node:url";
 import { SerialPort } from "serialport";
 import bwipjs from "bwip-js";
 import electronUpdater from "electron-updater";
-import { barcodeSchema, hardwareSettingsSchema, ipcRequestSchema, type DiscoveredServer, type HardwareSettings, type InventoryExcelExportResponse, type IpcRequest, type PartnerListDocumentRequest, type ProductExcelExportResponse, type ProductLabelPrintRequest, type PurchaseReceiptPrintRequest, type ReceiptPrintRequest, type ReorderListDocumentRequest, type ReportPdfExportRequest, type ShiftHistoryExcelExportResponse } from "@nabta/contracts";
-import { createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
+import { barcodeSchema, hardwareSettingsSchema, ipcRequestSchema, type DiscoveredServer, type HardwareSettings, type InventoryExcelExportResponse, type InventoryPeriodicExcelExportResponse, type IpcRequest, type PartnerListDocumentRequest, type ProductExcelExportResponse, type ProductLabelBatchPrintRequest, type ProductLabelPrintRequest, type PurchaseReceiptPrintRequest, type ReceiptPrintRequest, type ReorderListDocumentRequest, type ReportPdfExportRequest, type ShiftHistoryExcelExportResponse } from "@nabta/contracts";
+import { createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
+import { createLabelLayout, createLabelRasterHtml, createTsplGapCalibrationJob, createTsplNativeBarcodeJob, createTsplRasterJob, encodeXp233bTsplBitmap, type LabelPrinterProfile } from "./printing/label-engine.js";
+import { formatQtyForReceipt, receiptHtml } from "./printing/receipt-engine.js";
+import { WindowsRawSpooler } from "./printing/raw-spooler.js";
 
 interface DesktopConfig {
   serverUrl: string;
@@ -33,6 +36,7 @@ let hardwareSettings: HardwareSettings = DEFAULT_HARDWARE_SETTINGS;
 let serialScanner: SerialPort | null = null;
 let serialBuffer = "";
 let syncedLabelMediaKey: string | null = null;
+const labelRawSpooler = new WindowsRawSpooler();
 const runEmbeddedServer = process.argv.includes("--run-server");
 let hostProcessStarted = false;
 let hostStartPromise: Promise<void> | null = null;
@@ -162,6 +166,8 @@ if (process.env.NODE_ENV === "test" && process.env.NABTA_TEST_DEBUG_PORT) {
 
 function configPath(): string { return resolve(app.getPath("userData"), "connection.json"); }
 function hardwareSettingsPath(): string { return resolve(app.getPath("userData"), "hardware-settings.json"); }
+function previousHardwareSettingsPath(): string { return resolve(app.getPath("userData"), "hardware-settings.previous.json"); }
+function labelPrintLogPath(): string { return resolve(app.getPath("userData"), "label-print-log.jsonl"); }
 
 async function loadHardwareSettings(): Promise<HardwareSettings> {
   try {
@@ -182,8 +188,25 @@ async function loadHardwareSettings(): Promise<HardwareSettings> {
 
 async function saveHardwareSettings(value: HardwareSettings): Promise<void> {
   await mkdir(dirname(hardwareSettingsPath()), { recursive: true });
+  try {
+    const previous = await readFile(hardwareSettingsPath(), "utf8");
+    await writeFile(previousHardwareSettingsPath(), previous, { encoding: "utf8", mode: 0o600 });
+  } catch {
+    // The first save has no previous profile to restore.
+  }
   await writeFile(hardwareSettingsPath(), JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 });
   hardwareSettings = value;
+}
+
+async function restorePreviousHardwareSettings(): Promise<HardwareSettings> {
+  try {
+    const previous = hardwareSettingsSchema.parse(JSON.parse(await readFile(previousHardwareSettingsPath(), "utf8")) as unknown);
+    await saveHardwareSettings(previous);
+    await configureSerialScanner(previous);
+    return previous;
+  } catch {
+    throw { code: "HARDWARE_SETTINGS_RESTORE_UNAVAILABLE", messageAr: "لا توجد إعدادات أجهزة سابقة صالحة لاستعادتها على هذا الكاشير." };
+  }
 }
 
 function sendBarcodeToRenderer(raw: string, source: "SERIAL" | "HID"): void {
@@ -281,6 +304,7 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "servers.discover": throw new Error("discovery operation is local");
     case "host.start": throw new Error("host operation is local");
     case "health": return { method: "GET", path: "/v1/health" };
+    case "pos.metrics": return { method: "GET", path: "/v1/pos/metrics" };
     case "terminals.discover": return { method: "GET", path: "/v1/discovery/terminals" };
     case "setup": return { method: "POST", path: "/v1/setup", body: request.payload };
     case "login": return { method: "POST", path: "/v1/auth/login", body: request.payload };
@@ -289,6 +313,8 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       const params = new URLSearchParams();
       if (request.payload.query) params.set("query", request.payload.query);
       if (request.payload.category) params.set("category", request.payload.category);
+      if (request.payload.limit) params.set("limit", String(request.payload.limit));
+      if (request.payload.cursor) params.set("cursor", request.payload.cursor);
       return { method: "GET", path: `/v1/catalog?${params}` };
     }
     case "products.reference.lookup": return { method: "GET", path: `/v1/product-references/${encodeURIComponent(request.payload.barcode)}` };
@@ -313,6 +339,11 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       return { method: "GET", path: `/v1/products/export-data${suffix}` };
     }
     case "inventory.export-xlsx": return { method: "GET", path: "/v1/inventory/export" };
+    case "inventory.periodic-export-xlsx": {
+      const params = new URLSearchParams({ period: request.payload.period });
+      if (request.payload.referenceDate) params.set("referenceDate", request.payload.referenceDate);
+      return { method: "GET", path: `/v1/inventory/periodic-report?${params}` };
+    }
     case "products.import": return { method: "POST", path: "/v1/products/import", body: request.payload.request, headers: { "Idempotency-Key": request.payload.idempotencyKey } };
     case "sales.lookup": return { method: "GET", path: `/v1/sales/lookup?invoiceNo=${encodeURIComponent(request.payload.invoiceNo)}` };
     case "sales.return": return { method: "POST", path: `/v1/sales/${request.payload.saleId}/returns`, body: request.payload.return, headers: { "Idempotency-Key": request.payload.idempotencyKey } };
@@ -384,6 +415,7 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "partners.export-pdf":
     case "hardware.settings.get":
     case "hardware.settings.save":
+    case "hardware.settings.restore":
     case "hardware.printers.list":
     case "hardware.serial.list":
     case "hardware.receipt.print":
@@ -393,6 +425,8 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "hardware.driver.install":
     case "hardware.label.print":
     case "hardware.label.test":
+    case "hardware.label.calibrate":
+    case "hardware.label.batch.print":
     case "hardware.purchase-receipt.print":
     case "invoices.purchase-receipt.export-pdf": throw new Error("desktop hardware operation is local");
     case "config.get":
@@ -551,6 +585,18 @@ async function exportInventoryXlsx(data: InventoryExcelExportResponse): Promise<
   return { cancelled: false, path: destination.filePath, itemCount: data.items.length };
 }
 
+async function exportInventoryPeriodicXlsx(data: InventoryPeriodicExcelExportResponse): Promise<{ cancelled: boolean; path?: string; soldItemCount: number; reorderItemCount: number }> {
+  const options = {
+    title: "حفظ ملف الجرد الدوري بصيغة Excel",
+    defaultPath: resolve(app.getPath("documents"), `${data.periodLabel} ${data.storeName} ${data.periodStart} - ${data.periodEnd}.xlsx`),
+    filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+  };
+  const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (destination.canceled || !destination.filePath) return { cancelled: true, soldItemCount: data.salesItems.length, reorderItemCount: data.reorderItems.length };
+  await writeFile(destination.filePath, await createInventoryPeriodicWorkbook(data));
+  return { cancelled: false, path: destination.filePath, soldItemCount: data.salesItems.length, reorderItemCount: data.reorderItems.length };
+}
+
 /** @deprecated Replaced by the verified ExcelJS writer in workbooks.ts. */
 export function productsWorkbook(data: ProductExcelExportResponse): Buffer {
   const inline = (reference: string, value: string, style = 0) => `<c r="${reference}" s="${style}" t="inlineStr"><is><t xml:space="preserve">${escapeSpreadsheetXml(value)}</t></is></c>`;
@@ -692,9 +738,104 @@ async function callApi(request: IpcRequest): Promise<unknown> {
     await saveDesktopConfig({ ...config, terminalId: setup.terminalId });
   }
   if (request.operation === "inventory.export-xlsx") return exportInventoryXlsx(data as InventoryExcelExportResponse);
+  if (request.operation === "inventory.periodic-export-xlsx") return exportInventoryPeriodicXlsx(data as InventoryPeriodicExcelExportResponse);
   if (request.operation === "products.export") return exportProductsXlsx(data as ProductExcelExportResponse);
   if (request.operation === "shifts.export-xlsx") return exportShiftsXlsx(data as ShiftHistoryExcelExportResponse);
   return data;
+}
+
+const catalogImageUrlMap = new Map<string, string>();
+const failedImageUrlSet = new Set<string>();
+let imageSyncRunning = false;
+
+function resolveImageMime(bytes: Buffer): string {
+  if (bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "image/png";
+  if (bytes.subarray(0, 3).toString("hex") === "ffd8ff") return "image/jpeg";
+  if (bytes.subarray(0, 4).toString("ascii") === "GIF8") return "image/gif";
+  if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return "application/octet-stream";
+}
+
+async function fetchAndCacheImage(barcode: string, rawUrl: string, catalogRoot: string): Promise<Buffer | null> {
+  if (failedImageUrlSet.has(barcode)) return null;
+  try {
+    const encoded = encodeURI(rawUrl);
+    const response = await net.fetch(encoded, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NabtaPOS/1.0",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      },
+    });
+    if (!response.ok) {
+      failedImageUrlSet.add(barcode);
+      return null;
+    }
+    const arrayBuf = await response.arrayBuffer();
+    const bytes = Buffer.from(arrayBuf);
+    const mime = resolveImageMime(bytes);
+    if (mime === "application/octet-stream") {
+      failedImageUrlSet.add(barcode);
+      return null;
+    }
+    const targetFile = resolve(catalogRoot, `${barcode}.img`);
+    await mkdir(catalogRoot, { recursive: true });
+    await writeFile(targetFile, bytes);
+    return bytes;
+  } catch {
+    failedImageUrlSet.add(barcode);
+    return null;
+  }
+}
+
+async function startCatalogImageBackgroundSync(): Promise<void> {
+  if (imageSyncRunning || !desktopConfig) return;
+  imageSyncRunning = true;
+  try {
+    const catalogRoot = resolve(app.getPath("userData"), "blob_storage", "catalog");
+    await mkdir(catalogRoot, { recursive: true });
+
+    const endpoint = new URL("/v1/media/catalog-images", desktopConfig.serverUrl).toString();
+    const response = await net.fetch(endpoint).catch(() => null);
+    if (!response || !response.ok) {
+      imageSyncRunning = false;
+      return;
+    }
+    const items = (await response.json()) as Array<{ barcode: string; url: string }>;
+    for (const item of items) {
+      if (item.barcode && item.url) {
+        catalogImageUrlMap.set(item.barcode, item.url);
+      }
+    }
+
+    const pending: Array<{ barcode: string; url: string }> = [];
+    for (const [barcode, url] of catalogImageUrlMap.entries()) {
+      const targetFile = resolve(catalogRoot, `${barcode}.img`);
+      if (!existsSync(targetFile)) {
+        pending.push({ barcode, url });
+      }
+    }
+
+    if (pending.length === 0) {
+      imageSyncRunning = false;
+      return;
+    }
+
+    const concurrency = 3;
+    const worker = async () => {
+      while (pending.length > 0) {
+        const item = pending.shift();
+        if (!item) break;
+        await fetchAndCacheImage(item.barcode, item.url, catalogRoot);
+        await new Promise((r) => setTimeout(r, 60));
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  } catch {
+    // Graceful offline fallback
+  } finally {
+    imageSyncRunning = false;
+  }
 }
 
 async function registerProtocol(): Promise<void> {
@@ -718,13 +859,19 @@ async function registerProtocol(): Promise<void> {
     if (!path.startsWith(`${catalogRoot}${sep}`)) return new Response("Not found", { status: 404 });
     try {
       const bytes = await readFile(path);
-      const mime = bytes.subarray(0, 12).toString("hex").startsWith("89504e470d0a1a0a") ? "image/png"
-        : bytes.subarray(0, 3).toString("hex") === "ffd8ff" ? "image/jpeg"
-          : bytes.subarray(0, 4).toString("ascii") === "GIF8" ? "image/gif"
-            : bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP" ? "image/webp"
-              : "application/octet-stream";
-      return new Response(bytes, { headers: { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" } });
-    } catch { return new Response("Not found", { status: 404 }); }
+      const mime = resolveImageMime(bytes);
+      return new Response(new Uint8Array(bytes), { headers: { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" } });
+    } catch {
+      const sourceUrl = catalogImageUrlMap.get(barcode);
+      if (sourceUrl) {
+        const downloadedBytes = await fetchAndCacheImage(barcode, sourceUrl, catalogRoot);
+        if (downloadedBytes) {
+          const mime = resolveImageMime(downloadedBytes);
+          return new Response(new Uint8Array(downloadedBytes), { headers: { "Content-Type": mime, "Cache-Control": "public, max-age=31536000, immutable" } });
+        }
+      }
+      return new Response("Not found", { status: 404 });
+    }
   });
 }
 
@@ -761,7 +908,12 @@ async function createWindow(): Promise<void> {
     if (!url.startsWith("nabta://") && !url.startsWith("http://127.0.0.1:5173")) event.preventDefault();
   });
   await mainWindow.loadURL(process.env.NABTA_DEV_URL ?? "nabta://app/index.html");
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  mainWindow.once("ready-to-show", () => {
+    mainWindow?.show();
+    setTimeout(() => {
+      void startCatalogImageBackgroundSync();
+    }, 4000);
+  });
 }
 
 function escapeReportHtml(value: string): string {
@@ -893,34 +1045,6 @@ async function exportPartnerListPdf(report: PartnerListDocumentRequest): Promise
   } finally { if (!reportWindow.isDestroyed()) reportWindow.destroy(); }
 }
 
-function receiptHtml(request: ReceiptPrintRequest, paperWidth: "58" | "80"): string {
-  const { sale, storeName } = request;
-  // Windows thermal drivers reserve an unreported strip at each edge. Keep the
-  // content within a real safe area so Arabic currency glyphs are never clipped.
-  const printableWidth = paperWidth === "80" ? 72 : 48;
-  const sidePadding = paperWidth === "80" ? 2.4 : 1.8;
-  const branding = request.branding ?? { logoDataUrl: "", receiptPhone: "", whatsappPhone: "", socialHandle: "", receiptFooter: "شكراً لزيارتكم" };
-  const rows = sale.lines.map((line) => `<article class="item"><div class="item-top"><b>${escapeReportHtml(line.nameAr)}</b><strong dir="ltr">${escapeReportHtml(formatReportMoney(line.netMinor))}</strong></div><div class="item-meta"><span dir="ltr">${escapeReportHtml(formatQtyForReceipt(line.qtyMilli, line.unitKind))} × ${escapeReportHtml(formatReportMoney(line.unitPriceMinor))}</span><span>${line.unitKind === "WEIGHT" ? "موزون" : "قطعة"}</span></div></article>`).join("");
-  const contacts = [
-    branding.receiptPhone ? `<span dir="ltr">☎ ${escapeReportHtml(branding.receiptPhone)}</span>` : "",
-    branding.whatsappPhone ? `<span dir="ltr">واتساب ${escapeReportHtml(branding.whatsappPhone)}</span>` : "",
-    branding.socialHandle ? `<span>${escapeReportHtml(branding.socialHandle)}</span>` : "",
-  ].filter(Boolean).join("<span class=\"contact-separator\">•</span>");
-  const mark = branding.logoDataUrl
-    ? `<img class="brand-logo" src="${escapeReportHtml(branding.logoDataUrl)}" alt="شعار المتجر" />`
-    : `<span class="brand-mark" aria-hidden="true">✦</span>`;
-  const printedAt = new Intl.DateTimeFormat("ar-EG", { dateStyle: "medium", timeStyle: "short", timeZone: "Africa/Cairo" }).format(new Date(sale.postedAt));
-  const itemCount = new Intl.NumberFormat("ar-EG").format(sale.lines.length);
-  return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>${escapeReportHtml(sale.invoiceNo)}</title><style>
-    @page { size: ${paperWidth}mm auto; margin: 0; }
-    * { box-sizing:border-box; } body { margin:0; width:${paperWidth}mm; color:#111; background:#fff; font-family:Tahoma,Arial,"Segoe UI",sans-serif; font-size:${paperWidth === "58" ? "8.5" : "9.5"}pt; line-height:1.42; }
-    .receipt { width:${printableWidth}mm; margin:0 auto; padding:2.5mm ${sidePadding}mm 3.5mm; } .rule { height:.7mm; background:#111; margin:0 0 2mm; } header { text-align:center; padding:.3mm 0 2.2mm; } .brand-row { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.6mm; } .brand-logo { width:15mm; height:15mm; object-fit:contain; border-radius:2mm; } .brand-mark { display:inline-grid; place-items:center; width:13mm; height:13mm; border:1.35px solid #111; border-radius:50%; color:#111; font-size:18pt; } h1 { font-size:${paperWidth === "58" ? "16" : "19"}pt; margin:0; font-weight:900; letter-spacing:-.35px; } .store-subtitle { margin:.2mm 0 1mm; color:#222; font-size:${paperWidth === "58" ? "8.5" : "9.5"}pt; font-weight:600; } .receipt-kind { display:inline-block; margin-top:1mm; padding:.7mm 5mm; border:1.35px solid #111; border-radius:3mm; font-size:${paperWidth === "58" ? "10" : "12"}pt; font-weight:900; } .contacts { margin-top:1.2mm; display:flex; justify-content:center; flex-wrap:wrap; gap:1mm; color:#333; font-size:7.8pt; } .contact-separator { color:#777; } .invoice-box { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:1mm; margin-top:2mm; padding:1.6mm 0; border-top:1px dashed #555; border-bottom:1px dashed #555; font-size:7.8pt; text-align:right; } .invoice-box span { min-width:0; overflow-wrap:anywhere; } .invoice-box span:last-child { text-align:left; } .invoice-box b { display:block; margin-top:.2mm; color:#111; font-family:Consolas,monospace; font-size:8.3pt; } .items-title { margin:2.3mm 0 0; padding:1.1mm; border-top:1px solid #111; border-bottom:1px solid #111; background:#efefef; text-align:center; font-size:${paperWidth === "58" ? "9" : "10.5"}pt; color:#111; font-weight:900; } .items { border-bottom:1.2px solid #111; } .item { padding:1.9mm 0 1.7mm; border-bottom:1px dashed #888; } .item:last-child { border-bottom:0; } .item-top { display:flex; justify-content:space-between; gap:2mm; align-items:flex-start; } .item-top b { min-width:0; max-width:72%; overflow-wrap:anywhere; font-size:${paperWidth === "58" ? "8.7" : "9.7"}pt; line-height:1.35; } .item-top strong { flex:0 0 auto; white-space:nowrap; font-size:${paperWidth === "58" ? "11" : "13"}pt; } .item-meta { display:flex; justify-content:space-between; gap:2mm; margin-top:.5mm; color:#444; font-size:7.7pt; direction:rtl; } .summary { margin-top:2.5mm; padding-top:1.8mm; border-top:1.4px solid #111; display:grid; gap:1.2mm; } .summary p { margin:0; display:flex; justify-content:space-between; gap:2mm; } .summary p span { min-width:0; } .summary .total { margin-top:.8mm; padding:2mm 1.4mm; border:1.5px solid #111; border-radius:2.2mm; font-size:${paperWidth === "58" ? "12" : "14"}pt; font-weight:900; } .paid-change { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:1.5mm; margin-top:1.4mm; } .paid-change p { min-height:12mm; padding:1.3mm; border:1.2px solid #111; border-radius:2mm; background:#fff; text-align:center; flex-direction:column; justify-content:center; font-size:8pt; } .paid-change b { display:block; margin-top:.5mm; font-size:${paperWidth === "58" ? "10" : "11"}pt; } footer { margin-top:3mm; padding:2.2mm 0 1mm; border-top:1px dashed #555; text-align:center; color:#222; font-size:${paperWidth === "58" ? "9" : "10.5"}pt; font-weight:800; } footer small { display:block; margin-top:1mm; color:#555; font-size:7pt; font-weight:500; } @media print { .receipt { break-inside:avoid; } }
-  </style></head><body><article class="receipt"><div class="rule"></div><header><div class="brand-row">${mark}<h1>${escapeReportHtml(storeName)}</h1><p class="store-subtitle">مواد غذائية ومنتجات منزلية</p></div><span class="receipt-kind">فاتورة بيع</span>${contacts ? `<div class="contacts">${contacts}</div>` : ""}<div class="invoice-box"><span>رقم الفاتورة<b dir="ltr">${escapeReportHtml(sale.invoiceNo)}</b></span><span>تاريخ العملية<b>${escapeReportHtml(printedAt)}</b></span></div></header><div class="items-title">تفاصيل المشتريات — ${itemCount} أصناف</div><section class="items">${rows}</section><section class="summary"><p><span>إجمالي الأصناف</span><span dir="ltr">${escapeReportHtml(formatReportMoney(sale.subtotalMinor))}</span></p>${sale.discountMinor ? `<p><span>الخصم</span><span dir="ltr">− ${escapeReportHtml(formatReportMoney(sale.discountMinor))}</span></p>` : ""}<p class="total"><span>إجمالي المطلوب</span><span dir="ltr">${escapeReportHtml(formatReportMoney(sale.totalMinor))}</span></p><div class="paid-change"><p><span>المدفوع</span><b dir="ltr">${escapeReportHtml(formatReportMoney(sale.paidMinor))}</b></p><p><span>الباقي</span><b dir="ltr">${escapeReportHtml(formatReportMoney(sale.changeMinor))}</b></p></div></section><footer>✦ ${escapeReportHtml(branding.receiptFooter || "شكراً لزيارتكم")} ✦<small>نتمنى لكم دائماً مستلزمات أفضل</small></footer></article></body></html>`;
-}
-
-function formatQtyForReceipt(qtyMilli: number, unitKind: "PIECE" | "WEIGHT"): string {
-  return unitKind === "WEIGHT" ? `${(qtyMilli / 1000).toFixed(3)} كجم` : String(qtyMilli / 1000);
-}
 
 async function listInstalledPrinters(): Promise<Array<{ name: string; displayName: string; isDefault: boolean; status: number; description: string }>> {
   if (!mainWindow || mainWindow.isDestroyed()) return [];
@@ -929,6 +1053,21 @@ async function listInstalledPrinters(): Promise<Array<{ name: string; displayNam
     const details = printer as typeof printer & { isDefault?: boolean; status?: number };
     return { name: printer.name, displayName: printer.displayName, isDefault: details.isDefault === true, status: details.status ?? 0, description: printer.description };
   });
+}
+
+/**
+ * Electron requires the Windows *system* queue name for silent printing, not
+ * its friendly display name.  A saved queue can become stale after a driver
+ * reinstall or when the terminal is moved to another computer, so fail before
+ * rendering a label instead of giving the spooler an unusable device name.
+ */
+async function requireInstalledLabelPrinter(printerName: string): Promise<void> {
+  const printers = await listInstalledPrinters();
+  if (printers.some((printer) => printer.name === printerName)) return;
+  throw {
+    code: "LABEL_PRINTER_UNAVAILABLE",
+    messageAr: `طابعة الملصقات المختارة (${printerName}) غير موجودة في Windows على هذا الجهاز. افتح الإعدادات، حدّث قائمة الطابعات، ثم اخترها من القائمة واحفظ.`,
+  };
 }
 
 /** Select the installed printer roles on first run, including generic POS-80 queues. */
@@ -1026,7 +1165,9 @@ public static class NabtaXprinterMedia {
 async function syncLabelPrinterMedia(settings: HardwareSettings): Promise<void> {
   const printerName = settings.barcodePrinterName;
   if (process.platform !== "win32" || !printerName || !/xp[-\s]?233b|233b/iu.test(printerName)) return;
-  const { widthMm, heightMm } = labelMediaDimensions(settings.labelPaperSize);
+  const { widthMm, heightMm } = settings.labelPrintTransport === "TSPL"
+    ? { widthMm: settings.labelWidthMm, heightMm: settings.labelHeightMm }
+    : labelMediaDimensions(settings.labelPaperSize);
   const key = `${printerName}|${widthMm}x${heightMm}`;
   if (syncedLabelMediaKey === key) return;
   const expectedWidth = widthMm * 1000;
@@ -1211,24 +1352,220 @@ function productLabelHtml(request: ProductLabelPrintRequest): string {
   </style></head><body><section class="label${micro ? " micro-label" : ""}${wideShort ? " wide-short-label" : ""}">${labelContents}</section></body></html>`;
 }
 
+function currentTsplLabelProfile(): LabelPrinterProfile {
+  return {
+    model: hardwareSettings.labelPrinterModel,
+    dpi: hardwareSettings.labelDpi,
+    widthMm: hardwareSettings.labelWidthMm,
+    heightMm: hardwareSettings.labelHeightMm,
+    gapMm: hardwareSettings.labelGapMm,
+    speedMmPerSecond: hardwareSettings.labelSpeedMmPerSecond,
+    density: hardwareSettings.labelDensity,
+    direction: hardwareSettings.labelDirection ?? 1,
+    offsetXmm: hardwareSettings.labelOffsetXmm,
+    offsetYmm: hardwareSettings.labelOffsetYmm,
+    mediaType: hardwareSettings.labelMediaType,
+    renderMode: hardwareSettings.labelBarcodeRenderMode ?? "RASTER",
+    calibrationConfirmed: hardwareSettings.labelCalibrationConfirmed,
+  };
+}
+
+function monochromeTsplBitmap(bitmap: Buffer, width: number, height: number): Buffer {
+  const bytesPerRow = Math.ceil(width / 8);
+  const result = Buffer.alloc(bytesPerRow * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      // Electron native images use four bytes per pixel.  The average works for
+      // either BGRA or RGBA and avoids a platform-specific channel assumption.
+      const luminance = (bitmap[index]! + bitmap[index + 1]! + bitmap[index + 2]!) / 3;
+      // In TSPL wire format: 1 = Black dot (heated ink), 0 = White dot (unheated background)
+      if (luminance < 180) result[y * bytesPerRow + Math.floor(x / 8)]! |= 0x80 >> (x % 8);
+    }
+  }
+  return result;
+}
+
+function translateMonochromeTsplBitmap(source: Buffer, width: number, height: number, offsetX: number, offsetY: number): Buffer {
+  if (offsetX === 0 && offsetY === 0) return source;
+  const bytesPerRow = Math.ceil(width / 8);
+  const translated = Buffer.alloc(source.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if ((source[y * bytesPerRow + Math.floor(x / 8)]! & (0x80 >> (x % 8))) === 0) continue;
+      const targetX = x + offsetX;
+      const targetY = y + offsetY;
+      if (targetX < 0 || targetX >= width || targetY < 0 || targetY >= height) continue;
+      translated[targetY * bytesPerRow + Math.floor(targetX / 8)]! |= 0x80 >> (targetX % 8);
+    }
+  }
+  return translated;
+}
+
+async function rasterizeTsplLabel(profile: LabelPrinterProfile, request: ProductLabelPrintRequest, mode: "FULL" | "HEADER_ONLY" = "FULL"): Promise<Buffer> {
+  const layout = createLabelLayout(profile, request.barcode);
+  const targetWidth = layout.widthDots;
+  const targetHeight = mode === "HEADER_ONLY" ? layout.text.height : layout.heightDots;
+  const textWindow = new BrowserWindow({
+    show: false,
+    width: targetWidth,
+    height: targetHeight,
+    useContentSize: true,
+    frame: false,
+    enableLargerThanScreen: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+  try {
+    await textWindow.webContents.setZoomFactor(1);
+    await textWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(createLabelRasterHtml(profile, {
+      storeName: "نبتة",
+      name: request.nameAr,
+      barcode: request.barcode,
+      priceMinor: request.priceMinor,
+      copies: request.copies,
+    }, mode === "FULL"))}`);
+    const captured = await textWindow.webContents.capturePage({ x: 0, y: 0, width: targetWidth, height: targetHeight });
+    const normalized = captured.resize({ width: targetWidth, height: targetHeight, quality: "best" });
+    const actual = normalized.getSize();
+    if (actual.width !== targetWidth || actual.height !== targetHeight) throw new Error("Unable to rasterize the calibrated label dimensions");
+    const raster = monochromeTsplBitmap(normalized.toBitmap(), targetWidth, targetHeight);
+    const shiftedInkBitmap = translateMonochromeTsplBitmap(
+      raster, targetWidth, targetHeight,
+      Math.round((profile.offsetXmm * profile.dpi) / 25.4),
+      Math.round((profile.offsetYmm * profile.dpi) / 25.4),
+    );
+    // Explicitly false: Do NOT invert bits. In TSPL, 0 is white paper and 1 is black ink.
+    return encodeXp233bTsplBitmap(shiftedInkBitmap, false);
+  } finally {
+    if (!textWindow.isDestroyed()) textWindow.destroy();
+  }
+}
+
+async function writeLabelPrintLog(event: Record<string, unknown>): Promise<void> {
+  try {
+    await mkdir(dirname(labelPrintLogPath()), { recursive: true });
+    await appendFile(labelPrintLogPath(), `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, { encoding: "utf8", mode: 0o600 });
+  } catch (error) {
+    console.error("[nabta-label] unable to write local print log", error);
+  }
+}
+
+async function sendTsplLabel(printerName: string, request: ProductLabelPrintRequest): Promise<{ printed: true; printerName: string; spoolJobId: number }> {
+  const profile = currentTsplLabelProfile();
+  if (request.copies > 1 && !profile.calibrationConfirmed) {
+    throw { code: "LABEL_CALIBRATION_REQUIRED", messageAr: "أكد نجاح ملصق المعايرة عمليًا قبل طباعة أكثر من نسخة أو دفعة من الملصقات." };
+  }
+  try {
+    let payload: Buffer;
+    const content = {
+      storeName: "نبتة",
+      name: request.nameAr,
+      barcode: request.barcode,
+      priceMinor: request.priceMinor,
+      copies: request.copies,
+    };
+    if (profile.renderMode === "NATIVE_TSPL") {
+      const headerRaster = await rasterizeTsplLabel(profile, request, "HEADER_ONLY");
+      payload = createTsplNativeBarcodeJob(profile, content, headerRaster);
+    } else {
+      const fullRaster = await rasterizeTsplLabel(profile, request, "FULL");
+      payload = createTsplRasterJob(profile, content, fullRaster);
+    }
+    const result = await labelRawSpooler.submit(printerName, "Nabta TSPL Label", payload);
+    await writeLabelPrintLog({
+      printerName,
+      transport: "TSPL",
+      renderMode: profile.renderMode,
+      barcode: request.barcode,
+      nameAr: request.nameAr,
+      priceMinor: request.priceMinor,
+      copies: request.copies,
+      status: "SPOOLED",
+      jobId: result.jobId,
+      bytes: result.bytesWritten,
+    });
+    return { printed: true, printerName, spoolJobId: result.jobId };
+  } catch (error) {
+    await writeLabelPrintLog({
+      printerName,
+      transport: "TSPL",
+      barcode: request.barcode,
+      nameAr: request.nameAr,
+      status: "FAILED",
+      error: error instanceof Error ? error.message : "unknown",
+    });
+    const message = error instanceof Error ? error.message : "تعذر تجهيز مهمة TSPL";
+    throw { code: "TSPL_LABEL_PRINT_FAILED", messageAr: `تعذر إرسال مهمة الملصق إلى قائمة Windows RAW: ${message}` };
+  }
+}
+
+async function calibrateTsplLabel(printerName: string): Promise<{ submitted: true; printerName: string; spoolJobId: number }> {
+  const profile = currentTsplLabelProfile();
+  try {
+    const result = await labelRawSpooler.submit(printerName, "Nabta XP-233B Gap Calibration", createTsplGapCalibrationJob(profile));
+    await writeLabelPrintLog({ printerName, transport: "TSPL", status: "GAP_CALIBRATION_SPOOLED", jobId: result.jobId, bytes: result.bytesWritten });
+    return { submitted: true, printerName, spoolJobId: result.jobId };
+  } catch (error) {
+    await writeLabelPrintLog({ printerName, transport: "TSPL", status: "GAP_CALIBRATION_FAILED", error: error instanceof Error ? error.message : "unknown" });
+    throw { code: "TSPL_CALIBRATION_FAILED", messageAr: "تعذر إرسال أمر معايرة Gap إلى طابعة الملصقات. تحقق من اتصال الطابعة وتعريف Windows." };
+  }
+}
+
 async function printProductLabel(request: ProductLabelPrintRequest): Promise<{ printed: true; printerName: string }> {
   if (!hardwareSettings.barcodePrinterName) throw { code: "LABEL_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الباركود من الإعدادات أولًا." };
   if (hardwareSettings.barcodePrinterName === hardwareSettings.receiptPrinterName) throw { code: "PRINTER_ROLE_CONFLICT", messageAr: "لا يمكن استخدام الطابعة نفسها للباركود والإيصالات؛ اختر طابعتين منفصلتين." };
   const printerName = hardwareSettings.barcodePrinterName;
   const jobKey = `label:${printerName}:${request.barcode}:${request.nameAr}:${request.priceMinor}:${request.copies}`;
   return enqueuePrintJob(printerName, jobKey, async () => {
-    // Re-check after an application restart or an external driver change.  The
-    // queue must agree with Electron's page size, otherwise this driver silently
-    // centres a small label on the old 3 x 4 inch stock.
-    await syncLabelPrinterMedia(hardwareSettings);
+    await requireInstalledLabelPrinter(printerName);
+    if (hardwareSettings.labelPrintTransport === "TSPL") return sendTsplLabel(printerName, request);
+    // Media synchronization is started after saving device settings.  Never
+    // repeat or await its PowerShell/driver work here: it can take seconds on a
+    // busy cashier PC while the Windows queue is already ready to print.
     const labelWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
     try {
       await labelWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(productLabelHtml(request))}`);
-      const [width, height] = hardwareSettings.labelPaperSize.split("x").map(Number);
-      const result = await printWebContents(labelWindow, { silent: true, printBackground: true, deviceName: printerName, pageSize: { width: width! * 1000, height: height! * 1000 }, margins: { marginType: "none" }, copies: request.copies });
-      if (!result.success) throw { code: "LABEL_PRINT_FAILED", messageAr: result.errorType === "canceled" ? "أُلغيت طباعة الملصق." : result.errorType === "timeout" ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة." : "تعذر إرسال الملصق لطابعة الباركود المختارة. تحقق من تعريف Xprinter والورق." };
+      // Use the queue's own default media rather than forcing Chromium's
+      // custom page size.  The latter is rejected by several label drivers even
+      // though the same queue prints a Windows test page successfully.
+      const result = await printWebContents(labelWindow, { silent: true, printBackground: true, deviceName: printerName, usePrinterDefaultPageSize: true, margins: { marginType: "none" }, copies: request.copies });
+      if (!result.success) {
+        console.error("[nabta-label] print failed", { printerName, errorType: result.errorType });
+        const reason = result.errorType.toLocaleLowerCase();
+        throw {
+          code: "LABEL_PRINT_FAILED",
+          messageAr: reason.includes("invalid printer settings")
+            ? "إعدادات طابعة الملصقات غير صالحة. اضبط في تعريف Windows مقاس الرول نفسه المختار في نبتة، ثم أعد المحاولة."
+            : reason.includes("cancel")
+              ? "أُلغيت طباعة الملصق."
+              : result.errorType === "timeout"
+                ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة."
+                : "تعذر إرسال الملصق لطابعة الباركود المختارة. تحقق من أن الطابعة متصلة وغير معلّقة في قائمة طباعة Windows.",
+        };
+      }
       return { printed: true, printerName };
     } finally { if (!labelWindow.isDestroyed()) labelWindow.destroy(); }
+  });
+}
+
+async function printProductLabelBatch(request: ProductLabelBatchPrintRequest): Promise<{ printedCount: number; printerName: string }> {
+  if (!hardwareSettings.barcodePrinterName) throw { code: "LABEL_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الباركود من الإعدادات أولًا." };
+  if (hardwareSettings.labelPrintTransport !== "TSPL") throw { code: "LABEL_BATCH_REQUIRES_TSPL", messageAr: "طباعة الدفعات تتطلب اختيار مسار TSPL لطابعة XP-233B." };
+  if (!hardwareSettings.labelCalibrationConfirmed) throw { code: "LABEL_CALIBRATION_REQUIRED", messageAr: "أكد نجاح ملصق المعايرة عمليًا قبل طباعة دفعة من الملصقات." };
+  const printerName = hardwareSettings.barcodePrinterName;
+  return enqueuePrintJob(printerName, `label-batch:${printerName}:${JSON.stringify(request.labels)}`, async () => {
+    await requireInstalledLabelPrinter(printerName);
+    let printedCount = 0;
+    for (const label of request.labels) {
+      await sendTsplLabel(printerName, label);
+      printedCount += label.copies;
+    }
+    return { printedCount, printerName };
   });
 }
 
@@ -1236,28 +1573,35 @@ async function printProductLabelTest(): Promise<{ printed: true; printerName: st
   return printProductLabel({ nameAr: "صنف اختبار", barcode: "6221234567891", priceMinor: 1250, copies: 1 });
 }
 
-async function printReceipt(request: ReceiptPrintRequest): Promise<{ printed: true; printerName: string }> {
+async function printReceipt(request: ReceiptPrintRequest): Promise<{ printed: true; printerName: string; copies: number }> {
   if (!hardwareSettings.receiptPrinterName) throw { code: "RECEIPT_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الإيصالات من الإعدادات أولاً." };
   const printerName = hardwareSettings.receiptPrinterName;
-  return enqueuePrintJob(printerName, `receipt:${printerName}:${request.sale.saleId}`, async () => {
+  return enqueuePrintJob(printerName, `receipt:${printerName}:${request.sale.saleId}:${request.copies}`, async () => {
     const receiptWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
     try {
       await receiptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(receiptHtml(request, hardwareSettings.receiptPaperWidth))}`);
-      const result = await printWebContents(receiptWindow, { silent: true, printBackground: true, deviceName: printerName, usePrinterDefaultPageSize: true });
+      const result = await printWebContents(receiptWindow, {
+        silent: true,
+        printBackground: true,
+        deviceName: printerName,
+        usePrinterDefaultPageSize: true,
+        margins: { marginType: "none" },
+        copies: request.copies,
+      });
       if (!result.success) throw { code: "RECEIPT_PRINT_FAILED", messageAr: result.errorType === "canceled" ? "أُلغيت طباعة الإيصال." : result.errorType === "timeout" ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة." : "تعذر إرسال الإيصال للطابعة المختارة. تحقق من تعريف الطابعة وورقها." };
       if (hardwareSettings.cashDrawerEnabled) {
         void sendCashDrawerPulse(printerName, hardwareSettings.cashDrawerPin)
           .catch((error) => console.error("[nabta-drawer] receipt printed but drawer command failed", error));
       }
-      return { printed: true, printerName };
+      return { printed: true, printerName, copies: request.copies };
     } finally {
       if (!receiptWindow.isDestroyed()) receiptWindow.destroy();
     }
   });
 }
 
-async function printReceiptTest(): Promise<{ printed: true; printerName: string }> {
-  return printReceipt({ storeName: "نبتة — اختبار الطابعة", sale: {
+async function printReceiptTest(): Promise<{ printed: true; printerName: string; copies: number }> {
+  return printReceipt({ storeName: "نبتة — اختبار الطابعة", copies: 1, sale: {
     saleId: "00000000-0000-4000-8000-000000000001", invoiceNo: "TEST-RECEIPT", postedAt: new Date().toISOString(), subtotalMinor: 1250, discountMinor: 0, totalMinor: 1250, paidMinor: 1250, changeMinor: 0,
     lines: [{ productId: "00000000-0000-4000-8000-000000000002", nameAr: "إيصال اختبار", unitKind: "PIECE", qtyMilli: 1000, unitPriceMinor: 1250, grossMinor: 1250, discountMinor: 0, netMinor: 1250, stockVersion: 0 }],
   } });
@@ -1393,6 +1737,7 @@ ipcMain.handle("nabta:invoke", async (event, unknownRequest: unknown) => {
       });
       return { ok: true, data: hardwareSettings };
     }
+    if (request.operation === "hardware.settings.restore") return { ok: true, data: await restorePreviousHardwareSettings() };
     if (request.operation === "hardware.printers.list") return { ok: true, data: await listInstalledPrinters() };
     if (request.operation === "hardware.serial.list") return { ok: true, data: await listSerialPorts() };
     if (request.operation === "hardware.receipt.print") return { ok: true, data: await printReceipt(request.payload) };
@@ -1406,6 +1751,13 @@ ipcMain.handle("nabta:invoke", async (event, unknownRequest: unknown) => {
     if (request.operation === "hardware.driver.install") return { ok: true, data: await openBundledDriver(request.payload.role) };
     if (request.operation === "hardware.label.print") return { ok: true, data: await printProductLabel(request.payload) };
     if (request.operation === "hardware.label.test") return { ok: true, data: await printProductLabelTest() };
+    if (request.operation === "hardware.label.calibrate") {
+      if (!hardwareSettings.barcodePrinterName) throw { code: "LABEL_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الملصقات من الإعدادات أولًا." };
+      await requireInstalledLabelPrinter(hardwareSettings.barcodePrinterName);
+      if (hardwareSettings.labelPrintTransport !== "TSPL") throw { code: "TSPL_NOT_SELECTED", messageAr: "اختر مسار TSPL لطابعة XP-233B قبل معايرة Gap." };
+      return { ok: true, data: await calibrateTsplLabel(hardwareSettings.barcodePrinterName) };
+    }
+    if (request.operation === "hardware.label.batch.print") return { ok: true, data: await printProductLabelBatch(request.payload) };
     if (request.operation === "hardware.purchase-receipt.print") return { ok: true, data: await printPurchaseReceipt(request.payload) };
     if (request.operation === "invoices.purchase-receipt.export-pdf") return { ok: true, data: await exportPurchaseReceiptPdf(request.payload) };
     return { ok: true, data: await callApi(request) };

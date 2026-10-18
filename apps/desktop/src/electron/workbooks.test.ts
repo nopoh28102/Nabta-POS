@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import ExcelJS, { type Workbook } from "exceljs";
-import { createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
+import { createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
 
 const { Workbook: WorkbookConstructor } = ExcelJS;
 
@@ -40,6 +40,38 @@ describe("Excel exports", () => {
     expect(sheet?.getCell("A4").value).toBe("الصنف");
     expect(sheet?.getCell("D5").value).toBe(2);
     expect(sheet?.getCell("F5").value).toBe(15);
+  });
+
+  it("creates a periodic inventory audit with sales, shortages, and an Arabic summary", async () => {
+    const bytes = await createInventoryPeriodicWorkbook({
+      storeName: "الشيماء",
+      generatedAt: "2026-10-16T00:00:00.000Z",
+      period: "MONTHLY",
+      periodLabel: "جرد شهري",
+      periodStart: "2026-10-01",
+      periodEnd: "2026-10-31",
+      totals: {
+        soldProductCount: 1, grossQtyMilli: 2000, returnedQtyMilli: 0, netQtyMilli: 2000,
+        grossSalesMinor: 5000, returnsMinor: 0, netSalesMinor: 5000,
+        outOfStockCount: 1, belowReorderCount: 0,
+      },
+      salesItems: [{
+        nameAr: "أرز", category: "بقالة", barcode: "6220000000001", unitKind: "PIECE",
+        grossQtyMilli: 2000, returnedQtyMilli: 0, netQtyMilli: 2000,
+        grossSalesMinor: 5000, returnsMinor: 0, netSalesMinor: 5000,
+        averageUnitPriceMinor: 2500, availableQtyMilli: 0, reorderLevelMilli: 3000,
+      }],
+      reorderItems: [{
+        nameAr: "أرز", category: "بقالة", barcode: "6220000000001", unitKind: "PIECE",
+        availableQtyMilli: 0, reorderLevelMilli: 3000, shortageQtyMilli: 3000,
+        priceMinor: 2500, status: "OUT_OF_STOCK",
+      }],
+    });
+    const workbook = await openWorkbook(bytes);
+    expect(workbook.getWorksheet("ملخص الجرد")?.getCell("A4").value).toBe("البند");
+    expect(workbook.getWorksheet("الأصناف المباعة")?.getCell("A5").value).toBe("أرز");
+    expect(workbook.getWorksheet("الأصناف المباعة")?.getCell("E5").value).toBe(2);
+    expect(workbook.getWorksheet("نواقص وإعادة الطلب")?.getCell("G5").value).toBe(3);
   });
 
   it("creates an Excel monthly shift register with cashier and close details", async () => {

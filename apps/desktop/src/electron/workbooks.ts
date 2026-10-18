@@ -2,7 +2,7 @@
 // so a named import works in some development test runners but fails once the
 // app is packaged.  The default import is Node's supported CJS interop path.
 import ExcelJS, { type Workbook } from "exceljs";
-import type { InventoryExcelExportResponse, ProductExcelExportResponse, ShiftHistoryExcelExportResponse } from "@nabta/contracts";
+import type { InventoryExcelExportResponse, InventoryPeriodicExcelExportResponse, ProductExcelExportResponse, ShiftHistoryExcelExportResponse } from "@nabta/contracts";
 
 const { Workbook: WorkbookConstructor } = ExcelJS;
 
@@ -71,7 +71,7 @@ function styleSheet(
   return sheet;
 }
 
-function styleDataRow(sheet: ReturnType<Workbook["addWorksheet"]>, rowNumber: number, quantityColumn: number, moneyColumns: number[]): void {
+function styleDataRow(sheet: ReturnType<Workbook["addWorksheet"]>, rowNumber: number, quantityColumns: number | number[], moneyColumns: number[]): void {
   const row = sheet.getRow(rowNumber);
   row.eachCell({ includeEmpty: true }, (cell) => {
     cell.font = { name: "Arial", size: 11 };
@@ -80,7 +80,7 @@ function styleDataRow(sheet: ReturnType<Workbook["addWorksheet"]>, rowNumber: nu
   });
   row.getCell(1).alignment = { horizontal: "right", vertical: "middle" };
   row.getCell(2).alignment = { horizontal: "right", vertical: "middle" };
-  row.getCell(quantityColumn).numFmt = "0.###";
+  (Array.isArray(quantityColumns) ? quantityColumns : [quantityColumns]).forEach((column) => { row.getCell(column).numFmt = "0.###"; });
   moneyColumns.forEach((column) => { row.getCell(column).numFmt = '0.00 "ج.م"'; });
 }
 
@@ -112,6 +112,74 @@ export async function createInventoryWorkbook(data: InventoryExcelExportResponse
     styleDataRow(sheet, rowNumber, 4, [6]);
   });
   sheet.autoFilter = { from: { row: 4, column: 1 }, to: { row: Math.max(data.items.length + 4, 4), column: 7 } };
+  return serialize(workbook);
+}
+
+export async function createInventoryPeriodicWorkbook(data: InventoryPeriodicExcelExportResponse): Promise<Buffer> {
+  const workbook = baseWorkbook();
+  const summary = styleSheet(
+    workbook,
+    "ملخص الجرد",
+    `${data.periodLabel} — ${data.storeName}`,
+    `الفترة: ${data.periodStart} إلى ${data.periodEnd} | وقت التصدير: ${exportedAt(data.generatedAt)}`,
+    ["البند", "القيمة"],
+    [34, 28],
+  );
+  const summaryRows: Array<[string, string | number]> = [
+    ["عدد الأصناف التي بها حركة بيع أو مرتجع", data.totals.soldProductCount],
+    ["إجمالي المبيعات قبل المرتجعات", data.totals.grossSalesMinor / 100],
+    ["قيمة المرتجعات خلال الفترة", data.totals.returnsMinor / 100],
+    ["صافي المبيعات", data.totals.netSalesMinor / 100],
+    ["أصناف نفدت وتحتاج شراء", data.totals.outOfStockCount],
+    ["أصناف أقل من حد إعادة الطلب", data.totals.belowReorderCount],
+  ];
+  summaryRows.forEach(([label, value], index) => {
+    const rowNumber = index + 5;
+    summary.getRow(rowNumber).values = [label, value];
+    styleDataRow(summary, rowNumber, [], [2, 3, 4].includes(index + 1) ? [2] : []);
+  });
+  summary.autoFilter = { from: { row: 4, column: 1 }, to: { row: Math.max(summaryRows.length + 4, 4), column: 2 } };
+
+  const sales = styleSheet(
+    workbook,
+    "الأصناف المباعة",
+    `تفصيل مبيعات الأصناف — ${data.storeName}`,
+    `الفترة: ${data.periodStart} إلى ${data.periodEnd} | عدد الأصناف: ${data.salesItems.length}`,
+    ["الصنف", "التصنيف", "الباركود", "الوحدة", "الكمية المباعة", "المرتجع", "صافي الكمية", "متوسط سعر البيع", "صافي المبيعات", "الرصيد الحالي", "حد إعادة الطلب"],
+    [32, 18, 20, 11, 15, 13, 15, 17, 17, 15, 16],
+  );
+  data.salesItems.forEach((item, index) => {
+    const rowNumber = index + 5;
+    sales.getRow(rowNumber).values = [
+      item.nameAr, item.category, item.barcode ?? "—", item.unitKind === "WEIGHT" ? "كجم" : "قطعة",
+      item.grossQtyMilli / 1000, item.returnedQtyMilli / 1000, item.netQtyMilli / 1000,
+      item.averageUnitPriceMinor === null ? "—" : item.averageUnitPriceMinor / 100,
+      item.netSalesMinor / 100, item.availableQtyMilli / 1000, item.reorderLevelMilli / 1000,
+    ];
+    styleDataRow(sales, rowNumber, [5, 6, 7, 10, 11], [8, 9]);
+  });
+  sales.autoFilter = { from: { row: 4, column: 1 }, to: { row: Math.max(data.salesItems.length + 4, 4), column: 11 } };
+
+  const reorder = styleSheet(
+    workbook,
+    "نواقص وإعادة الطلب",
+    `قائمة النواقص والشراء المقترح — ${data.storeName}`,
+    `الرصيد الحالي وقت التصدير | عدد الأصناف: ${data.reorderItems.length}`,
+    ["الصنف", "التصنيف", "الباركود", "الوحدة", "المتاح", "حد إعادة الطلب", "الكمية المقترحة للشراء", "الحالة", "سعر البيع"],
+    [32, 18, 20, 11, 14, 16, 22, 18, 15],
+  );
+  data.reorderItems.forEach((item, index) => {
+    const rowNumber = index + 5;
+    const status = item.status === "OUT_OF_STOCK" ? "نفد من المخزون" : item.status === "BELOW_REORDER" ? "أقل من حد الطلب" : "عند حد الطلب";
+    reorder.getRow(rowNumber).values = [
+      item.nameAr, item.category, item.barcode ?? "—", item.unitKind === "WEIGHT" ? "كجم" : "قطعة",
+      item.availableQtyMilli / 1000, item.reorderLevelMilli / 1000, item.shortageQtyMilli / 1000, status, item.priceMinor / 100,
+    ];
+    styleDataRow(reorder, rowNumber, [5, 6, 7], [9]);
+    const statusCell = reorder.getCell(rowNumber, 8);
+    statusCell.font = { name: "Arial", size: 11, bold: true, color: { argb: item.status === "OUT_OF_STOCK" ? "FFB42318" : "FFB54708" } };
+  });
+  reorder.autoFilter = { from: { row: 4, column: 1 }, to: { row: Math.max(data.reorderItems.length + 4, 4), column: 9 } };
   return serialize(workbook);
 }
 

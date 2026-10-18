@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { stockCountPostRequestSchema } from "@nabta/contracts";
+import { inventoryPeriodicExportRequestSchema, stockCountPostRequestSchema } from "@nabta/contracts";
 import { calculateInventoryIssueValue, roundHalfUp } from "@nabta/domain";
 import type { Database } from "../db.js";
 import { transaction } from "../db.js";
@@ -7,7 +7,189 @@ import { ApiError } from "../errors.js";
 import { requirePermission } from "../auth.js";
 import { audit } from "../audit.js";
 
+function datePartsInCairo(date: Date): { year: number; month: number; day: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Africa/Cairo", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(date);
+  const part = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((item) => item.type === type)?.value);
+  return { year: part("year"), month: part("month"), day: part("day") };
+}
+
+function formatLocalDate(year: number, month: number, day: number): string {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function addDays(date: { year: number; month: number; day: number }, days: number): { year: number; month: number; day: number } {
+  const value = new Date(Date.UTC(date.year, date.month - 1, date.day + days));
+  return { year: value.getUTCFullYear(), month: value.getUTCMonth() + 1, day: value.getUTCDate() };
+}
+
+function parseReferenceDate(value: string | undefined): { year: number; month: number; day: number } {
+  if (!value) return datePartsInCairo(new Date());
+  const [rawYear, rawMonth, rawDay] = value.split("-");
+  const year = Number(rawYear);
+  const month = Number(rawMonth);
+  const day = Number(rawDay);
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) {
+    throw new ApiError(422, "INVALID_REFERENCE_DATE", "تاريخ التقرير غير صالح");
+  }
+  return { year, month, day };
+}
+
+function resolvePeriod(period: "MONTHLY" | "QUARTERLY" | "YEARLY", referenceDate: string | undefined): { start: string; endExclusive: string; end: string; label: string } {
+  const reference = parseReferenceDate(referenceDate);
+  if (period === "MONTHLY") {
+    const start = { ...reference, day: 1 };
+    const next = start.month === 12 ? { year: start.year + 1, month: 1, day: 1 } : { year: start.year, month: start.month + 1, day: 1 };
+    const end = addDays(next, -1);
+    return { start: formatLocalDate(start.year, start.month, start.day), endExclusive: formatLocalDate(next.year, next.month, next.day), end: formatLocalDate(end.year, end.month, end.day), label: "جرد شهري" };
+  }
+  if (period === "QUARTERLY") {
+    const startMonth = Math.floor((reference.month - 1) / 3) * 3 + 1;
+    const start = { year: reference.year, month: startMonth, day: 1 };
+    const next = startMonth === 10 ? { year: reference.year + 1, month: 1, day: 1 } : { year: reference.year, month: startMonth + 3, day: 1 };
+    const end = addDays(next, -1);
+    return { start: formatLocalDate(start.year, start.month, start.day), endExclusive: formatLocalDate(next.year, next.month, next.day), end: formatLocalDate(end.year, end.month, end.day), label: "جرد ربع سنوي" };
+  }
+  const start = { year: reference.year, month: 1, day: 1 };
+  const next = { year: reference.year + 1, month: 1, day: 1 };
+  const end = addDays(next, -1);
+  return { start: formatLocalDate(start.year, start.month, start.day), endExclusive: formatLocalDate(next.year, next.month, next.day), end: formatLocalDate(end.year, end.month, end.day), label: "جرد سنوي" };
+}
+
+function averageUnitPriceMinor(netSalesMinor: number, netQtyMilli: number): number | null {
+  if (netSalesMinor <= 0 || netQtyMilli <= 0) return null;
+  const numerator = BigInt(netSalesMinor) * 1000n;
+  const denominator = BigInt(netQtyMilli);
+  return Number((numerator + denominator / 2n) / denominator);
+}
+
 export function registerStockRoutes(app: FastifyInstance, db: Database): void {
+  app.get("/v1/inventory/periodic-report", async (request) => {
+    const auth = requirePermission(request, "EXPORT");
+    const query = inventoryPeriodicExportRequestSchema.parse(request.query);
+    const range = resolvePeriod(query.period, query.referenceDate);
+    const terminal = await db.query<{ warehouse_id: string }>("SELECT warehouse_id FROM terminals WHERE id = $1 AND active", [auth.terminalId]);
+    if (!terminal.rows[0]) throw new ApiError(409, "TERMINAL_INVALID", "نقطة البيع غير صالحة");
+    const warehouseId = terminal.rows[0].warehouse_id;
+    const [store, sales, reorder] = await Promise.all([
+      db.query<{ store_name: string }>("SELECT store_name FROM system_state WHERE singleton"),
+      db.query<{
+        name_ar: string; category: string; barcode: string | null; unit_kind: "PIECE" | "WEIGHT";
+        gross_qty_milli: number; returned_qty_milli: number; gross_sales_minor: number; returns_minor: number;
+        available_qty_milli: number; reorder_level_milli: number;
+      }>(`
+        WITH sales_in_period AS (
+          SELECT sl.product_id, max(sl.name_snapshot) AS name_ar, max(sl.unit_kind_snapshot)::text AS unit_kind,
+                 sum(sl.qty_milli)::bigint AS gross_qty_milli, sum(sl.net_minor)::bigint AS gross_sales_minor
+          FROM sales s JOIN sale_lines sl ON sl.sale_id = s.id
+          WHERE s.warehouse_id = $1
+            AND (s.posted_at AT TIME ZONE 'Africa/Cairo')::date >= $2::date
+            AND (s.posted_at AT TIME ZONE 'Africa/Cairo')::date < $3::date
+          GROUP BY sl.product_id
+        ), returns_in_period AS (
+          SELECT sl.product_id, max(sl.name_snapshot) AS name_ar, max(sl.unit_kind_snapshot)::text AS unit_kind,
+                 sum(srl.qty_milli)::bigint AS returned_qty_milli, sum(srl.refund_minor)::bigint AS returns_minor
+          FROM sale_returns sr
+          JOIN sale_return_lines srl ON srl.return_id = sr.id
+          JOIN sale_lines sl ON sl.id = srl.sale_line_id
+          JOIN sales s ON s.id = sl.sale_id
+          WHERE s.warehouse_id = $1
+            AND (sr.posted_at AT TIME ZONE 'Africa/Cairo')::date >= $2::date
+            AND (sr.posted_at AT TIME ZONE 'Africa/Cairo')::date < $3::date
+          GROUP BY sl.product_id
+        )
+        SELECT COALESCE(si.name_ar, ri.name_ar) AS name_ar, COALESCE(p.category, 'غير مصنف') AS category,
+               min(pb.barcode) AS barcode, COALESCE(si.unit_kind, ri.unit_kind)::text AS unit_kind,
+               COALESCE(si.gross_qty_milli, 0)::bigint AS gross_qty_milli,
+               COALESCE(ri.returned_qty_milli, 0)::bigint AS returned_qty_milli,
+               COALESCE(si.gross_sales_minor, 0)::bigint AS gross_sales_minor,
+               COALESCE(ri.returns_minor, 0)::bigint AS returns_minor,
+               COALESCE(sb.qty_milli, 0)::bigint AS available_qty_milli,
+               COALESCE(p.reorder_level_milli, 0)::bigint AS reorder_level_milli
+        FROM sales_in_period si FULL OUTER JOIN returns_in_period ri ON ri.product_id = si.product_id
+        LEFT JOIN products p ON p.id = COALESCE(si.product_id, ri.product_id)
+        LEFT JOIN stock_balances sb ON sb.product_id = COALESCE(si.product_id, ri.product_id) AND sb.warehouse_id = $1
+        LEFT JOIN product_barcodes pb ON pb.product_id = COALESCE(si.product_id, ri.product_id)
+        GROUP BY si.name_ar, ri.name_ar, p.category, si.unit_kind, ri.unit_kind, si.gross_qty_milli,
+                 ri.returned_qty_milli, si.gross_sales_minor, ri.returns_minor, sb.qty_milli, p.reorder_level_milli
+        ORDER BY COALESCE(si.name_ar, ri.name_ar)
+      `, [warehouseId, range.start, range.endExclusive]),
+      db.query<{
+        name_ar: string; category: string; barcode: string | null; unit_kind: "PIECE" | "WEIGHT";
+        qty_milli: number; reorder_level_milli: number; price_minor: number;
+      }>(`
+        SELECT p.name_ar, p.category, min(pb.barcode) AS barcode, p.unit_kind,
+               COALESCE(sb.qty_milli, 0)::bigint AS qty_milli, p.reorder_level_milli, p.price_minor
+        FROM terminals t
+        JOIN products p ON p.active AND p.reorder_level_milli > 0
+        LEFT JOIN stock_balances sb ON sb.warehouse_id = t.warehouse_id AND sb.product_id = p.id
+        LEFT JOIN product_barcodes pb ON pb.product_id = p.id
+        WHERE t.id = $1 AND COALESCE(sb.qty_milli, 0) <= p.reorder_level_milli
+        GROUP BY p.id, p.name_ar, p.category, p.unit_kind, sb.qty_milli, p.reorder_level_milli, p.price_minor
+        ORDER BY CASE WHEN COALESCE(sb.qty_milli, 0) = 0 THEN 0 WHEN COALESCE(sb.qty_milli, 0) < p.reorder_level_milli THEN 1 ELSE 2 END, p.name_ar
+      `, [auth.terminalId]),
+    ]);
+    const salesItems = sales.rows.map((item) => {
+      const netQtyMilli = item.gross_qty_milli - item.returned_qty_milli;
+      const netSalesMinor = item.gross_sales_minor - item.returns_minor;
+      return {
+        nameAr: item.name_ar,
+        category: item.category,
+        barcode: item.barcode,
+        unitKind: item.unit_kind,
+        grossQtyMilli: item.gross_qty_milli,
+        returnedQtyMilli: item.returned_qty_milli,
+        netQtyMilli,
+        grossSalesMinor: item.gross_sales_minor,
+        returnsMinor: item.returns_minor,
+        netSalesMinor,
+        averageUnitPriceMinor: averageUnitPriceMinor(netSalesMinor, netQtyMilli),
+        availableQtyMilli: item.available_qty_milli,
+        reorderLevelMilli: item.reorder_level_milli,
+      };
+    });
+    const reorderItems = reorder.rows.map((item) => ({
+      nameAr: item.name_ar,
+      category: item.category,
+      barcode: item.barcode,
+      unitKind: item.unit_kind,
+      availableQtyMilli: item.qty_milli,
+      reorderLevelMilli: item.reorder_level_milli,
+      shortageQtyMilli: Math.max(0, item.reorder_level_milli - item.qty_milli),
+      priceMinor: item.price_minor,
+      status: item.qty_milli === 0 ? "OUT_OF_STOCK" as const : item.qty_milli < item.reorder_level_milli ? "BELOW_REORDER" as const : "AT_REORDER" as const,
+    }));
+    const totals = salesItems.reduce((result, item) => ({
+      soldProductCount: result.soldProductCount + 1,
+      grossQtyMilli: result.grossQtyMilli + item.grossQtyMilli,
+      returnedQtyMilli: result.returnedQtyMilli + item.returnedQtyMilli,
+      netQtyMilli: result.netQtyMilli + item.netQtyMilli,
+      grossSalesMinor: result.grossSalesMinor + item.grossSalesMinor,
+      returnsMinor: result.returnsMinor + item.returnsMinor,
+      netSalesMinor: result.netSalesMinor + item.netSalesMinor,
+      outOfStockCount: result.outOfStockCount,
+      belowReorderCount: result.belowReorderCount,
+    }), {
+      soldProductCount: 0, grossQtyMilli: 0, returnedQtyMilli: 0, netQtyMilli: 0,
+      grossSalesMinor: 0, returnsMinor: 0, netSalesMinor: 0,
+      outOfStockCount: reorderItems.filter((item) => item.status === "OUT_OF_STOCK").length,
+      belowReorderCount: reorderItems.filter((item) => item.status === "BELOW_REORDER").length,
+    });
+    return {
+      storeName: store.rows[0]?.store_name ?? "نبتة",
+      generatedAt: new Date().toISOString(),
+      period: query.period,
+      periodLabel: range.label,
+      periodStart: range.start,
+      periodEnd: range.end,
+      salesItems,
+      reorderItems,
+      totals,
+    };
+  });
+
   app.get("/v1/stock/reorder-list", async (request) => {
     const auth = requirePermission(request, "STOCK_COUNT");
     const result = await db.query<{

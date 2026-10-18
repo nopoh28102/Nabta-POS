@@ -15,7 +15,9 @@ import type {
   InvoiceDetailResponse,
   InvoiceKind,
   InvoiceSummaryItem,
+  InventoryReportPeriod,
   PartnerListDocumentRequest,
+  PosMetricsResponse,
   QuoteResponse,
   ReceiptBranding,
   ReorderListDocumentRequest,
@@ -41,10 +43,23 @@ type Screen =
   | "shift"
   | "expenses"
   | "settings";
+
+interface TaxSettings {
+  enabled: boolean;
+  ratePercent: number;
+}
+const DEFAULT_TAX_SETTINGS: TaxSettings = { enabled: false, ratePercent: 14 };
+const TAX_SETTINGS_KEY = "nabta.tax-settings";
+
 interface Config {
   serverUrl: string;
   terminalId?: string;
   certificateFingerprint: string;
+}
+interface CatalogPage {
+  products: CatalogProduct[];
+  hasMore: boolean;
+  nextCursor?: string;
 }
 interface User {
   id: string;
@@ -152,6 +167,16 @@ interface BranchSettings extends ReceiptBranding {
 const DRAFT_KEY = "nabta-cart-draft-v1";
 const PENDING_KEY = "nabta-pending-sale-v1";
 const PENDING_RECEIPT_SCAN_KEY = "nabta-pending-receipt-scan-v1";
+const HELD_INVOICES_KEY = "nabta-held-invoices-v1";
+
+interface HeldInvoice {
+  id: string;
+  heldAt: string;
+  cart: CartLine[];
+  discount: string;
+  customerId: string;
+  totalMinor: number;
+}
 const THEME_KEY = "nabta-theme-mode";
 const POS_GRID_PAGE_SIZE = 60;
 const PRODUCTS_TABLE_PAGE_SIZE = 100;
@@ -162,20 +187,35 @@ const DEFAULT_HARDWARE: HardwareSettings = {
   serialPortPath: "",
   serialBaudRate: 9600,
   barcodePrinterName: "Xprinter XP-233B",
+  labelPrintTransport: "TSPL",
+  labelPrinterModel: "XP-233B",
+  labelDpi: 203,
+  labelWidthMm: 50,
+  labelHeightMm: 20,
+  labelGapMm: 2,
+  labelSpeedMmPerSecond: 50.8,
+  labelDensity: 8,
+  labelDirection: 1,
+  labelBarcodeRenderMode: "RASTER",
+  labelOffsetXmm: 0,
+  labelOffsetYmm: 0,
+  labelMediaType: "GAP",
+  labelCalibrationConfirmed: false,
   labelPaperSize: "58x30",
   labelTemplate: "STANDARD",
   receiptPrinterName: "Xprinter XP-Q808K USB",
   receiptPaperWidth: "80",
   autoPrintReceipt: false,
+  receiptCopies: 1,
   cashDrawerEnabled: false,
   cashDrawerPin: "2",
 };
 
 function savedTheme(): ThemeMode {
   try {
-    return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+    return localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
   } catch {
-    return "dark";
+    return "light";
   }
 }
 
@@ -930,6 +970,132 @@ function Centered({
   );
 }
 
+function renderCategoryIcon(categoryName: string): ReactNode {
+  if (categoryName === "الكل") {
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="3" width="7" height="7" rx="1.5" />
+        <rect x="14" y="3" width="7" height="7" rx="1.5" />
+        <rect x="14" y="14" width="7" height="7" rx="1.5" />
+        <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      </svg>
+    );
+  }
+  if (
+    categoryName.includes("مشروب") ||
+    categoryName.includes("عصير") ||
+    categoryName.includes("قهوة") ||
+    categoryName.includes("شاي") ||
+    categoryName.includes("ماء") ||
+    categoryName.includes("مياه")
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 8h1a4 4 0 0 1 0 8h-1" />
+        <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" />
+        <line x1="6" y1="1" x2="6" y2="4" />
+        <line x1="10" y1="1" x2="10" y2="4" />
+        <line x1="14" y1="1" x2="14" y2="4" />
+      </svg>
+    );
+  }
+  if (
+    categoryName.includes("مأكول") ||
+    categoryName.includes("خفيف") ||
+    categoryName.includes("سناك") ||
+    categoryName.includes("شيبس") ||
+    categoryName.includes("حلويات") ||
+    categoryName.includes("شوكول")
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 2v20M21 2v20M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2M7 2v20" />
+      </svg>
+    );
+  }
+  if (
+    categoryName.includes("بقال") ||
+    categoryName.includes("تموين") ||
+    categoryName.includes("أغذية") ||
+    categoryName.includes("طعام") ||
+    categoryName.includes("أرز") ||
+    categoryName.includes("زيت")
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z" />
+        <path d="M3 6h18" />
+        <path d="M16 10a4 4 0 0 1-8 0" />
+      </svg>
+    );
+  }
+  if (
+    categoryName.includes("منزل") ||
+    categoryName.includes("منظف") ||
+    categoryName.includes("ورق") ||
+    categoryName.includes("مناديل")
+  ) {
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        <polyline points="9 22 9 12 15 12 15 22" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
+      <line x1="7" y1="7" x2="7.01" y2="7" />
+    </svg>
+  );
+}
+
+function ProductArt({ product }: { product: CatalogProduct }): ReactNode {
+  const [hasError, setHasError] = useState(false);
+  const showImage = Boolean(product.imageBarcode) && !hasError;
+
+  return (
+    <span className="product-art">
+      {showImage ? (
+        <img
+          className="product-image"
+          src={`nabta-media://product/${encodeURIComponent(product.imageBarcode!)}`}
+          alt={product.nameAr}
+          loading="lazy"
+          onError={() => setHasError(true)}
+        />
+      ) : product.unitKind === "WEIGHT" ? (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="product-fallback-icon"
+        >
+          <path d="M6 2h12l2 6H4L6 2z" />
+          <rect x="3" y="8" width="18" height="13" rx="2" />
+          <path d="M12 12v5M9 14h6" />
+        </svg>
+      ) : (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="product-fallback-icon"
+        >
+          <rect x="2" y="7" width="20" height="14" rx="2" />
+          <path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
 function PosScreen({
   products,
   shift,
@@ -945,6 +1111,10 @@ function PosScreen({
     window.dispatchEvent(
       new CustomEvent("nabta:purchase-scan", { detail: barcode }),
     ),
+  globalSearch = "",
+  posMetrics = null,
+  refreshPosMetrics,
+  taxSettings = DEFAULT_TAX_SETTINGS,
 }: {
   products: CatalogProduct[];
   shift: Shift | null;
@@ -952,13 +1122,17 @@ function PosScreen({
   /** Reloads the complete cached catalog after a stock-changing operation. */
   refreshProducts: () => Promise<CatalogProduct[]>;
   /** Looks up a barcode without replacing the on-screen catalog. */
-  lookupProducts: (query: string) => Promise<CatalogProduct[]>;
+  lookupProducts: (query: string, cursor?: string) => Promise<CatalogPage>;
   refreshShift: () => Promise<void>;
   storeName: string;
   branding?: ReceiptBranding | undefined;
   onOpenShift: () => void;
   onUnregisteredBarcode?: (barcode: string) => void;
   onPurchaseScan?: (barcode: string) => void;
+  globalSearch?: string;
+  posMetrics?: PosMetricsResponse | null;
+  refreshPosMetrics?: () => Promise<PosMetricsResponse | null>;
+  taxSettings?: TaxSettings;
 }): ReactNode {
   const [cart, setCart] = useState<CartLine[]>(() => {
     try {
@@ -967,7 +1141,22 @@ function PosScreen({
       return [];
     }
   });
+  const [heldInvoices, setHeldInvoices] = useState<HeldInvoice[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(HELD_INVOICES_KEY) ?? "[]") as HeldInvoice[];
+    } catch {
+      return [];
+    }
+  });
+  const [showHeldModal, setShowHeldModal] = useState(false);
+  const [cartSaleTab, setCartSaleTab] = useState<"direct" | "customer">("direct");
+  const [sortOption, setSortOption] = useState<"default" | "price-asc" | "price-desc" | "name-asc">("default");
+  const [filterOption, setFilterOption] = useState<"all" | "in-stock" | "weight-only">("all");
   const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<CatalogProduct[]>(products);
+  const [catalogSearching, setCatalogSearching] = useState(false);
+  const [catalogHasMore, setCatalogHasMore] = useState(false);
+  const [nextCatalogCursor, setNextCatalogCursor] = useState<string | null>(null);
   const [category, setCategory] = useState("الكل");
   const [catalogPage, setCatalogPage] = useState(0);
   const [discount, setDiscount] = useState("0.00");
@@ -989,6 +1178,7 @@ function PosScreen({
   const [salePosting, setSalePosting] = useState(false);
   const [receiptPrinting, setReceiptPrinting] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+  const catalogRequestRef = useRef(0);
   const scanHandlerRef = useRef<
     (barcode: string, source: "HID" | "SERIAL") => Promise<void>
   >(async () => undefined);
@@ -1048,37 +1238,162 @@ function PosScreen({
     () => ["الكل", ...new Set(products.map((product) => product.category))],
     [products],
   );
-  // A cashier can scan and edit the cart while the local catalog contains
-  // thousands of items.  Filtering belongs only to catalog inputs; without
-  // this memo the same full scan runs again for every cart, payment and modal
-  // state update, which makes the register feel sluggish.
-  const visible = useMemo(
-    () =>
-      products.filter(
-        (product) =>
-          (category === "الكل" || product.category === category) &&
-          (!query ||
-            [product.nameAr, ...product.barcodes].some((value) =>
-              value.includes(query),
-            )),
-      ),
-    [category, products, query],
-  );
+  // Search and browsing stay server-backed. The renderer only holds a small
+  // page, even when the store has tens of thousands of items.
+  useEffect(() => {
+    const normalized = query.trim();
+    let cancelled = false;
+    const requestId = ++catalogRequestRef.current;
+    setCatalogPage(0);
+    setCatalogSearching(true);
+    const timer = window.setTimeout(() => {
+      void lookupProducts(normalized)
+        .then((next) => {
+          if (cancelled || requestId !== catalogRequestRef.current) return;
+          setSearchResults(next.products);
+          setCatalogHasMore(next.hasMore);
+          setNextCatalogCursor(next.nextCursor ?? null);
+        })
+        .catch(() => {
+          if (cancelled || requestId !== catalogRequestRef.current) return;
+          setSearchResults([]);
+          setCatalogHasMore(false);
+          setNextCatalogCursor(null);
+        })
+        .finally(() => {
+          if (!cancelled && requestId === catalogRequestRef.current) setCatalogSearching(false);
+        });
+    }, normalized ? 140 : 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [lookupProducts, products, query]);
+  useEffect(() => {
+    if (globalSearch) {
+      setQuery(globalSearch);
+    }
+  }, [globalSearch]);
+
+  const filteredProducts = useMemo(() => {
+    let list = searchResults.filter(
+      (product) => category === "الكل" || product.category === category,
+    );
+    if (filterOption === "in-stock") {
+      list = list.filter((p) => p.availableQtyMilli > 0);
+    } else if (filterOption === "weight-only") {
+      list = list.filter((p) => p.unitKind === "WEIGHT");
+    }
+    if (sortOption === "price-asc") {
+      list = [...list].sort((a, b) => a.priceMinor - b.priceMinor);
+    } else if (sortOption === "price-desc") {
+      list = [...list].sort((a, b) => b.priceMinor - a.priceMinor);
+    } else if (sortOption === "name-asc") {
+      list = [...list].sort((a, b) => a.nameAr.localeCompare(b.nameAr, "ar"));
+    }
+    return list;
+  }, [category, filterOption, searchResults, sortOption]);
+
+  const visible = filteredProducts;
   const catalogPageCount = Math.max(
     1,
-    Math.ceil(visible.length / POS_GRID_PAGE_SIZE),
+    Math.ceil(visible.length / POS_GRID_PAGE_SIZE) + (catalogHasMore ? 1 : 0),
   );
   const activeCatalogPage = Math.min(catalogPage, catalogPageCount - 1);
   const visiblePage = visible.slice(
     activeCatalogPage * POS_GRID_PAGE_SIZE,
     (activeCatalogPage + 1) * POS_GRID_PAGE_SIZE,
   );
-  useEffect(() => setCatalogPage(0), [query, category]);
+  useEffect(() => {
+    if (!catalogHasMore || !nextCatalogCursor || catalogSearching) return;
+    if (activeCatalogPage * POS_GRID_PAGE_SIZE < visible.length) return;
+    let cancelled = false;
+    setCatalogSearching(true);
+    void lookupProducts(query.trim(), nextCatalogCursor)
+      .then((next) => {
+        if (cancelled) return;
+        setSearchResults((current) => [...current, ...next.products]);
+        setCatalogHasMore(next.hasMore);
+        setNextCatalogCursor(next.nextCursor ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCatalogHasMore(false);
+          setNextCatalogCursor(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCatalogSearching(false);
+      });
+    return () => { cancelled = true; };
+  }, [activeCatalogPage, catalogHasMore, catalogSearching, lookupProducts, nextCatalogCursor, query, visible.length]);
+  useEffect(() => setCatalogPage(0), [query, category, filterOption, sortOption]);
   const subtotal = cart.reduce(
     (sum, line) =>
       sum + Math.round((line.product.priceMinor * line.qtyMilli) / 1000),
     0,
   );
+  const discountMinor = (() => {
+    try {
+      return minorFromInput(discount);
+    } catch {
+      return 0;
+    }
+  })();
+  const discountedSubtotal = Math.max(0, subtotal - discountMinor);
+  const taxMinor =
+    taxSettings?.enabled && (taxSettings.ratePercent ?? 0) > 0
+      ? Math.round(discountedSubtotal * (taxSettings.ratePercent / 100))
+      : 0;
+  const grandTotal = discountedSubtotal + taxMinor;
+
+  function clearCurrentCart(): void {
+    if (!cart.length) return;
+    if (window.confirm("هل تريد تفريغ عناصر السلة الحالية؟")) {
+      setCart([]);
+      setDiscount("0.00");
+    }
+  }
+
+  function holdCurrentCart(): void {
+    if (cart.length === 0) return;
+    const newHeld: HeldInvoice = {
+      id: crypto.randomUUID(),
+      heldAt: new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
+      cart: [...cart],
+      discount,
+      customerId,
+      totalMinor: grandTotal,
+    };
+    const updated = [newHeld, ...heldInvoices];
+    setHeldInvoices(updated);
+    localStorage.setItem(HELD_INVOICES_KEY, JSON.stringify(updated));
+    setCart([]);
+    setDiscount("0.00");
+    setNotice("تم حفظ الفاتورة في الفواتير المعلقة بنجاح.");
+  }
+
+  function restoreHeldCart(held: HeldInvoice): void {
+    if (cart.length > 0) {
+      if (!window.confirm("السلة الحالية تحتوي على أصناف. هل تريد استبدالها بالفاتورة المعلقة؟")) {
+        return;
+      }
+    }
+    setCart(held.cart);
+    setDiscount(held.discount || "0.00");
+    if (held.customerId) setCustomerId(held.customerId);
+    const updated = heldInvoices.filter((item) => item.id !== held.id);
+    setHeldInvoices(updated);
+    localStorage.setItem(HELD_INVOICES_KEY, JSON.stringify(updated));
+    setShowHeldModal(false);
+    setNotice("تمت استعادة الفاتورة المعلقة إلى السلة.");
+  }
+
+  function deleteHeldCart(id: string): void {
+    const updated = heldInvoices.filter((item) => item.id !== id);
+    setHeldInvoices(updated);
+    localStorage.setItem(HELD_INVOICES_KEY, JSON.stringify(updated));
+  }
 
   function addWithQty(product: CatalogProduct, qtyMilli: number): void {
     if (!Number.isInteger(qtyMilli) || qtyMilli <= 0) {
@@ -1103,6 +1418,10 @@ function PosScreen({
   }
 
   function add(product: CatalogProduct): void {
+    if (product.availableQtyMilli <= 0) {
+      setNotice(`الصنف (${product.nameAr}) غير متوفر حالياً في المخزون (الرصيد: 0). سجل استلام بضاعة لبيعه.`);
+      return;
+    }
     setSalesSheetOpen(true);
     if (product.unitKind === "WEIGHT") {
       setWeightTarget(product);
@@ -1143,11 +1462,30 @@ function PosScreen({
   }
 
   async function addSaleBarcode(barcode: string): Promise<boolean> {
-    let exact = products.find((product) => product.barcodes.includes(barcode));
-    if (!exact)
-      exact = (await lookupProducts(barcode)).find((product) =>
-        product.barcodes.includes(barcode),
-      );
+    const raw = barcode.trim();
+    const candidates = [raw];
+    if (raw.length === 12 && /^\d+$/.test(raw)) {
+      candidates.push("0" + raw);
+    } else if (raw.length === 13 && raw.startsWith("0")) {
+      candidates.push(raw.slice(1));
+    }
+
+    let exact: CatalogProduct | undefined;
+    for (const code of candidates) {
+      exact = products.find((product) => product.barcodes.includes(code));
+      if (exact) break;
+    }
+    if (!exact) {
+      for (const code of candidates) {
+        const found = (await lookupProducts(code)).products.find((product) =>
+          product.barcodes.includes(code),
+        );
+        if (found) {
+          exact = found;
+          break;
+        }
+      }
+    }
     if (exact) {
       add(exact);
       setQuery("");
@@ -1155,7 +1493,7 @@ function PosScreen({
       return true;
     }
     playScanTone("unknown");
-    setUnknownBarcode(barcode);
+    setUnknownBarcode(raw);
     return false;
   }
 
@@ -1294,13 +1632,17 @@ function PosScreen({
       setReceipt(sale);
       setDiscount("0.00");
       if (hardware.autoPrintReceipt && hardware.receiptPrinterName) {
-        void printReceiptForSale(sale, false).catch((cause) =>
+        void printReceiptForSale(sale, false, hardware.receiptCopies).catch((cause) =>
           setNotice(
             `تم تسجيل الفاتورة، لكن تعذرت طباعتها: ${errorMessage(cause)}`,
           ),
         );
       }
-      await Promise.all([refreshProducts(), refreshShift()]);
+      await Promise.all([
+        refreshProducts(),
+        refreshShift(),
+        refreshPosMetrics ? refreshPosMetrics() : Promise.resolve(),
+      ]);
     } catch (cause) {
       setNotice(errorMessage(cause));
     } finally {
@@ -1362,7 +1704,7 @@ function PosScreen({
     };
   }, [hardware.scannerTerminator]);
 
-  async function printReceiptForSale(sale: SaleResponse, announce = true): Promise<void> {
+  async function printReceiptForSale(sale: SaleResponse, announce = true, copies = 1): Promise<void> {
     if (receiptPrintingRef.current) {
       if (announce) setNotice("جارٍ بالفعل إرسال هذا الإيصال للطابعة؛ لن يُرسل أمر مكرر.");
       return;
@@ -1381,9 +1723,9 @@ function PosScreen({
     try {
       await invoke({
         operation: "hardware.receipt.print",
-        payload: { storeName, branding, sale },
+        payload: { storeName, branding, sale, copies },
       });
-      if (announce) setNotice(`أُرسل الإيصال إلى ${hardware.receiptPrinterName}.`);
+      if (announce) setNotice(`أُرسل ${copies === 1 ? "الإيصال" : `${copies} نسخ من الإيصال`} إلى ${hardware.receiptPrinterName}.`);
     } catch (cause) {
       if (announce) setNotice(errorMessage(cause));
       throw cause;
@@ -1417,10 +1759,7 @@ function PosScreen({
 
   return (
     <>
-      <PageHead
-        title="نقطة البيع"
-        subtitle="امسح الباركود، راجع السلة، ثم اترك الخادم يتحقق ويصدر الفاتورة."
-      />
+      <h1 className="sr-only">نقطة البيع</h1>
       {!online && (
         <div className="offline">
           الخادم غير متاح. المسودة محفوظة على هذا الجهاز، وإصدار الفاتورة متوقف
@@ -1432,102 +1771,263 @@ function PosScreen({
           {notice} ×
         </button>
       )}
+      {/* ─── Top 4 Metric Stat Cards ───────────────────────── */}
+      <div className="pos-stat-cards">
+        <div className="pos-stat-card sales">
+          <div className="stat-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="9" cy="21" r="1.4" />
+              <circle cx="20" cy="21" r="1.4" />
+              <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+            </svg>
+          </div>
+          <div className="stat-info">
+            <span className="stat-title">إجمالي المبيعات اليوم</span>
+            <span className="stat-value">
+              {formatMoney(posMetrics ? posMetrics.todaySalesMinor : (shift ? Math.max(0, shift.expectedCashMinor - shift.openingMinor) : 0))}
+            </span>
+          </div>
+        </div>
+
+        <div className="pos-stat-card invoices">
+          <div className="stat-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <polyline points="14 2 14 8 20 8" />
+              <line x1="16" y1="13" x2="8" y2="13" />
+              <line x1="16" y1="17" x2="8" y2="17" />
+              <polyline points="10 9 9 9 8 9" />
+            </svg>
+          </div>
+          <div className="stat-info">
+            <span className="stat-title">عدد الفواتير اليوم</span>
+            <span className="stat-value">
+              {posMetrics ? posMetrics.todayInvoiceCount : (shift && shift.expectedCashMinor > shift.openingMinor ? 1 : 0)}{" "}
+              <span className="stat-unit">فاتورة</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="pos-stat-card products">
+          <div className="stat-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+              <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+              <line x1="12" y1="22.08" x2="12" y2="12" />
+            </svg>
+          </div>
+          <div className="stat-info">
+            <span className="stat-title">عدد المنتجات</span>
+            <span className="stat-value">
+              {(posMetrics ? posMetrics.totalProductsCount : products.length).toLocaleString("ar-EG")}{" "}
+              <span className="stat-unit">منتج</span>
+            </span>
+          </div>
+        </div>
+
+        <div className="pos-stat-card customers">
+          <div className="stat-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+          </div>
+          <div className="stat-info">
+            <span className="stat-title">العملاء اليوم</span>
+            <span className="stat-value">
+              {posMetrics ? posMetrics.todayCustomerCount : (customers.length || 0)}{" "}
+              <span className="stat-unit">عميل</span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* ─── Main POS Layout (Catalog + Cart) ────────────────── */}
       <div className="pos-layout">
         <section className="catalog-area">
-          <div className="search">
-            <span>⌁</span>
-            <input
-              ref={searchRef}
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (
-                  event.key ===
-                  (hardware.scannerTerminator === "ENTER" ? "Enter" : "Tab")
-                ) {
-                  event.preventDefault();
-                  void scan();
-                }
-              }}
-              placeholder="ابحث بالاسم أو امسح الباركود… F2"
-              autoFocus
-            />
+          <div className="catalog-header-row">
+            <div className="catalog-main-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                <line x1="12" y1="22.08" x2="12" y2="12" />
+              </svg>
+              <h2>المنتجات</h2>
+            </div>
           </div>
-          <div className="tabs">
+
+          <div className="catalog-categories">
             {categories.map((item) => (
               <button
                 key={item}
-                className={category === item ? "selected" : ""}
+                type="button"
+                className={`category-pill ${category === item ? "active" : ""}`}
                 onClick={() => setCategory(item)}
               >
-                {item}
+                {renderCategoryIcon(item)}
+                <span>{item}</span>
               </button>
             ))}
           </div>
+
+          <div className="catalog-toolbar">
+            <div className="catalog-search-wrap">
+              <span className="catalog-search-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18 }}>
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+              </span>
+              <input
+                data-testid="pos-scanner"
+                ref={searchRef}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (
+                    event.key ===
+                    (hardware.scannerTerminator === "ENTER" ? "Enter" : "Tab")
+                  ) {
+                    event.preventDefault();
+                    void scan();
+                  }
+                }}
+                placeholder="ابحث بالاسم أو امسح الباركود… F2"
+                autoFocus
+              />
+            </div>
+
+            <div className="catalog-toolbar-actions">
+              <button
+                type="button"
+                className="toolbar-action-btn"
+                onClick={() => {
+                  setSortOption((prev) =>
+                    prev === "default"
+                      ? "price-asc"
+                      : prev === "price-asc"
+                        ? "price-desc"
+                        : prev === "price-desc"
+                          ? "name-asc"
+                          : "default"
+                  );
+                }}
+                title="تغيير الترتيب"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19" />
+                  <polyline points="19 12 12 19 5 12" />
+                </svg>
+                <span>
+                  {sortOption === "default"
+                    ? "ترتيب"
+                    : sortOption === "price-asc"
+                      ? "السعر ↑"
+                      : sortOption === "price-desc"
+                        ? "السعر ↓"
+                        : "الاسم أ-ي"}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className="toolbar-action-btn"
+                onClick={() => {
+                  setFilterOption((prev) =>
+                    prev === "all"
+                      ? "in-stock"
+                      : prev === "in-stock"
+                        ? "weight-only"
+                        : "all"
+                  );
+                }}
+                title="تصفية الأصناف"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+                </svg>
+                <span>
+                  {filterOption === "all"
+                    ? "تصفية"
+                    : filterOption === "in-stock"
+                      ? "المتوفر فقط"
+                      : "الموزون فقط"}
+                </span>
+              </button>
+            </div>
+          </div>
+
           <div className="product-grid">
             {visiblePage.map((product) => (
-              <button
+              <div
                 key={product.id}
-                className="product-card"
+                className={`product-card${product.availableQtyMilli <= 0 ? " out-of-stock" : ""}`}
+                role="button"
+                tabIndex={0}
                 onClick={() => add(product)}
-                disabled={product.availableQtyMilli <= 0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    add(product);
+                  }
+                }}
               >
-                <span className="stock">
-                  {formatQty(product.availableQtyMilli, product.unitKind)}
-                </span>
-                <span className="product-art">
-                  {product.unitKind === "WEIGHT" ? (
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <path d="M6 2h12l2 6H4L6 2z" />
-                      <rect x="3" y="8" width="18" height="13" rx="2" />
-                      <path d="M12 12v5M9 14h6" />
+                {product.availableQtyMilli <= 0 ? (
+                  <span className="stock-tag out-of-stock">نفد المخزون</span>
+                ) : (
+                  <span className="stock-tag">
+                    {formatQty(product.availableQtyMilli, product.unitKind)}
+                  </span>
+                )}
+
+                <ProductArt product={product} />
+
+                <b className="product-name">{product.nameAr}</b>
+
+                <div className="product-card-footer">
+                  <span className="product-price-tag">
+                    {formatMoney(product.priceMinor)}
+                    <small className="product-price-currency">
+                      {product.unitKind === "WEIGHT" ? " / كجم" : ""}
+                    </small>
+                  </span>
+
+                  <span
+                    className="quick-add-btn"
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      add(product);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.stopPropagation();
+                        e.preventDefault();
+                        add(product);
+                      }
+                    }}
+                    aria-label={`إضافة ${product.nameAr}`}
+                    title="إضافة سريعة للسلة"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
                     </svg>
-                  ) : (
-                    <svg
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <rect x="2" y="7" width="20" height="14" rx="2" />
-                      <path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2" />
-                    </svg>
-                  )}
-                  {product.imageBarcode && (
-                    <img
-                      className="product-image"
-                      src={`nabta-media://product/${encodeURIComponent(product.imageBarcode)}`}
-                      alt=""
-                      onError={(event) => {
-                        event.currentTarget.hidden = true;
-                      }}
-                    />
-                  )}
-                </span>
-                <b>{product.nameAr}</b>
-                <small>{product.category}</small>
-                <strong>
-                  {formatMoney(product.priceMinor)}
-                  {product.unitKind === "WEIGHT" ? " / كجم" : ""}
-                </strong>
-              </button>
+                  </span>
+                </div>
+              </div>
             ))}
           </div>
-          {visible.length > POS_GRID_PAGE_SIZE && (
+
+          {filteredProducts.length > POS_GRID_PAGE_SIZE && (
             <nav className="catalog-pagination" aria-label="تصفح الأصناف">
               <span>
                 عرض {activeCatalogPage * POS_GRID_PAGE_SIZE + 1}
                 {"–"}
-                {Math.min((activeCatalogPage + 1) * POS_GRID_PAGE_SIZE, visible.length)} من {visible.length}
+                {Math.min((activeCatalogPage + 1) * POS_GRID_PAGE_SIZE, filteredProducts.length)} من {filteredProducts.length}
               </span>
               <div>
                 <button
@@ -1549,46 +2049,114 @@ function PosScreen({
             </nav>
           )}
         </section>
-        <aside className="cart panel">
-          <header>
-            <div>
-              <h2>الفاتورة الحالية</h2>
-              <small>{shift ? "الوردية مفتوحة" : "افتح وردية للبدء"}</small>
+
+        {/* ─── Cart Panel ───────────────────────────────────────── */}
+        <aside className="cart">
+          <div className="cart-header-top">
+            <h2>فاتورة جديدة</h2>
+            <button
+              type="button"
+              className="cart-clear-icon-btn"
+              onClick={clearCurrentCart}
+              disabled={cart.length === 0}
+              title="تفريغ السلة"
+              aria-label="تفريغ السلة"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              </svg>
+            </button>
+          </div>
+
+          <div className="cart-sale-tabs">
+            <button
+              type="button"
+              className={`cart-sale-tab ${cartSaleTab === "direct" ? "active" : ""}`}
+              onClick={() => setCartSaleTab("direct")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="9" cy="21" r="1" />
+                <circle cx="20" cy="21" r="1" />
+                <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
+              </svg>
+              <span>بيع مباشر</span>
+            </button>
+            <button
+              type="button"
+              className={`cart-sale-tab ${cartSaleTab === "customer" ? "active" : ""}`}
+              onClick={() => setCartSaleTab("customer")}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                <circle cx="12" cy="7" r="4" />
+              </svg>
+              <span>عميل</span>
+            </button>
+          </div>
+
+          {cartSaleTab === "customer" && (
+            <div className="cart-customer-selector">
+              <select
+                value={customerId}
+                onChange={(e) => setCustomerId(e.target.value)}
+                aria-label="اختيار العميل"
+              >
+                <option value="">-- بيع مباشر (بدون تسجيل عميل) --</option>
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} {c.phone ? `(${c.phone})` : ""}
+                  </option>
+                ))}
+              </select>
             </div>
-            <span className="tag">{cart.length} أصناف</span>
-          </header>
-          <div className="cart-lines">
+          )}
+
+          <div className="cart-lines-container">
             {cart.length === 0 ? (
-              <div className="empty">
-                امسح باركودًا أو أضف أول صنف من القائمة.
+              <div className="cart-empty-message">
+                امسح باركودًا أو اختر منتجًا للبدء
               </div>
             ) : (
-              <div className="cart-sheet">
-                <div className="cart-sheet-head">
-                  <span>الصنف</span>
-                  <span>الكمية</span>
-                  <span>سعر الوحدة</span>
+              <div className="cart-table">
+                <div className="cart-table-head">
+                  <span></span>
                   <span>الإجمالي</span>
+                  <span>السعر</span>
+                  <span>الكمية</span>
+                  <span>المنتج</span>
                 </div>
                 {cart.map((line) => (
-                  <div className="cart-line" key={line.product.id}>
-                    <div className="cart-product">
-                      <b>{line.product.nameAr}</b>
+                  <div className="cart-line cart-table-row" key={line.product.id}>
+                    <button
+                      type="button"
+                      className="cart-row-delete"
+                      aria-label="حذف الصنف"
+                      onClick={() =>
+                        setCart((items) =>
+                          items.filter((item) => item.product.id !== line.product.id)
+                        )
+                      }
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 15, height: 15 }}>
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                      </svg>
+                    </button>
+
+                    <span className="cart-row-total">
+                      {formatMoney(
+                        Math.round((line.product.priceMinor * line.qtyMilli) / 1000)
+                      )}
+                    </span>
+
+                    <span className="cart-row-price">
+                      {formatMoney(line.product.priceMinor)}
+                    </span>
+
+                    <div className="cart-stepper">
                       <button
-                        aria-label="حذف الصنف"
-                        onClick={() =>
-                          setCart((items) =>
-                            items.filter(
-                              (item) => item.product.id !== line.product.id,
-                            ),
-                          )
-                        }
-                      >
-                        ×
-                      </button>
-                    </div>
-                    <div className="quantity-actions">
-                      <button
+                        type="button"
                         aria-label="تقليل الكمية"
                         onClick={() => changeCartQty(line.product, -1)}
                       >
@@ -1598,72 +2166,179 @@ function PosScreen({
                         {formatQty(line.qtyMilli, line.product.unitKind)}
                       </span>
                       <button
+                        type="button"
                         aria-label="زيادة الكمية"
                         onClick={() => changeCartQty(line.product, 1)}
                       >
                         +
                       </button>
                     </div>
-                    <span>{formatMoney(line.product.priceMinor)}</span>
-                    <strong>
-                      {formatMoney(
-                        Math.round(
-                          (line.product.priceMinor * line.qtyMilli) / 1000,
-                        ),
-                      )}
-                    </strong>
+
+                    <div className="cart-row-product-info">
+                      {line.product.imageBarcode ? (
+                        <img
+                          className="thumb"
+                          src={`nabta-media://product/${encodeURIComponent(line.product.imageBarcode)}`}
+                          alt=""
+                          onError={(e) => {
+                            e.currentTarget.style.display = "none";
+                          }}
+                        />
+                      ) : null}
+                      <b>{line.product.nameAr}</b>
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </div>
-          <div className="cart-summary">
-            <p>
-              <span>إجمالي الأصناف</span>
+
+          <div className="cart-summary-box">
+            <div className="cart-summary-line">
+              <span>المجموع الفرعي</span>
               <b>{formatMoney(subtotal)}</b>
-            </p>
-            <Field label="خصم الفاتورة">
-              <input
-                value={discount}
-                onChange={(event) => setDiscount(event.target.value)}
-                inputMode="decimal"
-                dir="ltr"
-              />
-            </Field>
-            <p className="payable">
-              <span>المطلوب</span>
-              <strong>
-                {formatMoney(
-                  Math.max(
-                    0,
-                    subtotal -
-                      (() => {
-                        try {
-                          return minorFromInput(discount);
-                        } catch {
-                          return 0;
-                        }
-                      })(),
-                  ),
-                )}
-              </strong>
-            </p>
-            <button
-              className={`primary checkout${shift ? "" : " open-shift-checkout"}`}
-              disabled={!online || cart.length === 0 || paymentPreparing || salePosting}
-              onClick={() => {
-                if (!shift) {
-                  onOpenShift();
-                  return;
-                }
-                void preparePayment();
-              }}
-            >
-              {paymentPreparing ? "جارٍ تجهيز الدفع..." : shift ? "إتمام البيع" : "فتح وردية للمتابعة"} <kbd>F4</kbd>
-            </button>
+            </div>
+
+            <div className="cart-summary-line">
+              <span>% خصم</span>
+              <div className="cart-discount-input-row">
+                <input
+                  value={discount}
+                  onChange={(event) => setDiscount(event.target.value)}
+                  inputMode="decimal"
+                  dir="ltr"
+                  placeholder="0.00"
+                />
+              </div>
+            </div>
+
+            {taxSettings?.enabled && (taxSettings.ratePercent ?? 0) > 0 && (
+              <div className="cart-summary-line">
+                <span>الضريبة ({taxSettings.ratePercent}%)</span>
+                <b>{formatMoney(taxMinor)}</b>
+              </div>
+            )}
+
+            <div className="cart-grand-total-row">
+              <span>الإجمالي</span>
+              <strong>{formatMoney(grandTotal)}</strong>
+            </div>
+
+            <div className="cart-buttons-group">
+              <button
+                type="button"
+                className={`cart-btn-checkout${shift ? "" : " open-shift-checkout"}`}
+                disabled={!online || cart.length === 0 || paymentPreparing || salePosting}
+                onClick={() => {
+                  if (!shift) {
+                    onOpenShift();
+                    return;
+                  }
+                  void preparePayment();
+                }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18 }}>
+                  <rect x="2" y="5" width="20" height="14" rx="2" />
+                  <line x1="2" y1="10" x2="22" y2="10" />
+                </svg>
+                <span>
+                  {paymentPreparing
+                    ? "جارٍ تجهيز الدفع..."
+                    : shift
+                      ? "إتمام البيع"
+                      : "فتح وردية للبدء"}
+                </span>
+                <kbd style={{ fontSize: 10, opacity: 0.8, padding: "2px 5px", background: "rgba(0,0,0,0.15)", borderRadius: 4 }}>F4</kbd>
+              </button>
+
+              <button
+                type="button"
+                className="cart-btn-hold"
+                disabled={cart.length === 0}
+                onClick={holdCurrentCart}
+                title="تعليق وحفظ الفاتورة الحالية لاسترجاعها لاحقًا"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18 }}>
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                  <polyline points="17 21 17 13 7 13 7 21" />
+                  <polyline points="7 3 7 8 15 8" />
+                </svg>
+                <span>حفظ الفاتورة</span>
+              </button>
+            </div>
+
+            {heldInvoices.length > 0 && (
+              <button
+                type="button"
+                className="held-invoices-pill"
+                onClick={() => setShowHeldModal(true)}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
+                  <circle cx="12" cy="12" r="10" />
+                  <polyline points="12 6 12 12 16 14" />
+                </svg>
+                <span>فواتير معلقة ({heldInvoices.length})</span>
+              </button>
+            )}
           </div>
         </aside>
       </div>
+
+      {/* ─── Held Invoices Modal ─────────────────────────────── */}
+      {showHeldModal && (
+        <div className="modal-backdrop" onClick={() => setShowHeldModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 540 }}>
+            <h2>الفواتير المعلقة ({heldInvoices.length})</h2>
+            <p className="hint">اختر فاتورة معلقة لاستعادتها إلى السلة وإتمام عملية البيع.</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, margin: "16px 0", maxHeight: 360, overflowY: "auto" }}>
+              {heldInvoices.map((held, idx) => (
+                <div
+                  key={held.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "12px 16px",
+                    border: "1px solid var(--line)",
+                    borderRadius: 12,
+                    background: "#f8fafc",
+                  }}
+                >
+                  <div>
+                    <b>فاتورة #{heldInvoices.length - idx}</b>
+                    <div style={{ fontSize: 11, color: "var(--ink-muted)", marginTop: 3 }}>
+                      الوقت: {held.heldAt} • {held.cart.length} أصناف
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: "bold", color: "var(--green)", marginTop: 2 }}>
+                      {formatMoney(held.totalMinor)}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      type="button"
+                      className="primary"
+                      style={{ padding: "6px 14px", fontSize: 12 }}
+                      onClick={() => restoreHeldCart(held)}
+                    >
+                      استعادة
+                    </button>
+                    <button
+                      type="button"
+                      style={{ padding: "6px 10px", fontSize: 12, color: "var(--red)", borderColor: "rgba(239,68,68,0.3)" }}
+                      onClick={() => deleteHeldCart(held.id)}
+                    >
+                      حذف
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button type="button" onClick={() => setShowHeldModal(false)}>إغلاق</button>
+            </div>
+          </div>
+        </div>
+      )}
       {pendingScan && (
         <div className="modal-backdrop">
           <section className="modal scanner-modal">
@@ -2176,10 +2851,13 @@ function ProductsScreen({
       setMessage(errorMessage(cause));
     }
   }
-  async function exportProducts(mode: "PUBLIC" | "INTERNAL", productIds = searchResults.map((product) => product.id)): Promise<void> {
+  async function exportProducts(mode: "PUBLIC" | "INTERNAL"): Promise<void> {
     try {
-      if (!productIds.length) throw new Error("لا توجد أصناف مطابقة لتصديرها");
-      const result = await invoke<{ cancelled: boolean; path?: string; itemCount: number }>({ operation: "products.export", payload: { mode, productIds } });
+      const query = productQuery.trim();
+      const result = await invoke<{ cancelled: boolean; path?: string; itemCount: number }>({
+        operation: "products.export",
+        payload: { mode, ...(query ? { query } : {}) },
+      });
       setMessage(result.cancelled
         ? "تم إلغاء حفظ ملف Excel."
         : `تم حفظ ملف Excel (${result.itemCount} صنف): ${result.path}`);
@@ -2187,8 +2865,8 @@ function ProductsScreen({
       setMessage(errorMessage(cause));
     }
   }
-  async function printSearchedProductLabel(product: CatalogProduct, copies = 1): Promise<void> {
-    const barcode = product.barcodes[0];
+  async function printSearchedProductLabel(product: CatalogProduct, barcodeToPrint?: string, copies = 1): Promise<void> {
+    const barcode = (barcodeToPrint || product.barcodes[0] || "").trim();
     if (!barcode) {
       setMessage("لا يوجد باركود لهذا الصنف لطباعة الملصق.");
       return;
@@ -2204,7 +2882,7 @@ function ProductsScreen({
         return;
       }
       const result = await printProductLabel(product.nameAr, barcode, product.priceMinor, copies);
-      setMessage(`أُرسل ${copies} ملصق لصنف «${product.nameAr}» إلى ${result.printerName}.`);
+      setMessage(`أُرسل ${copies} ملصق لصنف «${product.nameAr}» بالباركود [${barcode}] إلى ${result.printerName}.`);
     } catch (cause) {
       const failure = cause as Partial<ApiFailure>;
       setMessage(
@@ -2594,24 +3272,56 @@ function ProductsScreen({
             className="modal form-grid"
             onSubmit={(event) => {
               event.preventDefault();
-              const copies = Number(new FormData(event.currentTarget).get("copies"));
+              const data = new FormData(event.currentTarget);
+              const copies = Number(data.get("copies"));
               if (!Number.isInteger(copies) || copies < 1 || copies > 100) {
                 setMessage("أدخل عدداً صحيحاً من 1 إلى 100 نسخة.");
                 return;
               }
+              const barcode = String(data.get("barcode") || "").trim() || (labelPrintProduct.barcodes[0] ?? "");
+              if (!barcode) {
+                setMessage("أدخل باركود صالحاً لطباعة الملصق.");
+                return;
+              }
               const product = labelPrintProduct;
               setLabelPrintProduct(null);
-              void printSearchedProductLabel(product, copies);
+              void printSearchedProductLabel(product, barcode, copies);
             }}
           >
             <h2 className="full">طباعة باركود الصنف</h2>
-            <p className="full">{labelPrintProduct.nameAr}</p>
+            <div className="full" style={{ background: "rgba(29, 184, 122, 0.08)", border: "1px solid rgba(29, 184, 122, 0.25)", borderRadius: "8px", padding: "12px 16px" }}>
+              <div style={{ fontSize: "16px", fontWeight: "bold", color: "var(--nabta-text, #1e293b)", marginBottom: "4px" }}>{labelPrintProduct.nameAr}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "14px", color: "var(--nabta-text-muted, #64748b)" }}>
+                <span>سعر البيع: <strong style={{ color: "var(--nabta-primary, #059669)" }}>{formatMoney(labelPrintProduct.priceMinor)}</strong></span>
+                <span>الرصيد: {formatQty(labelPrintProduct.availableQtyMilli, labelPrintProduct.unitKind)}</span>
+              </div>
+            </div>
+            {labelPrintProduct.barcodes.length > 1 ? (
+              <Field label="اختر الباركود المراد طباعته">
+                <select name="barcode" defaultValue={labelPrintProduct.barcodes[0]} dir="ltr" autoFocus>
+                  {labelPrintProduct.barcodes.map((code) => (
+                    <option key={code} value={code}>{code}</option>
+                  ))}
+                </select>
+              </Field>
+            ) : (
+              <Field label="الباركود المسجل للطباعة">
+                <input
+                  name="barcode"
+                  defaultValue={labelPrintProduct.barcodes[0] ?? ""}
+                  dir="ltr"
+                  required
+                  autoFocus
+                  title="الباركود الذي سيتم طباعته على الاستيكر"
+                />
+              </Field>
+            )}
             <Field label="عدد النسخ المطلوبة">
-              <input name="copies" type="number" min="1" max="100" step="1" defaultValue="1" required autoFocus dir="ltr" />
+              <input name="copies" type="number" min="1" max="100" step="1" defaultValue="1" required dir="ltr" />
             </Field>
             <div className="modal-actions full">
               <button type="button" onClick={() => setLabelPrintProduct(null)}>إلغاء</button>
-              <button className="primary">طباعة</button>
+              <button className="primary">طباعة الملصق</button>
             </div>
           </form>
         </div>
@@ -2772,6 +3482,19 @@ interface ExpiryLot {
   days_remaining: number;
 }
 
+function boundedNumber(value: FormDataEntryValue | null, fallback: number, minimum: number, maximum: number): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(minimum, Math.min(maximum, numeric)) : fallback;
+}
+
+function cairoDateForInput(): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Africa/Cairo", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const value = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
+
 function qtyFromInput(value: string): number {
   const normalized = value.trim().replace(/[٫,]/g, ".");
   const match = /^(\d+)(?:\.(\d{1,3}))?$/.exec(normalized);
@@ -2816,6 +3539,9 @@ function InventoryScreen({
   ]);
   const [receiptBarcode, setReceiptBarcode] = useState("");
   const [unknownReceiptBarcode, setUnknownReceiptBarcode] = useState("");
+  const [auditPeriod, setAuditPeriod] = useState<InventoryReportPeriod>("MONTHLY");
+  const [auditReferenceDate, setAuditReferenceDate] = useState(cairoDateForInput);
+  const [exportingAudit, setExportingAudit] = useState(false);
   const product = products.find((item) => item.id === productId) ?? products[0];
   useEffect(() => {
     if (!productId && products[0]) setProductId(products[0].id);
@@ -3020,13 +3746,52 @@ function InventoryScreen({
     }
   }
 
+  async function exportPeriodicInventory(): Promise<void> {
+    if (exportingAudit) return;
+    setExportingAudit(true);
+    try {
+      const result = await invoke<{ cancelled: boolean; path?: string; soldItemCount: number; reorderItemCount: number }>({
+        operation: "inventory.periodic-export-xlsx",
+        payload: { period: auditPeriod, referenceDate: auditReferenceDate },
+      });
+      setMessage(result.cancelled
+        ? "تم إلغاء حفظ ملف الجرد الدوري."
+        : `تم تصدير الجرد بنجاح: ${result.soldItemCount} صنف بحركة بيع أو مرتجع، و${result.reorderItemCount} صنفًا ضمن النواقص. ${result.path}`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setExportingAudit(false);
+    }
+  }
+
   return (
     <>
       <PageHead
         title="إدارة المخزون"
         subtitle="اختر العملية المطلوبة؛ كل عملية لها مساحة مستقلة وواضحة."
-        action={<button onClick={() => void exportCurrentInventory()}>تصدير المخزون إلى Excel</button>}
+        action={<div className="page-head-actions"><button onClick={() => void exportCurrentInventory()}>تصدير المخزون الحالي</button></div>}
       />
+      <section className="inventory-period-export" aria-label="تصدير جرد دوري">
+        <div>
+          <h2>جرد دوري للمبيعات والنواقص</h2>
+          <p>ينشئ ملف Excel مفصّلًا للأصناف المباعة خلال الفترة، والمرتجعات، والرصيد الحالي، وقائمة شراء للأصناف الناقصة.</p>
+        </div>
+        <label className="field">
+          نوع الجرد
+          <select value={auditPeriod} onChange={(event) => setAuditPeriod(event.target.value as InventoryReportPeriod)}>
+            <option value="MONTHLY">شهري</option>
+            <option value="QUARTERLY">ربع سنوي</option>
+            <option value="YEARLY">سنوي</option>
+          </select>
+        </label>
+        <label className="field">
+          تاريخ مرجعي للفترة
+          <input type="date" value={auditReferenceDate} onChange={(event) => setAuditReferenceDate(event.target.value)} />
+        </label>
+        <button type="button" className="primary" onClick={() => void exportPeriodicInventory()} disabled={exportingAudit}>
+          {exportingAudit ? "جارٍ تجهيز ملف الجرد…" : "تصدير الجرد إلى Excel"}
+        </button>
+      </section>
       <div className="subtabs" role="tablist" aria-label="عمليات المخزون">
         {(
           [
@@ -3712,6 +4477,7 @@ function InvoicesScreen({
         payload: {
           storeName,
           branding,
+          copies: 1,
           sale: reprintData,
         },
       });
@@ -5587,11 +6353,21 @@ function ExpensesScreen({
 function SettingsScreen({
   onSettingsChange,
   onDataReset,
+  taxSettings = DEFAULT_TAX_SETTINGS,
+  onTaxSettingsChange,
+  currentUser,
+  onUserUpdated,
 }: {
   onSettingsChange: (settings: BranchSettings) => void;
   onDataReset: () => void;
+  taxSettings?: TaxSettings;
+  onTaxSettingsChange?: (settings: TaxSettings) => void;
+  currentUser?: User | undefined;
+  onUserUpdated?: ((user: User) => void) | undefined;
 }): ReactNode {
   const [settings, setSettings] = useState<BranchSettings | null>(null);
+  const [taxEnabled, setTaxEnabled] = useState(taxSettings.enabled);
+  const [taxRatePercent, setTaxRatePercent] = useState(taxSettings.ratePercent);
   const [pendingLogo, setPendingLogo] = useState<string | null>(null);
   const [hardware, setHardware] = useState<HardwareSettings>(DEFAULT_HARDWARE);
   const [printers, setPrinters] = useState<InstalledPrinter[]>([]);
@@ -5640,10 +6416,30 @@ function SettingsScreen({
         logoDataUrl,
       };
       await invoke({ operation: "settings.branch.update", payload: next });
+      const ownerDisplayName = String(data.get("ownerDisplayName") ?? "").trim();
+      if (currentUser && ownerDisplayName && ownerDisplayName !== currentUser.displayName) {
+        await invoke({
+          operation: "users.update",
+          payload: {
+            userId: currentUser.id,
+            update: {
+              displayName: ownerDisplayName,
+              role: (currentUser.role as "CASHIER" | "MANAGER" | "OWNER" | "STOCK_KEEPER") || "OWNER",
+              active: true,
+              discountLimitBps: 10000,
+            },
+          },
+        });
+        onUserUpdated?.({ ...currentUser, displayName: ownerDisplayName });
+      }
       setSettings(next);
       setPendingLogo(null);
       onSettingsChange(next);
-      setMessage("تم حفظ هوية المتجر وتصميم الإيصال وإعدادات البيع.");
+      onTaxSettingsChange?.({
+        enabled: taxEnabled,
+        ratePercent: Number(taxRatePercent) || 0,
+      });
+      setMessage("تم حفظ هوية المتجر وتصميم الإيصال وإعدادات البيع والضريبة.");
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -5669,12 +6465,27 @@ function SettingsScreen({
         Math.min(230400, Number(data.get("serialBaudRate")) || 9600),
       ),
       barcodePrinterName: String(data.get("barcodePrinterName") ?? "").trim(),
+      labelPrintTransport: String(data.get("labelPrintTransport")) === "WINDOWS" ? "WINDOWS" : "TSPL",
+      labelPrinterModel: "XP-233B",
+      labelDpi: 203,
+      labelWidthMm: boundedNumber(data.get("labelWidthMm"), 50, 20, 56),
+      labelHeightMm: boundedNumber(data.get("labelHeightMm"), 20, 10, 150),
+      labelGapMm: boundedNumber(data.get("labelGapMm"), 2, 0.5, 10),
+      labelSpeedMmPerSecond: boundedNumber(data.get("labelSpeedMmPerSecond"), 50.8, 25.4, 127),
+      labelDensity: Math.round(boundedNumber(data.get("labelDensity"), 8, 0, 15)),
+      labelDirection: Number(data.get("labelDirection") ?? 1) === 0 ? 0 : 1,
+      labelBarcodeRenderMode: data.get("labelBarcodeRenderMode") === "NATIVE_TSPL" ? "NATIVE_TSPL" : "RASTER",
+      labelOffsetXmm: boundedNumber(data.get("labelOffsetXmm"), 0, -10, 10),
+      labelOffsetYmm: boundedNumber(data.get("labelOffsetYmm"), 0, -10, 10),
+      labelMediaType: "GAP",
+      labelCalibrationConfirmed: data.get("labelCalibrationConfirmed") === "on",
       labelPaperSize: labelPaperSize(String(data.get("labelPaperSize") ?? "")),
       labelTemplate: labelTemplate(String(data.get("labelTemplate") ?? "")),
       receiptPrinterName: String(data.get("receiptPrinterName") ?? "").trim(),
       receiptPaperWidth:
         String(data.get("receiptPaperWidth")) === "58" ? "58" : "80",
       autoPrintReceipt: data.get("autoPrintReceipt") === "on",
+      receiptCopies: Math.max(1, Math.min(5, Math.trunc(Number(data.get("receiptCopies")) || 1))),
       cashDrawerEnabled: data.get("cashDrawerEnabled") === "on",
       cashDrawerPin: String(data.get("cashDrawerPin")) === "5" ? "5" : "2",
     };
@@ -5712,8 +6523,31 @@ function SettingsScreen({
   async function printLabelTest(): Promise<void> {
     setDevicesBusy(true);
     try {
-      const result = await invoke<{ printerName: string }>({ operation: "hardware.label.test" });
-      setMessage(`تم إرسال ملصق الاختبار إلى ${result.printerName}.`);
+      const result = await invoke<{ printerName: string; spoolJobId?: number }>({ operation: "hardware.label.test" });
+      setMessage(`قبلت قائمة Windows ملصق الاختبار لطابعة ${result.printerName}${result.spoolJobId ? ` (مهمة رقم ${result.spoolJobId})` : ""}. هذا لا يثبت خروج الورق فعليًا؛ افحص الملصق ثم أكد المعايرة.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setDevicesBusy(false);
+    }
+  }
+  async function calibrateLabelGap(): Promise<void> {
+    setDevicesBusy(true);
+    try {
+      const result = await invoke<{ printerName: string; spoolJobId: number }>({ operation: "hardware.label.calibrate" });
+      setMessage(`أُرسل أمر معايرة حساس Gap إلى ${result.printerName} (مهمة Windows رقم ${result.spoolJobId}). لا يحدد هذا الأمر عرض الملصق؛ اطبع ملصق اختبار بعده ثم أكد القياس عمليًا.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setDevicesBusy(false);
+    }
+  }
+  async function restoreHardware(): Promise<void> {
+    setDevicesBusy(true);
+    try {
+      const restored = await invoke<HardwareSettings>({ operation: "hardware.settings.restore" });
+      setHardware(restored);
+      setMessage("تمت استعادة إعدادات الأجهزة السابقة لهذا الكاشير.");
     } catch (cause) {
       setMessage(errorMessage(cause));
     } finally {
@@ -5756,15 +6590,27 @@ function SettingsScreen({
             className="settings-form"
             onSubmit={(event) => void save(event)}
           >
-            <Field label="اسم السوبر ماركت">
-              <input
-                name="storeName"
-                defaultValue={settings.storeName}
-                minLength={2}
-                maxLength={160}
-                required
-              />
-            </Field>
+            <div style={{ display: "grid", gridTemplateColumns: currentUser ? "1fr 1fr" : "1fr", gap: "14px", marginBottom: "14px" }}>
+              <Field label="اسم السوبر ماركت / المتجر">
+                <input
+                  name="storeName"
+                  defaultValue={settings.storeName}
+                  minLength={2}
+                  maxLength={160}
+                  required
+                />
+              </Field>
+              {currentUser && (
+                <Field label="اسم المسؤول / المالك">
+                  <input
+                    name="ownerDisplayName"
+                    defaultValue={currentUser.displayName}
+                    maxLength={80}
+                    placeholder="مثال: أحمد محمد / المدير العام"
+                  />
+                </Field>
+              )}
+            </div>
             <div className="receipt-branding-settings">
               <Field label="رقم الهاتف على الإيصال">
                 <input name="receiptPhone" defaultValue={settings.receiptPhone} placeholder="01234567890" inputMode="tel" dir="ltr" />
@@ -5808,6 +6654,40 @@ function SettingsScreen({
                 <small>يحمي البيع من تشغيلات منتهية الصلاحية.</small>
               </span>
             </label>
+            <div className="tax-settings-card" style={{ marginTop: "1rem", marginBottom: "1rem", padding: "1rem", background: "var(--card-bg, #f8fafc)", borderRadius: "10px", border: "1px solid var(--border-color, #e2e8f0)" }}>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  name="taxEnabled"
+                  checked={taxEnabled}
+                  onChange={(e) => setTaxEnabled(e.target.checked)}
+                />
+                <span>
+                  <b>تفعيل ضريبة القيمة المضافة (VAT)</b>
+                  <small>إضافة سطر الضريبة في شاشة البيع وحسابها على الفاتورة (معطلة افتراضياً لمعظم محلات السوبرماركت).</small>
+                </span>
+              </label>
+
+              {taxEnabled && (
+                <div style={{ marginTop: "0.75rem", maxWidth: "240px" }}>
+                  <Field label="نسبة الضريبة (%)">
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="0.5"
+                      value={taxRatePercent}
+                      onChange={(e) => setTaxRatePercent(Number(e.target.value) || 0)}
+                      placeholder="14"
+                      dir="ltr"
+                    />
+                  </Field>
+                  <small style={{ color: "var(--text-muted, #64748b)", display: "block", marginTop: "4px" }}>
+                    النسبة العامة في مصر 14% أو 15%، يمكنك تعديلها أو إيقافها حسب طبيعة النشاط.
+                  </small>
+                </div>
+              )}
+            </div>
             <button className="primary">حفظ هوية المتجر والإعدادات</button>
           </form>
         </section>
@@ -5815,7 +6695,7 @@ function SettingsScreen({
       <section className="panel operation-panel device-panel">
         <div className="panel-title-row">
           <div>
-            <h2>السكانر والطابعة</h2>
+            <h2>الطابعات والباركود</h2>
             <p className="hint">الإعدادات تحفظ لهذا الجهاز/الكاشير فقط.</p>
           </div>
           <button
@@ -5908,9 +6788,9 @@ function SettingsScreen({
             </p>
           </div>
           <div className="device-section">
-            <h3>طابعة ملصقات الباركود</h3>
+            <h3>معايرة طابعة الباركود — Xprinter XP-233B</h3>
             <div className="two-columns">
-              <Field label="طابعة الملصقات — Xprinter XP-233B">
+              <Field label="طابعة الملصقات في Windows">
                 <SearchableSelect
                   name="barcodePrinterName"
                   value={hardware.barcodePrinterName}
@@ -5924,54 +6804,53 @@ function SettingsScreen({
                   emptyText="لا توجد طابعات مثبتة في Windows."
                 />
               </Field>
-              <Field label="مقاس الملصق">
-                <select
-                  name="labelPaperSize"
-                  value={hardware.labelPaperSize}
-                  onChange={(event) => {
-                    const selectedSize = labelPaperSize(event.target.value);
-                    setHardware({
-                      ...hardware,
-                      labelPaperSize: selectedSize,
-                      labelTemplate: hardware.labelTemplate === "MICRO" ? "STANDARD" : hardware.labelTemplate,
-                    });
-                  }}
-                >
-                  {LABEL_PAPER_SIZES.map((size) => <option key={size.value} value={size.value}>{size.label}</option>)}
+              <Field label="مسار طباعة الملصق">
+                <select name="labelPrintTransport" value={hardware.labelPrintTransport} onChange={(event) => setHardware({ ...hardware, labelPrintTransport: event.target.value === "WINDOWS" ? "WINDOWS" : "TSPL" })}>
+                  <option value="TSPL">TSPL RAW — موصى به لـ XP-233B</option>
+                  <option value="WINDOWS">Windows / تعريف الطابعة — توافق فقط</option>
                 </select>
               </Field>
             </div>
-            <div className="label-layout-settings">
-              <Field label="تصميم الملصق">
-                <select
-                  name="labelTemplate"
-                  value={hardware.labelTemplate}
-                  onChange={(event) => setHardware({ ...hardware, labelTemplate: labelTemplate(event.target.value) })}
-                >
-                  {LABEL_TEMPLATES.filter((template) => template.value !== "MICRO").map((template) => <option key={template.value} value={template.value}>{template.label} — {template.description}</option>)}
+            <div className="three-columns">
+              <Field label="عرض الاستيكر (مم)"><input name="labelWidthMm" type="number" min="20" max="56" step="0.1" value={hardware.labelWidthMm} onChange={(event) => setHardware({ ...hardware, labelWidthMm: boundedNumber(event.target.value, 50, 20, 56), labelCalibrationConfirmed: false })} dir="ltr" /></Field>
+              <Field label="ارتفاع الاستيكر (مم)"><input name="labelHeightMm" type="number" min="10" max="150" step="0.1" value={hardware.labelHeightMm} onChange={(event) => setHardware({ ...hardware, labelHeightMm: boundedNumber(event.target.value, 20, 10, 150), labelCalibrationConfirmed: false })} dir="ltr" /></Field>
+              <Field label="الفاصل Gap (مم)"><input name="labelGapMm" type="number" min="0.5" max="10" step="0.1" value={hardware.labelGapMm} onChange={(event) => setHardware({ ...hardware, labelGapMm: boundedNumber(event.target.value, 2, 0.5, 10), labelCalibrationConfirmed: false })} dir="ltr" /></Field>
+            </div>
+            <div className="three-columns">
+              <Field label="السرعة (مم/ث)"><input name="labelSpeedMmPerSecond" type="number" min="25.4" max="127" step="0.1" value={hardware.labelSpeedMmPerSecond} onChange={(event) => setHardware({ ...hardware, labelSpeedMmPerSecond: boundedNumber(event.target.value, 50.8, 25.4, 127) })} dir="ltr" /></Field>
+              <Field label="الكثافة 0–15"><input name="labelDensity" type="number" min="0" max="15" step="1" value={hardware.labelDensity} onChange={(event) => setHardware({ ...hardware, labelDensity: Math.round(boundedNumber(event.target.value, 8, 0, 15)) })} dir="ltr" /></Field>
+              <Field label="المستشعر"><input value="Gap — 203 DPI" readOnly dir="ltr" /></Field>
+            </div>
+            <div className="two-columns">
+              <Field label="اتجاه الطباعة">
+                <select name="labelDirection" value={hardware.labelDirection ?? 1} onChange={(event) => setHardware({ ...hardware, labelDirection: Number(event.target.value) as 0 | 1 })}>
+                  <option value={1}>طبيعي (DIRECTION 1,0)</option>
+                  <option value={0}>معكوس 180° (DIRECTION 0,0)</option>
                 </select>
               </Field>
-              <div className={`label-preview label-preview-${hardware.labelTemplate.toLowerCase()}`} style={{ aspectRatio: hardware.labelPaperSize.replace("x", " / ") }}>
-                <b className="label-preview-brand">الشيماء</b>
-                <span className="label-preview-rule" />
-                <span className="label-preview-bars" aria-label="باركود تجريبي" />
-                <em>123456789012</em>
-                <div className="label-preview-details"><strong>صنف تجريبي باسم طويل</strong><span>١٢٫٥٠ ج.م</span></div>
+              <Field label="محرك رسم الباركود">
+                <select name="labelBarcodeRenderMode" value={hardware.labelBarcodeRenderMode ?? "RASTER"} onChange={(event) => setHardware({ ...hardware, labelBarcodeRenderMode: event.target.value === "NATIVE_TSPL" ? "NATIVE_TSPL" : "RASTER" })}>
+                  <option value="RASTER">محرك نقطي موحد (Test B — موصى به ومطابق للمعاينة)</option>
+                  <option value="NATIVE_TSPL">باركود TSPL الداخلي (Test A — خطوط الطابعة المدمجة)</option>
+                </select>
+              </Field>
+            </div>
+            <div className="two-columns">
+              <Field label="إزاحة أفقية X (مم)"><input name="labelOffsetXmm" type="number" min="-10" max="10" step="0.1" value={hardware.labelOffsetXmm} onChange={(event) => setHardware({ ...hardware, labelOffsetXmm: boundedNumber(event.target.value, 0, -10, 10), labelCalibrationConfirmed: false })} dir="ltr" /></Field>
+              <Field label="إزاحة رأسية Y (مم)"><input name="labelOffsetYmm" type="number" min="-10" max="10" step="0.1" value={hardware.labelOffsetYmm} onChange={(event) => setHardware({ ...hardware, labelOffsetYmm: boundedNumber(event.target.value, 0, -10, 10), labelCalibrationConfirmed: false })} dir="ltr" /></Field>
+            </div>
+            {hardware.labelPrintTransport === "WINDOWS" && <div className="two-columns"><Field label="مقاس تعريف Windows"><select name="labelPaperSize" value={hardware.labelPaperSize} onChange={(event) => setHardware({ ...hardware, labelPaperSize: labelPaperSize(event.target.value) })}>{LABEL_PAPER_SIZES.map((size) => <option key={size.value} value={size.value}>{size.label}</option>)}</select></Field><Field label="تصميم المسار البديل"><select name="labelTemplate" value={hardware.labelTemplate} onChange={(event) => setHardware({ ...hardware, labelTemplate: labelTemplate(event.target.value) })}>{LABEL_TEMPLATES.filter((template) => template.value !== "MICRO").map((template) => <option key={template.value} value={template.value}>{template.label}</option>)}</select></Field></div>}
+            <div className="label-layout-settings">
+              <div className="label-preview label-preview-standard" style={{ aspectRatio: `${hardware.labelWidthMm} / ${hardware.labelHeightMm}` }}>
+                <b className="label-preview-brand">نبتة</b><span className="label-preview-rule" /><span className="label-preview-bars" aria-label="باركود تجريبي" /><em>6221234567891</em><div className="label-preview-details"><strong>منتج عربي طويل Mixed English</strong><span>١٢٫٥٠ ج.م</span></div>
               </div>
             </div>
-            <p className="hint">
-              اختر مقاس الرول فقط ثم احفظ: نبتة يطابقه تلقائيًا مع تعريف Xprinter XP-233B قبل الطباعة. هذه القائمة تستبعد المقاسات الصغيرة التي لا تحفظ مساحة أمان كافية لباركود التجزئة.
-            </p>
-            <button
-              type="button"
-              onClick={() => void printLabelTest()}
-              disabled={devicesBusy || !hardware.barcodePrinterName}
-            >
-              طباعة ملصق اختبار
-            </button>
-            <button type="button" onClick={() => void installBundledDriver("LABEL")} disabled={devicesBusy}>
-              تشغيل تعريف XP-233B المضمّن
-            </button>
+            <label className="toggle-row"><input type="checkbox" name="labelCalibrationConfirmed" checked={hardware.labelCalibrationConfirmed} onChange={(event) => setHardware({ ...hardware, labelCalibrationConfirmed: event.currentTarget.checked })} /><span><b>تم قياس ملصق اختبار فعليًا</b><small>لن يسمح نبتة بطباعة أكثر من نسخة أو دفعة حتى تؤكد أن الباركود والسعر والمحاذاة سليمة.</small></span></label>
+            <p className="hint">القيم 50 × 20 مم وGap 2 مم قيم بداية تقديرية. أمر معايرة Gap يضبط موضع الفواصل ولا يكتشف عرض الملصق؛ لا تؤكد المعايرة إلا بعد اختبار المقاس بمسطرة وقارئ باركود فعلي.</p>
+            <button type="button" onClick={() => void calibrateLabelGap()} disabled={devicesBusy || !hardware.barcodePrinterName || hardware.labelPrintTransport !== "TSPL"}>معايرة حساس Gap</button>
+            <button type="button" onClick={() => void printLabelTest()} disabled={devicesBusy || !hardware.barcodePrinterName}>طباعة ملصق اختبار</button>
+            <button type="button" onClick={() => void restoreHardware()} disabled={devicesBusy}>استعادة الإعدادات السابقة</button>
+            <button type="button" onClick={() => void installBundledDriver("LABEL")} disabled={devicesBusy}>تشغيل تعريف XP-233B المضمّن</button>
           </div>
           <div className="device-section">
             <h3>طابعة الإيصالات الحرارية</h3>
@@ -6002,6 +6881,19 @@ function SettingsScreen({
             </div>
             <p className="hint">فواتير 80 مم تُنسّق داخل مساحة طباعة آمنة 72 مم، مع خطوط فاصلة وملخص إجمالي واضح، لتفادي قصّ الكلام من الجانبين.</p>
             <p className="hint">إذا ظهر اسم XP-80 أو POS-80 في Windows فهو غالباً تعريف عام لطابعة الإيصالات 80 مم؛ اختَره هنا ثم اطبع اختباراً. يمكن تشغيل التعريف الرسمي المضمّن عند إعداد جهاز جديد.</p>
+            <Field label="عدد نسخ إيصال العميل بعد إتمام الدفع">
+              <input
+                name="receiptCopies"
+                type="number"
+                min="1"
+                max="5"
+                step="1"
+                value={hardware.receiptCopies}
+                onChange={(event) => setHardware({ ...hardware, receiptCopies: Math.max(1, Math.min(5, Math.trunc(Number(event.target.value) || 1))) })}
+                dir="ltr"
+              />
+            </Field>
+            <p className="hint">يُطبّق هذا العدد عند تفعيل الطباعة التلقائية بعد البيع. الطباعة اليدوية وإعادة الطباعة تبقيان نسخة واحدة لمنع التكرار غير المقصود.</p>
             <label className="toggle-row">
               <input
                 type="checkbox"
@@ -6080,12 +6972,20 @@ function SettingsScreen({
           </div>
         </form>
       </section>
-      <ManagementPanel onDataReset={onDataReset} />
+      <ManagementPanel onDataReset={onDataReset} currentUser={currentUser} onUserUpdated={onUserUpdated} />
     </>
   );
 }
 
-function ManagementPanel({ onDataReset }: { onDataReset: () => void }): ReactNode {
+function ManagementPanel({
+  onDataReset,
+  currentUser,
+  onUserUpdated,
+}: {
+  onDataReset: () => void;
+  currentUser?: User | undefined;
+  onUserUpdated?: ((user: User) => void) | undefined;
+}): ReactNode {
   type Tab = "users" | "audit" | "backup" | "receipt" | "reset";
   type ManagedUser = {
     id: string;
@@ -6182,12 +7082,13 @@ function ManagementPanel({ onDataReset }: { onDataReset: () => void }): ReactNod
     setBusy(true);
     const data = new FormData(form);
     try {
+      const nextDisplayName = String(data.get("displayName") || user.displayName).trim();
       await invoke({
         operation: "users.update",
         payload: {
           userId: user.id,
           update: {
-            displayName: String(data.get("displayName")),
+            displayName: nextDisplayName,
             role: String(data.get("role")) as ManagedUser["role"],
             active: data.get("active") === "on",
             discountLimitBps: Number(data.get("discountLimitBps")) || 0,
@@ -6197,6 +7098,9 @@ function ManagementPanel({ onDataReset }: { onDataReset: () => void }): ReactNod
           },
         },
       });
+      if (currentUser && user.id === currentUser.id && nextDisplayName) {
+        onUserUpdated?.({ ...currentUser, displayName: nextDisplayName });
+      }
       await refresh();
       setMessage("تم حفظ حساب المستخدم وصلاحياته.");
     } catch (cause) {
@@ -6308,7 +7212,7 @@ function ManagementPanel({ onDataReset }: { onDataReset: () => void }): ReactNod
       });
       await invoke({
         operation: "hardware.receipt.print",
-        payload: { storeName: store.storeName, branding: store, sale },
+        payload: { storeName: store.storeName, branding: store, copies: 1, sale },
       });
       await refresh();
       setMessage(`أُعيدت طباعة ${sale.invoiceNo} وسُجلت العملية في التدقيق.`);
@@ -6442,7 +7346,14 @@ function ManagementPanel({ onDataReset }: { onDataReset: () => void }): ReactNod
                   void saveUser(user, event.currentTarget);
                 }}
               >
-                <b>{user.displayName}</b>
+                <input
+                  name="displayName"
+                  defaultValue={user.displayName}
+                  required
+                  placeholder="الاسم"
+                  aria-label={`اسم ${user.displayName}`}
+                  style={{ minWidth: 110, padding: "5px 8px" }}
+                />
                 <small dir="ltr">{user.username}</small>
                 <select name="role" defaultValue={user.role}>
                   <option value="OWNER">مالك</option>
@@ -6815,6 +7726,10 @@ function Workspace({
   theme: ThemeMode;
   onThemeChange: (theme: ThemeMode) => void;
 }): ReactNode {
+  const [currentUser, setCurrentUser] = useState<User>(user);
+  useEffect(() => {
+    setCurrentUser(user);
+  }, [user]);
   const [screen, setScreen] = useState<Screen>("pos");
   const [products, setProducts] = useState<CatalogProduct[]>([]);
   const [shift, setShift] = useState<Shift | null>(null);
@@ -6827,20 +7742,41 @@ function Workspace({
     useState<ReceiptBranding | undefined>(undefined);
   const [reorderAlerts, setReorderAlerts] =
     useState<ReorderListResponse | null>(null);
-  const loadCatalogProducts = useCallback(async (query = "") => {
-    const result = await invoke<{ products: CatalogProduct[] }>({
+  const [posMetrics, setPosMetrics] = useState<PosMetricsResponse | null>(null);
+  const [taxSettings, setTaxSettings] = useState<TaxSettings>(() => {
+    try {
+      const raw = localStorage.getItem(TAX_SETTINGS_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return DEFAULT_TAX_SETTINGS;
+  });
+  const updateTaxSettings = useCallback((next: TaxSettings) => {
+    setTaxSettings(next);
+    localStorage.setItem(TAX_SETTINGS_KEY, JSON.stringify(next));
+  }, []);
+  const refreshPosMetrics = useCallback(async (): Promise<PosMetricsResponse | null> => {
+    try {
+      const res = await invoke<PosMetricsResponse>({ operation: "pos.metrics" });
+      setPosMetrics(res);
+      return res;
+    } catch {
+      return null;
+    }
+  }, []);
+  const loadCatalogProducts = useCallback(async (query = "", cursor?: string): Promise<CatalogPage> => {
+    const result = await invoke<CatalogPage>({
       operation: "catalog.list",
-      payload: { ...(query ? { query } : {}) },
+      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 60 },
     });
-    return result.products;
+    return result;
   }, []);
   const refreshProducts = useCallback(async () => {
-    const nextProducts = await loadCatalogProducts();
-    setProducts(nextProducts);
-    return nextProducts;
+    const page = await loadCatalogProducts();
+    setProducts(page.products);
+    return page.products;
   }, [loadCatalogProducts]);
   const lookupProducts = useCallback(
-    async (query: string) => loadCatalogProducts(query),
+    async (query: string, cursor?: string) => loadCatalogProducts(query, cursor),
     [loadCatalogProducts],
   );
   const refreshShift = useCallback(async () => {
@@ -6900,9 +7836,11 @@ function Workspace({
     };
   }, [resumeReceiptAfterProduct]);
   useEffect(() => {
-    void Promise.all([refreshProducts(), refreshShift()]).catch(() =>
-      setOnline(false),
-    );
+    void Promise.all([
+      refreshProducts(),
+      refreshShift(),
+      refreshPosMetrics(),
+    ]).catch(() => setOnline(false));
     const timer = window.setInterval(() => {
       void invoke({ operation: "health" })
         .then(() => setOnline(true))
@@ -6939,18 +7877,71 @@ function Workspace({
       onLogout();
     }
   }
+  const [globalSearchQuery, setGlobalSearchQuery] = useState("");
+  const [clockNow, setClockNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setClockNow(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const arabicDateStr = useMemo(() => {
+    try {
+      return new Intl.DateTimeFormat("ar-EG", {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      }).format(clockNow);
+    } catch {
+      return clockNow.toLocaleDateString("ar-EG");
+    }
+  }, [clockNow]);
+
+  const arabicTimeStr = useMemo(() => {
+    try {
+      return new Intl.DateTimeFormat("ar-EG", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      }).format(clockNow);
+    } catch {
+      return clockNow.toLocaleTimeString("ar-EG");
+    }
+  }, [clockNow]);
+
+  const roleLabel = useMemo(() => {
+    if (currentUser.role === "ADMIN" || currentUser.role === "OWNER") return "مدير المتجر";
+    if (currentUser.role === "CASHIER") return "كاشير";
+    if (currentUser.role === "STOCK") return "مسؤول مخزون";
+    return currentUser.role;
+  }, [currentUser.role]);
+
   const NAV_ICONS: Record<Screen, ReactNode> = {
     pos: (
       <svg
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <rect x="2" y="3" width="20" height="14" rx="2" />
-        <path d="M8 21h8M12 17v4" />
+        <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+        <polyline points="9 22 9 12 15 12 15 22" />
+      </svg>
+    ),
+    invoices: (
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <circle cx="9" cy="21" r="1.4" />
+        <circle cx="20" cy="21" r="1.4" />
+        <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6" />
       </svg>
     ),
     products: (
@@ -6958,11 +7949,13 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
         <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+        <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+        <line x1="12" y1="22.08" x2="12" y2="12" />
       </svg>
     ),
     inventory: (
@@ -6970,12 +7963,13 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <path d="M5 8h14M5 12h14M5 16h6" />
-        <rect x="3" y="3" width="18" height="18" rx="2" />
+        <ellipse cx="12" cy="5" rx="9" ry="3" />
+        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
       </svg>
     ),
     reorder: (
@@ -6983,13 +7977,12 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <path d="M3 3h2l2.5 12.5h10.8l2-8H7" />
-        <circle cx="10" cy="20" r="1.4" />
-        <circle cx="17" cy="20" r="1.4" />
+        <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+        <path d="M13.73 21a2 2 0 0 1-3.46 0" />
       </svg>
     ),
     partners: (
@@ -6997,26 +7990,14 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
         <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
         <circle cx="9" cy="7" r="4" />
-        <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
-      </svg>
-    ),
-    expenses: (
-      <svg
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <rect x="2" y="5" width="20" height="14" rx="2" />
-        <path d="M2 10h20" />
+        <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+        <path d="M16 3.13a4 4 0 0 1 0 7.75" />
       </svg>
     ),
     reports: (
@@ -7024,7 +8005,7 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
@@ -7033,33 +8014,32 @@ function Workspace({
         <line x1="6" y1="20" x2="6" y2="14" />
       </svg>
     ),
+    expenses: (
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M21 12V7H5a2 2 0 0 1 0-4h14v4" />
+        <path d="M3 5v14a2 2 0 0 0 2 2h16v-5" />
+        <path d="M18 12a2 2 0 0 0 0 4h4v-4z" />
+      </svg>
+    ),
     shift: (
       <svg
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
-        <circle cx="12" cy="12" r="10" />
-        <polyline points="12 6 12 12 16 14" />
-      </svg>
-    ),
-    invoices: (
-      <svg
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-        <polyline points="14 2 14 8 20 8" />
-        <line x1="16" y1="13" x2="8" y2="13" />
-        <line x1="16" y1="17" x2="8" y2="17" />
-        <polyline points="10 9 9 9 8 9" />
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <circle cx="9" cy="7" r="4" />
+        <rect x="16" y="11" width="6" height="8" rx="1" />
       </svg>
     ),
     settings: (
@@ -7067,7 +8047,7 @@ function Workspace({
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
-        strokeWidth="1.8"
+        strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"
       >
@@ -7076,87 +8056,230 @@ function Workspace({
       </svg>
     ),
   };
-  const nav: Array<[Screen, string]> = [
-    ["pos", "نقطة البيع"],
-    ["products", "الأصناف"],
-    ["inventory", "المخزون"],
-    ...(user.permissions.includes("STOCK_COUNT")
-      ? [["reorder", "قائمة الشراء"] as [Screen, string]]
-      : []),
+
+  const nav: Array<{ id: Screen; label: string; testName: string }> = [
+    { id: "pos", label: "الرئيسية", testName: "الرئيسية نقطة البيع" },
+    { id: "invoices", label: "المبيعات", testName: "المبيعات الفواتير" },
+    { id: "products", label: "المنتجات", testName: "المنتجات الأصناف" },
+    { id: "inventory", label: "المخزون", testName: "المخزون" },
     ...(user.permissions.includes("PARTNER_MANAGE")
-      ? [["partners", "العلاقات"] as [Screen, string]]
+      ? [{ id: "partners" as Screen, label: "العملاء", testName: "العملاء العلاقات" }]
       : []),
-    ["invoices", "الفواتير"],
+    { id: "reports", label: "التقارير", testName: "التقارير" },
     ...(user.permissions.includes("CASH_MOVE")
-      ? [["expenses", "المصروفات"] as [Screen, string]]
+      ? [{ id: "expenses" as Screen, label: "المصاريف", testName: "المصاريف المصروفات" }]
       : []),
-    ["reports", "التقارير"],
-    ["shift", "الوردية"],
+    { id: "shift", label: "الموظفين", testName: "الموظفين الوردية" },
     ...(user.permissions.includes("SETTINGS")
-      ? [["settings", "الإعدادات"] as [Screen, string]]
+      ? [{ id: "settings" as Screen, label: "الإعدادات", testName: "الإعدادات" }]
       : []),
   ];
-  const title = nav.find(([id]) => id === screen)?.[1] ?? "نبتة";
+
   return (
     <div className="shell">
       <aside className="sidebar">
         <div className="logo">
-          <span className="leaf" aria-hidden="true">
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{ width: 22, height: 22 }}
-            >
-              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" />
-              <path d="M8 12h8M12 8v8" />
-            </svg>
+          <span className="logo-leaf" aria-hidden="true">
+            {receiptBranding?.logoDataUrl ? (
+              <img
+                src={receiptBranding.logoDataUrl}
+                alt={storeName || "نبتة"}
+              />
+            ) : (
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.5 10-10 10Z" />
+                <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12" />
+              </svg>
+            )}
           </span>
-          <div>
-            <b>{storeName}</b>
-            <small>متجرك، في مكان واحد</small>
+          <div className="logo-text">
+            <b className="logo-title" title={storeName || "نبتة"}>{storeName || "نبتة"}</b>
+            <span className="logo-sub">{storeName ? "نظام نبتة لإدارة المبيعات" : "إدارة مبيعات أسهل"}</span>
           </div>
         </div>
         <nav>
-          {nav.map(([id, label]) => (
+          {nav.map(({ id, label, testName }) => (
             <button
               key={id}
               className={screen === id ? "active" : ""}
               onClick={() => setScreen(id)}
+              aria-label={testName}
             >
               <span className="nav-icon">{NAV_ICONS[id]}</span>
               <span>{label}</span>
             </button>
           ))}
         </nav>
-        <div className="sidebar-user">
-          <b>{user.displayName}</b>
-          <small>{user.role}</small>
-          <button onClick={() => void logout()}>خروج</button>
+        <div className="sidebar-logout">
+          <button type="button" onClick={() => void logout()}>
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              style={{ width: 18, height: 18 }}
+            >
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <polyline points="16 17 21 12 16 7" />
+              <line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
+            <span>تسجيل الخروج</span>
+          </button>
         </div>
       </aside>
       <div className="workspace">
         <header className="topbar">
-          <span>{title}</span>
-          <div className="topbar-actions">
-            <ThemeToggle theme={theme} onThemeChange={onThemeChange} />
+          <div className="topbar-right-widget">
+            <span className="topbar-clock-icon">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ width: 22, height: 22 }}
+              >
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                <line x1="16" y1="2" x2="16" y2="6" />
+                <line x1="8" y1="2" x2="8" y2="6" />
+                <line x1="3" y1="10" x2="21" y2="10" />
+              </svg>
+            </span>
+            <div className="topbar-clock-text">
+              <span className="topbar-clock-date">{arabicDateStr}</span>
+              <span className="topbar-clock-time">{arabicTimeStr}</span>
+            </div>
+          </div>
+
+          <div className="topbar-search-wrap">
+            <span className="topbar-search-icon">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ width: 17, height: 17 }}
+              >
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </span>
+            <input
+              data-testid="global-product-search"
+              value={globalSearchQuery}
+              onChange={(e) => {
+                setGlobalSearchQuery(e.target.value);
+                if (screen !== "pos" && screen !== "products") setScreen("pos");
+              }}
+              placeholder="ابحث عن منتج أو رقم باركود ..."
+              aria-label="ابحث عن منتج أو رقم باركود"
+            />
+          </div>
+
+          <div className="topbar-left-controls">
+            <div className="topbar-branch-pill">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ width: 16, height: 16 }}
+              >
+                <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                <polyline points="9 22 9 12 15 12 15 22" />
+              </svg>
+              <span>{storeName || "فرع الرياض"}</span>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ width: 12, height: 12, color: "#64748b" }}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </div>
+
             {user.permissions.includes("STOCK_COUNT") && (
               <button
                 type="button"
-                className={`notification-bell ${reorderAlerts?.totals.outOfStock ? "critical" : ""}`}
+                className="topbar-bell-btn"
                 onClick={() => setScreen("reorder")}
                 aria-label="فتح تنبيهات النواقص"
+                title="تنبيهات النواقص"
               >
-                <span aria-hidden="true">🔔</span>
-                <span>تنبيهات المخزون</span>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  style={{ width: 18, height: 18 }}
+                >
+                  <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                  <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+                </svg>
                 {reorderAlerts && reorderAlerts.items.length > 0 && (
-                  <b>{reorderAlerts.items.length}</b>
+                  <span className="topbar-bell-badge">
+                    {reorderAlerts.items.length}
+                  </span>
                 )}
               </button>
             )}
+
+            <div className="topbar-user-chip">
+              <div className="topbar-user-avatar">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  style={{ width: 18, height: 18 }}
+                >
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                  <circle cx="12" cy="7" r="4" />
+                </svg>
+              </div>
+              <div className="topbar-user-info">
+                <span className="topbar-user-name">
+                  {currentUser.displayName || "المدير العام"}
+                </span>
+                <span className="topbar-user-role">{roleLabel}</span>
+              </div>
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ width: 12, height: 12, color: "#64748b" }}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </div>
+
+            <ThemeToggle theme={theme} onThemeChange={onThemeChange} />
+
             <span className={online ? "online" : "disconnected"}>
               {online ? "النظام يعمل" : "النظام غير جاهز"}
             </span>
@@ -7178,6 +8301,10 @@ function Workspace({
                 setPendingBarcode(barcode);
                 setScreen("products");
               }}
+              globalSearch={globalSearchQuery}
+              posMetrics={posMetrics}
+              refreshPosMetrics={refreshPosMetrics}
+              taxSettings={taxSettings}
             />
           )}
           {screen === "products" && (
@@ -7223,6 +8350,10 @@ function Workspace({
           )}
           {screen === "settings" && (
             <SettingsScreen
+              currentUser={currentUser}
+              onUserUpdated={setCurrentUser}
+              taxSettings={taxSettings}
+              onTaxSettingsChange={updateTaxSettings}
               onSettingsChange={(next) => {
                 setStoreName(next.storeName);
                 setReceiptBranding(next);
@@ -7254,20 +8385,24 @@ export function LegacyWorkspace({
   const [products, setProducts] = useState<CatalogProduct[]>([]);
   const [shift, setShift] = useState<Shift | null>(null);
   const [online, setOnline] = useState(true);
-  const loadCatalogProducts = useCallback(async (query = "") => {
-    const result = await invoke<{ products: CatalogProduct[] }>({
+  const [storeName, setStoreName] = useState("الشيماء");
+  useEffect(() => {
+    void invoke<{ storeName: string }>({ operation: "store.info" }).then((r) => setStoreName(r.storeName)).catch(() => {});
+  }, []);
+  const loadCatalogProducts = useCallback(async (query = "", cursor?: string): Promise<CatalogPage> => {
+    const result = await invoke<CatalogPage>({
       operation: "catalog.list",
-      payload: { ...(query ? { query } : {}) },
+      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 60 },
     });
-    return result.products;
+    return result;
   }, []);
   const refreshProducts = useCallback(async () => {
-    const nextProducts = await loadCatalogProducts();
-    setProducts(nextProducts);
-    return nextProducts;
+    const page = await loadCatalogProducts();
+    setProducts(page.products);
+    return page.products;
   }, [loadCatalogProducts]);
   const lookupProducts = useCallback(
-    async (query: string) => loadCatalogProducts(query),
+    async (query: string, cursor?: string) => loadCatalogProducts(query, cursor),
     [loadCatalogProducts],
   );
   const refreshShift = useCallback(async () => {
@@ -7300,8 +8435,8 @@ export function LegacyWorkspace({
         <div className="logo">
           <span className="leaf">⌁</span>
           <div>
-            <b>نبتة</b>
-            <small>متجرك، في مكان واحد</small>
+            <b>{storeName || "نبتة"}</b>
+            <small>{storeName ? "نظام نبتة لإدارة المبيعات" : "متجرك، في مكان واحد"}</small>
           </div>
         </div>
         <nav>
@@ -7359,7 +8494,7 @@ export function LegacyWorkspace({
               refreshProducts={refreshProducts}
               lookupProducts={lookupProducts}
               refreshShift={refreshShift}
-              storeName="نبتة"
+              storeName={storeName}
               onOpenShift={() => setScreen("shift")}
             />
           )}
@@ -7376,7 +8511,7 @@ export function LegacyWorkspace({
           {screen === "invoices" && (
             <InvoicesScreen
               products={products}
-              storeName="نبتة"
+              storeName={storeName}
               receiptBranding={{
                 logoDataUrl: "",
                 receiptPhone: "",

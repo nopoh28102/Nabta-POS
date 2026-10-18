@@ -23,5 +23,8 @@ server-deploy-test2/
 apps/desktop/server-runtime/
 .tmp-*.xml
 server-bundle-test*.mjs
+apps/server/exports/
+apps/server/temp-db/
+apps/server/temp-db-barcodes/
 book_assets/images/*.png
 book_assets/images/*.webp

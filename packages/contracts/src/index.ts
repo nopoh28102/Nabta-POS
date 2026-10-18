@@ -6,6 +6,7 @@ export const qtyMilliSchema = z.number().int().positive().max(9_000_000_000_000)
 export const idSchema = z.string().uuid();
 export const barcodeSchema = z.string().trim().min(1).max(80).regex(/^[^\r\n]+$/);
 export const localDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+export const inventoryReportPeriodSchema = z.enum(["MONTHLY", "QUARTERLY", "YEARLY"]);
 
 export const roleSchema = z.enum(["OWNER", "MANAGER", "CASHIER", "STOCK_KEEPER"]);
 export const unitKindSchema = z.enum(["PIECE", "WEIGHT"]);
@@ -339,6 +340,23 @@ export const hardwareSettingsSchema = z.object({
   serialBaudRate: z.number().int().min(1_200).max(230_400).default(9_600),
   /** Windows printer dedicated to barcode labels; never used for receipts. */
   barcodePrinterName: z.string().trim().max(300).default("Xprinter XP-233B"),
+  /** Native TSPL avoids browser/driver scaling for calibrated XP-233B labels. */
+  labelPrintTransport: z.enum(["TSPL", "WINDOWS"]).default("TSPL"),
+  labelPrinterModel: z.literal("XP-233B").default("XP-233B"),
+  labelDpi: z.literal(203).default(203),
+  /** Physical media values are deliberately user-calibrated, not inferred facts. */
+  labelWidthMm: z.number().min(20).max(56).default(50),
+  labelHeightMm: z.number().min(10).max(150).default(20),
+  labelGapMm: z.number().min(0.5).max(10).default(2),
+  labelSpeedMmPerSecond: z.number().min(25.4).max(127).default(50.8),
+  labelDensity: z.number().int().min(0).max(15).default(8),
+  labelDirection: z.union([z.literal(0), z.literal(1)]).default(1),
+  labelBarcodeRenderMode: z.enum(["RASTER", "NATIVE_TSPL"]).default("RASTER"),
+  labelOffsetXmm: z.number().min(-10).max(10).default(0),
+  labelOffsetYmm: z.number().min(-10).max(10).default(0),
+  labelMediaType: z.literal("GAP").default("GAP"),
+  /** Batches stay unavailable until a physical test label is accepted. */
+  labelCalibrationConfirmed: z.boolean().default(false),
   /**
    * Supported XP-233B label media.  Legacy small sizes remain accepted so an
    * existing terminal can load its old local settings, but the application
@@ -350,6 +368,8 @@ export const hardwareSettingsSchema = z.object({
   receiptPrinterName: z.string().trim().max(300).default("Xprinter XP-Q808K USB"),
   receiptPaperWidth: z.enum(["58", "80"]).default("80"),
   autoPrintReceipt: z.boolean().default(false),
+  /** Number of customer receipt copies sent automatically after a completed sale. */
+  receiptCopies: z.number().int().min(1).max(5).default(1),
   /** Cash drawers are driven through the receipt printer's RJ11 port using ESC/POS. */
   cashDrawerEnabled: z.boolean().default(false),
   /** The physical drawer cable may use either standard ESC/POS kick-out pin. */
@@ -361,6 +381,10 @@ export const productLabelPrintRequestSchema = z.object({
   barcode: barcodeSchema,
   priceMinor: amountMinorSchema.positive(),
   copies: z.number().int().min(1).max(100).default(1),
+});
+
+export const productLabelBatchPrintRequestSchema = z.object({
+  labels: z.array(productLabelPrintRequestSchema).min(1).max(20),
 });
 
 export const receiptBrandingSchema = z.object({
@@ -377,6 +401,8 @@ export const receiptBrandingSchema = z.object({
 export const receiptPrintRequestSchema = z.object({
   storeName: z.string().trim().min(2).max(160),
   branding: receiptBrandingSchema.optional(),
+  /** Manual reprints remain one copy unless the caller explicitly requests more. */
+  copies: z.number().int().min(1).max(5).default(1),
   sale: z.object({
     saleId: idSchema,
     invoiceNo: z.string().trim().min(1).max(100),
@@ -427,6 +453,7 @@ export type ReorderListDocumentRequest = z.infer<typeof reorderListDocumentReque
 export type PartnerListDocumentRequest = z.infer<typeof partnerListDocumentRequestSchema>;
 export type HardwareSettings = z.infer<typeof hardwareSettingsSchema>;
 export type ProductLabelPrintRequest = z.infer<typeof productLabelPrintRequestSchema>;
+export type ProductLabelBatchPrintRequest = z.infer<typeof productLabelBatchPrintRequestSchema>;
 export type ReceiptPrintRequest = z.infer<typeof receiptPrintRequestSchema>;
 export type ReceiptBranding = z.infer<typeof receiptBrandingSchema>;
 
@@ -560,6 +587,65 @@ export interface InventoryExcelExportResponse {
   items: InventoryExcelExportItem[];
 }
 
+/** Requested period is resolved by the server in Africa/Cairo time. */
+export const inventoryPeriodicExportRequestSchema = z.object({
+  period: inventoryReportPeriodSchema.default("MONTHLY"),
+  /** Any day within the desired month, quarter, or year. Defaults to today in Cairo. */
+  referenceDate: localDateSchema.optional(),
+});
+export type InventoryReportPeriod = z.infer<typeof inventoryReportPeriodSchema>;
+
+export interface InventoryPeriodicSalesExportItem {
+  nameAr: string;
+  category: string;
+  barcode: string | null;
+  unitKind: z.infer<typeof unitKindSchema>;
+  grossQtyMilli: number;
+  returnedQtyMilli: number;
+  netQtyMilli: number;
+  grossSalesMinor: number;
+  returnsMinor: number;
+  netSalesMinor: number;
+  averageUnitPriceMinor: number | null;
+  availableQtyMilli: number;
+  reorderLevelMilli: number;
+}
+
+export interface InventoryPeriodicReorderExportItem {
+  nameAr: string;
+  category: string;
+  barcode: string | null;
+  unitKind: z.infer<typeof unitKindSchema>;
+  availableQtyMilli: number;
+  reorderLevelMilli: number;
+  shortageQtyMilli: number;
+  priceMinor: number;
+  status: "OUT_OF_STOCK" | "BELOW_REORDER" | "AT_REORDER";
+}
+
+/** Data used by the desktop app to create a locally saved periodic stock-audit Excel file. */
+export interface InventoryPeriodicExcelExportResponse {
+  storeName: string;
+  generatedAt: string;
+  period: InventoryReportPeriod;
+  periodLabel: string;
+  periodStart: string;
+  periodEnd: string;
+  salesItems: InventoryPeriodicSalesExportItem[];
+  reorderItems: InventoryPeriodicReorderExportItem[];
+  totals: {
+    soldProductCount: number;
+    grossQtyMilli: number;
+    returnedQtyMilli: number;
+    netQtyMilli: number;
+    grossSalesMinor: number;
+    returnsMinor: number;
+    netSalesMinor: number;
+    outOfStockCount: number;
+    belowReorderCount: number;
+  };
+}
+
 /** Data used by the desktop app to create a locally saved product-price Excel file. */
 export interface ProductExcelExportItem {
   nameAr: string;
@@ -610,17 +696,36 @@ export interface SaleResponse {
   lines: QuoteResponse["lines"];
 }
 
+export interface PosMetricsResponse {
+  todaySalesMinor: number;
+  todayInvoiceCount: number;
+  totalProductsCount: number;
+  todayCustomerCount: number;
+}
+
 export const ipcRequestSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("config.get") }),
   z.object({ operation: z.literal("config.set"), payload: z.object({ serverUrl: z.string().url(), terminalId: idSchema.optional(), certificateFingerprint: z.string().max(256).default("") }) }),
   z.object({ operation: z.literal("servers.discover") }),
   z.object({ operation: z.literal("host.start") }),
   z.object({ operation: z.literal("health") }),
+  z.object({ operation: z.literal("pos.metrics") }),
   z.object({ operation: z.literal("terminals.discover") }),
   z.object({ operation: z.literal("setup"), payload: setupRequestSchema }),
   z.object({ operation: z.literal("login"), payload: loginRequestSchema }),
   z.object({ operation: z.literal("logout") }),
-  z.object({ operation: z.literal("catalog.list"), payload: z.object({ query: z.string().max(160).optional(), category: z.string().max(100).optional() }) }),
+  z.object({ operation: z.literal("catalog.list"), payload: z.object({
+    query: z.string().max(160).optional(),
+    category: z.string().max(100).optional(),
+    // A small, bounded page keeps the renderer responsive even when a store
+    // has tens of thousands of products. Barcode lookups can still request a
+    // single exact match without transferring the whole catalog.
+    limit: z.number().int().min(1).max(200).optional(),
+    // Opaque keyset cursor returned by the previous page.  This avoids the
+    // increasingly expensive OFFSET scans that make deep catalogue browsing
+    // slow once a store has tens of thousands of products.
+    cursor: z.string().min(1).max(512).optional(),
+  }) }),
   z.object({ operation: z.literal("products.reference.lookup"), payload: z.object({ barcode: z.string().trim().min(1).max(80) }) }),
   z.object({ operation: z.literal("products.barcode.generate") }),
   z.object({ operation: z.literal("products.create"), payload: createProductRequestSchema }),
@@ -629,6 +734,7 @@ export const ipcRequestSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("products.archive"), payload: archiveProductRequestSchema }),
   z.object({ operation: z.literal("products.export"), payload: productExportRequestSchema.optional() }),
   z.object({ operation: z.literal("inventory.export-xlsx") }),
+  z.object({ operation: z.literal("inventory.periodic-export-xlsx"), payload: inventoryPeriodicExportRequestSchema }),
   z.object({ operation: z.literal("products.import"), payload: z.object({ idempotencyKey: idSchema, request: productCsvImportRequestSchema }) }),
   z.object({ operation: z.literal("sales.lookup"), payload: z.object({ invoiceNo: z.string().trim().min(1).max(80) }) }),
   z.object({ operation: z.literal("sales.return"), payload: z.object({ saleId: idSchema, idempotencyKey: idSchema, return: saleReturnRequestSchema }) }),
@@ -679,6 +785,7 @@ export const ipcRequestSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("partners.export-pdf"), payload: partnerListDocumentRequestSchema }),
   z.object({ operation: z.literal("hardware.settings.get") }),
   z.object({ operation: z.literal("hardware.settings.save"), payload: hardwareSettingsSchema }),
+  z.object({ operation: z.literal("hardware.settings.restore") }),
   z.object({ operation: z.literal("hardware.printers.list") }),
   z.object({ operation: z.literal("hardware.serial.list") }),
   z.object({ operation: z.literal("hardware.receipt.print"), payload: receiptPrintRequestSchema }),
@@ -688,6 +795,8 @@ export const ipcRequestSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("hardware.driver.install"), payload: z.object({ role: z.enum(["LABEL", "RECEIPT"]) }) }),
   z.object({ operation: z.literal("hardware.label.print"), payload: productLabelPrintRequestSchema }),
   z.object({ operation: z.literal("hardware.label.test") }),
+  z.object({ operation: z.literal("hardware.label.calibrate") }),
+  z.object({ operation: z.literal("hardware.label.batch.print"), payload: productLabelBatchPrintRequestSchema }),
   z.object({ operation: z.literal("invoices.list"), payload: invoiceListQuerySchema }),
   z.object({ operation: z.literal("invoices.get"), payload: invoiceDetailQuerySchema }),
   z.object({ operation: z.literal("hardware.purchase-receipt.print"), payload: purchaseReceiptPrintRequestSchema }),

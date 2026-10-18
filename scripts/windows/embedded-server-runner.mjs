@@ -82,11 +82,11 @@ try {
     INSERT INTO warehouses(id, branch_id, name, is_default) VALUES ('${localWarehouseId}', '${localBranchId}', 'المخزن الرئيسي', true) ON CONFLICT (id) DO NOTHING;
     INSERT INTO terminals(id, branch_id, warehouse_id, name, active) VALUES ('${localTerminalId}', '${localBranchId}', '${localWarehouseId}', 'كاشير 1', true) ON CONFLICT (id) DO NOTHING;
     INSERT INTO users(id, display_name, username, password_hash, role, discount_limit_bps)
-      VALUES ('${localAdminId}', 'مدير نبتة', 'admin', '${localAdminHash}', 'OWNER', 10000)
+      VALUES ('${localAdminId}', 'المدير العام', 'admin', '${localAdminHash}', 'OWNER', 10000)
       ON CONFLICT DO NOTHING;
     UPDATE users SET password_hash = '${localAdminHash}', role = 'OWNER', active = true, failed_login_count = 0, locked_until = NULL
       WHERE lower(username) = 'admin';
-    UPDATE system_state SET setup_completed = true, store_name = 'نبتة' WHERE singleton;
+    UPDATE system_state SET setup_completed = true, store_name = COALESCE(NULLIF(store_name, ''), 'نبتة') WHERE singleton;
   `);
 } finally {
   await bootstrapDb.close();

@@ -5,6 +5,8 @@ import {
   allocateReturnValue,
   calculateInventoryIssueValue,
   calculateLineMinor,
+  extractTokenVariants,
+  matchesArabicGuessing,
   normalizeArabicSearch,
   roundHalfUp,
 } from "@nabta/domain";
@@ -73,5 +75,21 @@ describe("Arabic search", () => {
     expect(normalizeArabicSearch("  أَرُزّ  مصري  ")).toBe("ارز مصري");
     expect(normalizeArabicSearch("جبنة بيضاء")).toBe(normalizeArabicSearch("جبنه بيضاء"));
     expect(normalizeArabicSearch("06221000000011")).toBe("06221000000011");
+  });
+
+  it("extracts Arabic token variants without prefixes", () => {
+    expect(extractTokenVariants("الجبنة")).toContain("الجبنة");
+    expect(extractTokenVariants("الجبنة")).toContain("جبنة");
+    expect(extractTokenVariants("بالشوكولاتة")).toContain("شوكولاتة");
+  });
+
+  it("matches products by middle word, last word, or out-of-order guessing", () => {
+    const product = "شيبسي بطاطس عائلي بالجبنة المتبلة 50 جم";
+    expect(matchesArabicGuessing(product, "متبلة")).toBe(true);
+    expect(matchesArabicGuessing(product, "جبنة")).toBe(true);
+    expect(matchesArabicGuessing(product, "جبنة متبلة")).toBe(true);
+    expect(matchesArabicGuessing(product, "متبلة شيبسي")).toBe(true);
+    expect(matchesArabicGuessing(product, "50 عائلي")).toBe(true);
+    expect(matchesArabicGuessing(product, "طماطم")).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { archiveProductRequestSchema, createProductRequestSchema, productCsvImportRequestSchema, productExportRequestSchema, quoteRequestSchema, updateProductPriceRequestSchema, updateProductRequestSchema } from "@nabta/contracts";
-import { allocateInvoiceDiscount, calculateInventoryIssueValue, calculateLineMinor, normalizeArabicSearch, toSafeNumber } from "@nabta/domain";
+import { allocateInvoiceDiscount, calculateInventoryIssueValue, calculateLineMinor, extractTokenVariants, normalizeArabicSearch, toSafeNumber } from "@nabta/domain";
 import type { Database } from "../db.js";
 import { transaction } from "../db.js";
 import { ApiError } from "../errors.js";
@@ -24,6 +24,30 @@ interface CatalogRow {
   warehouse_id: string;
   barcodes: string[];
   image_barcode: string | null;
+  cursor_rank: number;
+}
+
+interface CatalogCursor {
+  rank: number;
+  nameAr: string;
+  id: string;
+}
+
+function decodeCatalogCursor(value: unknown): CatalogCursor | null {
+  if (typeof value !== "string" || !value) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<CatalogCursor>;
+    if (typeof parsed.rank !== "number" || parsed.rank < 0 || parsed.rank > 5 || typeof parsed.nameAr !== "string" || !parsed.nameAr || typeof parsed.id !== "string" || !/^[0-9a-f-]{36}$/i.test(parsed.id)) {
+      throw new Error("invalid catalog cursor");
+    }
+    return { rank: parsed.rank, nameAr: parsed.nameAr, id: parsed.id };
+  } catch {
+    throw new ApiError(422, "INVALID_CATALOG_CURSOR", "مؤشر الكتالوج غير صالح");
+  }
+}
+
+function encodeCatalogCursor(row: Pick<CatalogRow, "cursor_rank" | "name_ar" | "id">): string {
+  return Buffer.from(JSON.stringify({ rank: row.cursor_rank, nameAr: row.name_ar, id: row.id })).toString("base64url");
 }
 
 interface QuoteProductRow extends CatalogRow {
@@ -143,6 +167,15 @@ export function registerCatalogRoutes(app: FastifyInstance, db: Database): void 
     const reference = findProductReference(barcode);
     if (!reference) return reply.code(404).send({ code: "REFERENCE_NOT_FOUND", message: "لا توجد بيانات مرجعية لهذا الباركود" });
     return reference;
+  });
+
+  app.get("/v1/media/catalog-images", async () => {
+    const result = await db.query<{ barcode: string; image_source_url: string }>(`
+      SELECT barcode, image_source_url
+      FROM product_reference_catalog
+      WHERE image_source_url <> ''
+    `);
+    return result.rows.map((r) => ({ barcode: r.barcode, url: r.image_source_url }));
   });
 
   app.get("/v1/products/export", async (request, reply) => {
@@ -299,12 +332,104 @@ export function registerCatalogRoutes(app: FastifyInstance, db: Database): void 
     const auth = requireAuth(request);
     const query = typeof (request.query as Record<string, unknown>).query === "string" ? String((request.query as Record<string, unknown>).query).trim() : "";
     const category = typeof (request.query as Record<string, unknown>).category === "string" ? String((request.query as Record<string, unknown>).category).trim() : "";
+    const limitInput = Number((request.query as Record<string, unknown>).limit ?? 60);
+    const limit = Number.isInteger(limitInput) ? Math.min(Math.max(limitInput, 1), 200) : 60;
+    const cursor = decodeCatalogCursor((request.query as Record<string, unknown>).cursor);
     const normalized = normalizeArabicSearch(query);
+    const tokens = normalized.split(/\s+/).filter(Boolean);
+
+    const params: unknown[] = [auth.terminalId, query, normalized, category];
+    let tokenConditionsSql = "true";
+
+    if (tokens.length > 0) {
+      const tokenClauses: string[] = [];
+      for (const token of tokens) {
+        const variants = extractTokenVariants(token);
+        const variantClauses: string[] = [];
+        for (const variant of variants) {
+          params.push(`%${variant}%`);
+          variantClauses.push(`p.search_name LIKE $${params.length}`);
+        }
+        tokenClauses.push(`(${variantClauses.join(" OR ")})`);
+      }
+      tokenConditionsSql = tokenClauses.join(" AND ");
+    }
+
+    params.push(`${normalized}%`);
+    const normalizedPrefixIdx = params.length;
+
+    params.push(`% ${normalized}%`);
+    const wordPrefixIdx = params.length;
+
+    params.push(tokens[0] ? `${tokens[0]}%` : "");
+    const firstTokenPrefixIdx = params.length;
+
+    params.push(limit + 1);
+    const limitIdx = params.length;
+
+    params.push(cursor?.rank ?? null);
+    const cursorRankIdx = params.length;
+
+    params.push(cursor?.nameAr ?? null);
+    const cursorNameArIdx = params.length;
+
+    params.push(cursor?.id ?? null);
+    const cursorIdIdx = params.length;
+
     const result = await db.query<CatalogRow>(`
+      WITH terminal_context AS (
+        SELECT warehouse_id FROM terminals WHERE id = $1
+      ),
+      matched_products AS (
+        SELECT p.id, p.name_ar,
+          CASE
+            WHEN $2 = '' THEN 1
+            WHEN EXISTS (
+              SELECT 1 FROM product_barcodes exact_barcode
+              WHERE exact_barcode.product_id = p.id
+                AND (
+                  exact_barcode.barcode = $2
+                  OR ($2 <> '' AND exact_barcode.barcode = '0' || $2)
+                  OR ($2 LIKE '0%' AND exact_barcode.barcode = substring($2 from 2))
+                )
+            ) THEN 0
+            WHEN $3 <> '' AND p.search_name LIKE $${normalizedPrefixIdx} THEN 1
+            WHEN $3 <> '' AND p.search_name LIKE $${wordPrefixIdx} THEN 2
+            WHEN $${firstTokenPrefixIdx} <> '' AND p.search_name LIKE $${firstTokenPrefixIdx} THEN 3
+            ELSE 4
+          END AS cursor_rank
+        FROM products p
+        WHERE p.active
+          AND (
+            $2 = ''
+            OR EXISTS (
+              SELECT 1 FROM product_barcodes exact_barcode
+              WHERE exact_barcode.product_id = p.id
+                AND (
+                  exact_barcode.barcode = $2
+                  OR ($2 <> '' AND exact_barcode.barcode = '0' || $2)
+                  OR ($2 LIKE '0%' AND exact_barcode.barcode = substring($2 from 2))
+                )
+            )
+            OR lower(COALESCE(p.sku, '')) LIKE lower($2) || '%'
+            OR lower(COALESCE(p.sku, '')) LIKE 'catalog:' || lower($2) || '%'
+            OR ($2 <> '' AND lower(COALESCE(p.sku, '')) LIKE 'catalog:0' || lower($2) || '%')
+            OR (${tokenConditionsSql})
+          )
+          AND ($4 = '' OR p.category = $4)
+      ),
+      paged_products AS (
+        SELECT * FROM matched_products
+        WHERE $${cursorRankIdx}::int IS NULL
+           OR cursor_rank > $${cursorRankIdx}
+           OR (cursor_rank = $${cursorRankIdx} AND (name_ar > $${cursorNameArIdx} OR (name_ar = $${cursorNameArIdx} AND id > $${cursorIdIdx}::uuid)))
+        ORDER BY cursor_rank, name_ar, id
+        LIMIT $${limitIdx}
+      )
       SELECT p.id, p.name_ar, p.description, p.category, p.unit_kind, p.price_minor, p.wholesale_price_minor, p.reorder_level_milli,
              COALESCE(sb.qty_milli, 0) AS qty_milli,
              COALESCE(sb.version, 0) AS stock_version,
-             sb.warehouse_id,
+             sb.warehouse_id, matched.cursor_rank,
              COALESCE(array_agg(pb.barcode ORDER BY pb.barcode) FILTER (WHERE pb.barcode IS NOT NULL), '{}') AS barcodes,
              (
                SELECT ref.barcode
@@ -314,26 +439,24 @@ export function registerCatalogRoutes(app: FastifyInstance, db: Database): void 
                ORDER BY reference_barcode.created_at, ref.barcode
                LIMIT 1
              ) AS image_barcode
-      FROM terminals t
-      JOIN products p ON p.active
+      FROM paged_products matched
+      JOIN products p ON p.id = matched.id
+      JOIN terminal_context t ON true
       LEFT JOIN stock_balances sb ON sb.product_id = p.id AND sb.warehouse_id = t.warehouse_id
       LEFT JOIN product_barcodes pb ON pb.product_id = p.id
-      WHERE t.id = $1
-        AND ($2 = '' OR pb.barcode = $2 OR p.search_name LIKE '%' || $3 || '%' OR lower(p.sku) LIKE '%' || lower($2) || '%')
-        AND ($4 = '' OR p.category = $4)
-      GROUP BY p.id, sb.qty_milli, sb.warehouse_id, sb.version
-      ORDER BY CASE WHEN $2 <> '' AND bool_or(pb.barcode = $2) THEN 0 ELSE 1 END, p.name_ar
-       -- The desktop renderer paginates product cards and table rows itself.
-       -- Keep the local catalog complete so a high barcode cannot disappear
-       -- simply because it sorts after the first 3,500 products.
-       LIMIT 10000
-    `, [auth.terminalId, query, normalized, category]);
+      GROUP BY p.id, sb.qty_milli, sb.warehouse_id, sb.version, matched.cursor_rank, matched.name_ar, matched.id
+      ORDER BY matched.cursor_rank, matched.name_ar, matched.id
+    `, params);
+    const pageRows = result.rows.slice(0, limit);
+    const lastRow = pageRows.at(-1);
     return {
-      products: result.rows.map((row) => ({
+      products: pageRows.map((row) => ({
         id: row.id, warehouseId: row.warehouse_id, nameAr: row.name_ar, description: row.description, category: row.category, unitKind: row.unit_kind,
         priceMinor: row.price_minor, ...(auth.permissions.has("VIEW_COST") ? { wholesalePriceMinor: row.wholesale_price_minor } : {}), availableQtyMilli: row.qty_milli, reorderLevelMilli: row.reorder_level_milli,
         barcodes: row.barcodes, ...(row.image_barcode ? { imageBarcode: row.image_barcode } : {}), version: row.stock_version,
       })),
+      hasMore: result.rows.length > limit,
+      ...(result.rows.length > limit && lastRow ? { nextCursor: encodeCatalogCursor(lastRow) } : {}),
     };
   });
 

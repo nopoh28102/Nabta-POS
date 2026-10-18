@@ -101,6 +101,81 @@ describe("embedded PGlite server", () => {
     expect(count.statusCode, count.body).toBe(201);
   });
 
+  it("bounds catalogue pages and keeps exact barcode lookup available", async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    const firstPage = await app.inject({ method: "GET", url: "/v1/catalog?limit=1", headers });
+    expect(firstPage.statusCode, firstPage.body).toBe(200);
+    expect((firstPage.json() as { products: unknown[] }).products).toHaveLength(1);
+
+    const barcode = await app.inject({
+      method: "GET",
+      url: "/v1/catalog?query=0000000000999&limit=1",
+      headers,
+    });
+    expect(barcode.statusCode, barcode.body).toBe(200);
+    expect(barcode.json()).toMatchObject({
+      products: [expect.objectContaining({ barcodes: expect.arrayContaining(["0000000000999"]) })],
+    });
+  });
+
+  it("serves a 50k-product catalogue through bounded keyset pages", async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    await db.query(`
+      INSERT INTO products (id, name_ar, search_name, category, unit_kind, price_minor, wholesale_price_minor, reorder_level_milli)
+      SELECT gen_random_uuid(), 'صنف ضغط ' || lpad(series::text, 5, '0'), 'صنف ضغط ' || lpad(series::text, 5, '0'), 'اختبار ضغط', 'PIECE', 1000, 0, 0
+      FROM generate_series(1, 50025) AS series
+    `);
+
+    const firstStartedAt = performance.now();
+    const first = await app.inject({ method: "GET", url: "/v1/catalog?query=%D8%B5%D9%86%D9%81%20%D8%B6%D8%BA%D8%B7&limit=60", headers });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(performance.now() - firstStartedAt).toBeLessThan(2_000);
+    const firstPage = first.json() as { products: Array<{ id: string }>; hasMore: boolean; nextCursor?: string };
+    expect(firstPage.products).toHaveLength(60);
+    expect(firstPage.hasMore).toBe(true);
+    expect(firstPage.nextCursor).toBeTruthy();
+
+    const second = await app.inject({ method: "GET", url: `/v1/catalog?query=%D8%B5%D9%86%D9%81%20%D8%B6%D8%BA%D8%B7&limit=60&cursor=${encodeURIComponent(firstPage.nextCursor!)}`, headers });
+    expect(second.statusCode, second.body).toBe(200);
+    const secondPage = second.json() as { products: Array<{ id: string }> };
+    expect(secondPage.products).toHaveLength(60);
+    expect(secondPage.products.some((product) => firstPage.products.some((previous) => previous.id === product.id))).toBe(false);
+
+    const deepCursorRow = await db.query<{ id: string }>("SELECT id FROM products WHERE name_ar = 'صنف ضغط 49999'");
+    const deepCursor = Buffer.from(JSON.stringify({ rank: 1, nameAr: "صنف ضغط 49999", id: deepCursorRow.rows[0]!.id })).toString("base64url");
+    const deepStartedAt = performance.now();
+    const deep = await app.inject({ method: "GET", url: `/v1/catalog?query=%D8%B5%D9%86%D9%81%20%D8%B6%D8%BA%D8%B7&limit=60&cursor=${encodeURIComponent(deepCursor)}`, headers });
+    expect(deep.statusCode, deep.body).toBe(200);
+    expect(performance.now() - deepStartedAt).toBeLessThan(2_000);
+    const deepPage = deep.json() as { products: Array<{ nameAr: string }>; hasMore: boolean };
+    expect(deepPage.products).toHaveLength(26);
+    expect(deepPage.products.at(0)?.nameAr).toBe("صنف ضغط 50000");
+    expect(deepPage.hasMore).toBe(false);
+    // Keep unrelated CSV/backup tests on their compact fixture database.
+    await db.query("DELETE FROM products WHERE category = 'اختبار ضغط'");
+    await db.exec("VACUUM FULL products");
+  }, 60_000);
+
+  it("exports a monthly, quarterly, and yearly inventory audit scoped to the current terminal", async () => {
+    const headers = { authorization: `Bearer ${token}` };
+    for (const period of ["MONTHLY", "QUARTERLY", "YEARLY"]) {
+      const response = await app.inject({ method: "GET", url: `/v1/inventory/periodic-report?period=${period}`, headers });
+      expect(response.statusCode, response.body).toBe(200);
+      const report = response.json() as {
+        period: string; periodStart: string; periodEnd: string;
+        salesItems: Array<{ nameAr: string; grossQtyMilli: number; netSalesMinor: number }>;
+        reorderItems: unknown[];
+        totals: { soldProductCount: number; netSalesMinor: number };
+      };
+      expect(report.period).toBe(period);
+      expect(report.periodStart).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(report.periodEnd).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      expect(report.salesItems.some((item) => item.nameAr === "منتج مضمّن" && item.grossQtyMilli === 1000)).toBe(true);
+      expect(report.totals.soldProductCount).toBe(report.salesItems.length);
+      expect(report.totals.netSalesMinor).toBeTypeOf("number");
+    }
+  });
+
   it("keeps data after a server restart", async () => {
     await app.close();
     await db.end();

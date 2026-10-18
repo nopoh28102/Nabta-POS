@@ -162,3 +162,30 @@ export function toSafeNumber(value: bigint, field: string): number {
   return Number(value);
 }
 
+export function extractTokenVariants(token: string): string[] {
+  const clean = token.trim();
+  if (!clean) return [];
+  const variants = [clean];
+  if (clean.startsWith("ال") && clean.length > 3) {
+    variants.push(clean.slice(2));
+  } else if ((clean.startsWith("بال") || clean.startsWith("وال") || clean.startsWith("كال") || clean.startsWith("فال")) && clean.length > 4) {
+    variants.push(clean.slice(3));
+    variants.push(clean.slice(1));
+  } else if ((clean.startsWith("و") || clean.startsWith("ب") || clean.startsWith("ف") || clean.startsWith("ك")) && clean.length > 3) {
+    variants.push(clean.slice(1));
+  }
+  return [...new Set(variants)];
+}
+
+export function matchesArabicGuessing(text: string, query: string): boolean {
+  if (!query) return true;
+  const normalizedText = normalizeArabicSearch(text);
+  const normalizedQuery = normalizeArabicSearch(query);
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+  return tokens.every((token) => {
+    const variants = extractTokenVariants(token);
+    return variants.some((v) => normalizedText.includes(v));
+  });
+}
+

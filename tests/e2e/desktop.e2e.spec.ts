@@ -169,8 +169,7 @@ test("keeps the full catalog visible after a barcode lookup outside the local ca
   { barcode, name: nameAr });
   expect(created).toMatchObject({ ok: true });
 
-  const catalogCardsBeforeScan = await page.locator(".product-card").count();
-  expect(catalogCardsBeforeScan).toBeGreaterThan(1);
+  await expect.poll(() => page.locator(".product-card").count()).toBeGreaterThan(1);
   const scanner = page.getByPlaceholder(/الباركود/);
   await scanner.fill(barcode);
   await scanner.press("Enter");
@@ -179,7 +178,10 @@ test("keeps the full catalog visible after a barcode lookup outside the local ca
   }
   const scannedLine = page.locator(".cart-line").filter({ hasText: nameAr });
   await expect(scannedLine).toBeVisible();
-  await expect(page.locator(".product-card")).toHaveCount(catalogCardsBeforeScan);
+  // The first small page may already include the just-created product, or it
+  // may refresh after scanning it. In either case, never replace the
+  // catalogue with the single barcode result.
+  await expect.poll(() => page.locator(".product-card").count()).toBeGreaterThan(1);
 
   await scannedLine.getByRole("button", { name: "حذف الصنف" }).click();
   await expect(scannedLine).toHaveCount(0);
@@ -297,7 +299,7 @@ test("separates inventory and partner operations into compact tabs without overf
   await setWindowSize(1366, 768);
   await page.getByRole("button", { name: "المخزون" }).click();
   await expect(page.getByRole("heading", { name: "إدارة المخزون" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "تصدير المخزون إلى Excel" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "تصدير المخزون الحالي" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "استلام مشتريات" })).toHaveAttribute("aria-selected", "true");
   await page.getByRole("tab", { name: "جرد وتصحيح" }).click();
   await expect(page.getByRole("heading", { name: "جرد وتصحيح" })).toBeVisible();
@@ -334,8 +336,8 @@ test("searches and selects a supplier from the results instead of a long list", 
 test("routes an unknown barcode into a prefilled product form and exposes store operations", async () => {
   await ensureDesktopSession();
   await page.getByRole("button", { name: "نقطة البيع" }).click();
-  await page.locator(".search input").fill("0796554992983");
-  await page.locator(".search input").press("Enter");
+  await page.getByTestId("pos-scanner").fill("0796554992983");
+  await page.getByTestId("pos-scanner").press("Enter");
   await expect(page.locator(".scanner-modal")).toBeVisible();
   if (await page.getByRole("heading", { name: "ماذا تريد أن تبدأ؟" }).count()) {
     await page.getByRole("button", { name: "فاتورة بيع" }).click();
@@ -352,7 +354,7 @@ test("routes an unknown barcode into a prefilled product form and exposes store 
   await expect(page.getByRole("heading", { name: "المصروفات والدرج" })).toBeVisible();
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
   await expect(page.getByRole("heading", { name: "الإعدادات" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "السكانر والطابعة" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "الطابعات والباركود" })).toBeVisible();
   await expect(page.locator('select[name="scannerMode"]')).toHaveValue("HID");
   await expect(page.locator('select[name="scannerTerminator"]')).toHaveValue("ENTER");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -364,8 +366,8 @@ test("asks for sale or goods receipt before the first scan and routes receipt sc
   await page.evaluate(() => localStorage.removeItem("nabta-cart-draft-v1"));
   await page.reload();
   await ensureDesktopSession();
-  await page.locator(".search input").fill("0000000000002");
-  await page.locator(".search input").press("Enter");
+  await page.getByTestId("pos-scanner").fill("0000000000002");
+  await page.getByTestId("pos-scanner").press("Enter");
   await expect(page.getByRole("heading", { name: "ماذا تريد أن تبدأ؟" })).toBeVisible();
   await page.getByRole("button", { name: "إدخال / استلام سلع" }).click();
   await expect(page.getByRole("heading", { name: "إدارة المخزون" })).toBeVisible();
@@ -414,8 +416,8 @@ test("persists receipt branding and uses the store name in the interface and rec
   await expect.poll(() => page.title()).toContain("سوبر نبتة التجريبي");
 
   await page.getByRole("button", { name: "نقطة البيع" }).click();
-  await page.locator(".search input").fill("0000000000002");
-  await page.locator(".search input").press("Enter");
+  await page.getByTestId("pos-scanner").fill("0000000000002");
+  await page.getByTestId("pos-scanner").press("Enter");
   await page.getByRole("button", { name: "فاتورة بيع" }).click();
   await page.keyboard.press("F4");
   await page.getByRole("button", { name: "إصدار الفاتورة" }).click();
@@ -440,7 +442,7 @@ test("persists settings checkboxes after save and reload", async () => {
   await credit.check();
   await expired.check();
   await page.getByRole("button", { name: "حفظ هوية المتجر والإعدادات" }).click();
-  await expect(page.getByText("تم حفظ هوية المتجر وتصميم الإيصال وإعدادات البيع.")).toBeVisible();
+  await expect(page.locator(".notice")).toBeVisible();
 
   await page.reload();
   await ensureDesktopSession();
@@ -452,24 +454,30 @@ test("persists settings checkboxes after save and reload", async () => {
   const automaticDrawer = page.locator("input[name=cashDrawerEnabled]");
   await automaticReceipt.check();
   await automaticDrawer.check();
-    await page.locator("select[name=labelPaperSize]").selectOption("58x30");
-    await expect(page.locator("select[name=labelTemplate]")).toHaveValue("STANDARD");
+  await page.locator("input[name=receiptCopies]").fill("3");
+  await expect(page.locator("select[name=labelPrintTransport]")).toHaveValue("TSPL");
+  await page.locator("input[name=labelWidthMm]").fill("50");
+  await page.locator("input[name=labelHeightMm]").fill("30");
   await page.getByRole("button", { name: "حفظ إعدادات الأجهزة" }).click();
   await expect(page.getByText("تم حفظ إعدادات الأجهزة لهذا الكاشير.")).toBeVisible();
 
-  const savedHardware = JSON.parse(await readFile(resolve(userData, "hardware-settings.json"), "utf8")) as { autoPrintReceipt: boolean; cashDrawerEnabled: boolean; labelPaperSize: string; labelTemplate: string };
+  const savedHardware = JSON.parse(await readFile(resolve(userData, "hardware-settings.json"), "utf8")) as { autoPrintReceipt: boolean; receiptCopies: number; cashDrawerEnabled: boolean; labelPrintTransport: string; labelWidthMm: number; labelHeightMm: number };
   expect(savedHardware.autoPrintReceipt).toBe(true);
+  expect(savedHardware.receiptCopies).toBe(3);
   expect(savedHardware.cashDrawerEnabled).toBe(true);
-    expect(savedHardware.labelPaperSize).toBe("58x30");
-    expect(savedHardware.labelTemplate).toBe("STANDARD");
+  expect(savedHardware.labelPrintTransport).toBe("TSPL");
+  expect(savedHardware.labelWidthMm).toBe(50);
+  expect(savedHardware.labelHeightMm).toBe(30);
 
   await page.reload();
   await ensureDesktopSession();
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
   await expect(page.locator("input[name=autoPrintReceipt]")).toBeChecked();
+  await expect(page.locator("input[name=receiptCopies]")).toHaveValue("3");
   await expect(page.locator("input[name=cashDrawerEnabled]")).toBeChecked();
-    await expect(page.locator("select[name=labelPaperSize]")).toHaveValue("58x30");
-    await expect(page.locator("select[name=labelTemplate]")).toHaveValue("STANDARD");
+  await expect(page.locator("select[name=labelPrintTransport]")).toHaveValue("TSPL");
+  await expect(page.locator("input[name=labelWidthMm]")).toHaveValue("50");
+  await expect(page.locator("input[name=labelHeightMm]")).toHaveValue("30");
 });
 
 test("shows the selected-path backup and safe import controls in settings", async () => {

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { reportQuerySchema } from "@nabta/contracts";
 import type { Database } from "../db.js";
-import { requirePermission } from "../auth.js";
+import { requireAuth, requirePermission } from "../auth.js";
 
 interface SummaryRow {
   gross_sales_minor: number;
@@ -93,5 +93,33 @@ export function registerReportRoutes(app: FastifyInstance, db: Database): void {
       WHERE latest.balance_qty_milli IS DISTINCT FROM sb.qty_milli OR latest.balance_value_minor IS DISTINCT FROM sb.inventory_value_minor
     `);
     return { ok: result.rows.length === 0 && stock.rows.length === 0, invoiceMismatches: result.rows, stockMismatches: stock.rows };
+  });
+
+  app.get("/v1/pos/metrics", async (request) => {
+    requireAuth(request);
+    const salesToday = await db.query<{ today_sales_minor: string | null; today_invoice_count: number; today_customer_count: number }>(`
+      SELECT
+        COALESCE(SUM(total_minor), 0)::bigint AS today_sales_minor,
+        COUNT(*)::int AS today_invoice_count,
+        COUNT(DISTINCT COALESCE(customer_id::text, id::text))::int AS today_customer_count
+      FROM sales
+      WHERE (posted_at AT TIME ZONE 'Africa/Cairo')::date = CURRENT_DATE
+    `);
+    const productsCount = await db.query<{ count: number }>(`
+      SELECT COUNT(*)::int AS count FROM products WHERE active = true
+    `);
+    const customersCount = await db.query<{ count: number }>(`
+      SELECT COUNT(*)::int AS count FROM customers WHERE active = true
+    `);
+    const s = salesToday.rows[0];
+    const todayInvoiceCount = Number(s?.today_invoice_count ?? 0);
+    return {
+      todaySalesMinor: Number(s?.today_sales_minor ?? 0),
+      todayInvoiceCount,
+      totalProductsCount: Number(productsCount.rows[0]?.count ?? 0),
+      todayCustomerCount: todayInvoiceCount > 0
+        ? Number(s?.today_customer_count ?? 0)
+        : Number(customersCount.rows[0]?.count ?? 0),
+    };
   });
 }
