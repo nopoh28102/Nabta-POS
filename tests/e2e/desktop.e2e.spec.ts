@@ -449,6 +449,7 @@ test("persists settings checkboxes after save and reload", async () => {
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
   await expect(page.getByRole("checkbox", { name: "تفعيل البيع الآجل" })).toBeChecked();
   await expect(page.getByRole("checkbox", { name: "منع بيع الأصناف المنتهية" })).toBeChecked();
+  await page.getByRole("tab", { name: "الأجهزة والطباعة", exact: true }).click();
 
   const automaticReceipt = page.locator("input[name=autoPrintReceipt]");
   const automaticDrawer = page.locator("input[name=cashDrawerEnabled]");
@@ -472,6 +473,7 @@ test("persists settings checkboxes after save and reload", async () => {
   await page.reload();
   await ensureDesktopSession();
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
+  await page.getByRole("tab", { name: "الأجهزة والطباعة", exact: true }).click();
   await expect(page.locator("input[name=autoPrintReceipt]")).toBeChecked();
   await expect(page.locator("input[name=receiptCopies]")).toHaveValue("3");
   await expect(page.locator("input[name=cashDrawerEnabled]")).toBeChecked();
@@ -483,6 +485,7 @@ test("persists settings checkboxes after save and reload", async () => {
 test("shows the selected-path backup and safe import controls in settings", async () => {
   await ensureDesktopSession();
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
+  await page.getByRole("tab", { name: "الإدارة والبيانات", exact: true }).click();
   await page.getByRole("tab", { name: "النسخ والاستعادة" }).click();
   await expect(page.getByRole("heading", { name: "النسخ الاحتياطي والاستيراد الآمن" })).toBeVisible();
   await expect(page.getByRole("button", { name: "اختيار مجلد النسخ التلقائي" })).toBeVisible();
@@ -497,6 +500,7 @@ test("shows the owner guarded fresh-cycle reset controls in settings", async () 
   await ensureDesktopSession();
   await page.getByRole("button", { name: "الإعدادات", exact: true }).click();
   await expect(page.getByRole("heading", { name: "الإعدادات" })).toBeVisible();
+  await page.getByRole("tab", { name: "الإدارة والبيانات", exact: true }).click();
   await page.getByRole("tab", { name: "بدء دورة جديدة" }).click();
   await expect(page.getByRole("heading", { name: "بدء دورة جديدة للمتجر" })).toBeVisible();
   await page.getByRole("textbox", { name: "الرمز السري لإعادة البدء" }).fill("000000");

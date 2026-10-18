@@ -1802,6 +1802,11 @@ td small { display: block; margin-top: 2px; }
 }
 .settings-panel { max-width: 760px; padding: 28px; margin: 0 auto; }
 .settings-form { display: grid; gap: 12px; margin-top: 20px; }
+.settings-tabs { display:flex; flex-wrap:wrap; gap:8px; width:min(960px, 100%); margin:0 auto 16px; padding:6px; border:1px solid var(--line); border-radius:14px; background:var(--bg-raised); }
+.settings-tabs button { flex:1 1 180px; min-height:42px; padding:9px 14px; border:0; border-radius:10px; background:transparent; color:var(--ink-muted); font:inherit; font-weight:700; cursor:pointer; }
+.settings-tabs button:hover { background:var(--bg-surface); color:var(--ink); }
+.settings-tabs button[aria-selected="true"] { background:var(--green); color:#fff; box-shadow:0 5px 14px rgba(22,131,104,.22); }
+.settings-tabs button:focus-visible { outline:3px solid color-mix(in srgb, var(--green) 42%, transparent); outline-offset:2px; }
 .receipt-branding-settings { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; padding:16px; border:1px solid var(--line); border-radius:14px; background:var(--bg-raised); }
 .receipt-branding-settings > .field:first-child { grid-column:1 / -1; }
 .logo-upload { grid-row:span 2; display:grid; align-content:start; gap:8px; padding:12px; border:1px dashed rgba(29,184,122,.42); border-radius:12px; color:var(--ink-muted); font-size:13px; }
@@ -2069,6 +2074,8 @@ td small { display: block; margin-top: 2px; }
   .payment-form button { grid-column:1 / -1; }
 }
 @media (max-width: 690px) {
+  .settings-tabs { display:grid; grid-template-columns:1fr; gap:4px; padding:5px; }
+  .settings-tabs button { width:100%; }
   .subtabs { width: 100%; margin-inline: 0; }
   .subtabs button { padding-inline: 10px; }
   .operation-panel { padding: 16px; }

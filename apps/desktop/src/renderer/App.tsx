@@ -6365,7 +6365,9 @@ function SettingsScreen({
   currentUser?: User | undefined;
   onUserUpdated?: ((user: User) => void) | undefined;
 }): ReactNode {
+  type SettingsTab = "store" | "devices" | "management";
   const [settings, setSettings] = useState<BranchSettings | null>(null);
+  const [activeTab, setActiveTab] = useState<SettingsTab>("store");
   const [taxEnabled, setTaxEnabled] = useState(taxSettings.enabled);
   const [taxRatePercent, setTaxRatePercent] = useState(taxSettings.ratePercent);
   const [pendingLogo, setPendingLogo] = useState<string | null>(null);
@@ -6583,8 +6585,40 @@ function SettingsScreen({
         subtitle="هوية المتجر، تصميم الإيصال، خيارات البيع وأجهزة هذا الكاشير."
       />
       {message && <div className="notice">{message}</div>}
-      {settings && (
-        <section className="panel operation-panel">
+      <nav className="settings-tabs" aria-label="أقسام الإعدادات" role="tablist">
+        <button
+          id="settings-tab-store"
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "store"}
+          aria-controls="settings-panel-store"
+          onClick={() => setActiveTab("store")}
+        >
+          المتجر والإيصال
+        </button>
+        <button
+          id="settings-tab-devices"
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "devices"}
+          aria-controls="settings-panel-devices"
+          onClick={() => setActiveTab("devices")}
+        >
+          الأجهزة والطباعة
+        </button>
+        <button
+          id="settings-tab-management"
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "management"}
+          aria-controls="settings-panel-management"
+          onClick={() => setActiveTab("management")}
+        >
+          الإدارة والبيانات
+        </button>
+      </nav>
+      {activeTab === "store" && settings && (
+        <section id="settings-panel-store" role="tabpanel" aria-labelledby="settings-tab-store" className="panel operation-panel">
           <h2>هوية المتجر والإيصال</h2>
           <form
             className="settings-form"
@@ -6692,7 +6726,7 @@ function SettingsScreen({
           </form>
         </section>
       )}
-      <section className="panel operation-panel device-panel">
+      {activeTab === "devices" && <section id="settings-panel-devices" role="tabpanel" aria-labelledby="settings-tab-devices" className="panel operation-panel device-panel">
         <div className="panel-title-row">
           <div>
             <h2>الطابعات والباركود</h2>
@@ -6971,8 +7005,10 @@ function SettingsScreen({
             </button>
           </div>
         </form>
-      </section>
-      <ManagementPanel onDataReset={onDataReset} currentUser={currentUser} onUserUpdated={onUserUpdated} />
+      </section>}
+      {activeTab === "management" && <div id="settings-panel-management" role="tabpanel" aria-labelledby="settings-tab-management">
+        <ManagementPanel onDataReset={onDataReset} currentUser={currentUser} onUserUpdated={onUserUpdated} />
+      </div>}
     </>
   );
 }
