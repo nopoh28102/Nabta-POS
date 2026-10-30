@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+      - name: Verify DNSHE safety checks
+        run: python3 -m unittest discover -s tests -p 'test_dnshe_auto_renew.py' -v
       - name: Run official DNSHE API integration
         env:
           DNSHE_API_KEY: ${{ secrets.DNSHE_API_KEY }}
