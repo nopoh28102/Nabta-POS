@@ -1,0 +1,38 @@
+name: DNSHE Auto Renew - Nabta domain
+
+on:
+  schedule:
+    # Every Tuesday at 03:17 UTC, away from the start of the hour.
+    - cron: "17 3 * * 2"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check = read-only test; renew = renew only if free-renewal window is open"
+        type: choice
+        options:
+          - check
+          - renew
+        default: check
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dnshe-nabta-auto-renew
+  cancel-in-progress: false
+
+jobs:
+  domain-renewal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Run official DNSHE API integration
+        env:
+          DNSHE_API_KEY: ${{ secrets.DNSHE_API_KEY }}
+          DNSHE_API_SECRET: ${{ secrets.DNSHE_API_SECRET }}
+          DNSHE_TARGET_DOMAIN: nabta.de5.net
+          DNSHE_MODE: ${{ github.event_name == 'schedule' && 'renew' || inputs.mode }}
+        run: python3 scripts/dnshe_auto_renew.py
