@@ -24,6 +24,7 @@ export interface LabelPrintContent {
   barcode: string;
   priceMinor: number;
   copies: number;
+  hidePrice?: boolean;
 }
 
 export interface LabelLayout {
@@ -310,6 +311,8 @@ function escapeHtml(value: string): string {
 export function createLabelRasterHtml(profile: LabelPrinterProfile, content: LabelPrintContent, includeBarcode = true): string {
   const layout = createLabelLayout(profile, content.barcode);
   const price = `${(content.priceMinor / 100).toFixed(2)} ج.م`;
+  const priceMarkup = content.hidePrice ? "" : `<div class="price-tag">${escapeHtml(price)}</div>`;
+  const nameWidth = content.hidePrice ? layout.text.width : layout.text.nameWidth;
   const kind = resolveLabelBarcodeKind(content.barcode);
 
   const barcodeSvg = includeBarcode
@@ -357,7 +360,7 @@ export function createLabelRasterHtml(profile: LabelPrinterProfile, content: Lab
       overflow: hidden;
     }
     .name {
-      width: ${layout.text.nameWidth}px;
+      width: ${nameWidth}px;
       max-height: ${layout.text.height}px;
       font-size: ${nameFont}px;
       font-weight: 800;
@@ -413,9 +416,9 @@ export function createLabelRasterHtml(profile: LabelPrinterProfile, content: Lab
     }
   </style></head><body>
     <div class="label-container">
-      <div class="header-row">
+      <div class="header-row${content.hidePrice ? " no-price" : ""}">
         <div class="name">${escapeHtml(content.name)}</div>
-        <div class="price-tag">${escapeHtml(price)}</div>
+        ${priceMarkup}
       </div>
       ${includeBarcode ? `<div class="barcode-box">${barcodeSvg}</div><div class="digits">${escapeHtml(content.barcode)}</div>` : ""}
     </div>

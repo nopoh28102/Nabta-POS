@@ -26,6 +26,17 @@ const configSchema = z.object({
   NABTA_LOCAL_MODE: z.enum(["0", "1"]).optional(),
   PG_DUMP_PATH: z.string().optional(),
   BACKUP_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(30),
+  // 32 random bytes encoded as base64url.  It is deliberately server-only;
+  // the Electron renderer never reads it and payment credentials are stored
+  // encrypted in PostgreSQL/PGlite.
+  NABTA_PAYMENT_ENCRYPTION_KEY: z.string().min(40).max(128).optional(),
+  // Shared only with the Cloudflare Worker that fronts the customer ordering
+  // site.  The customer browser never receives this value.
+  COMMERCE_API_SHARED_SECRET: z.string().min(32).max(512).optional(),
+  // Separate from the customer storefront secret. This key is held only by
+  // registered Nabta cashier applications and the Cloudflare terminal relay.
+  TERMINAL_RELAY_SHARED_SECRET: z.string().min(32).max(512).optional(),
+  TERMINAL_ENROLLMENT_PIN: z.string().regex(/^\d{6}$/).default("281020"),
   // The owner requested a separate confirmation code for the destructive
   // "start a new business cycle" action.  It can be overridden per server.
   DATA_RESET_PIN: z.string().regex(/^\d{6}$/).default("281020"),

@@ -1,0 +1,9 @@
+name = "nabta-messenger-connector"
+main = "src/index.ts"
+compatibility_date = "2026-10-27"
+
+# Create these encrypted secrets with `wrangler secret put`; do not put them
+# in this file or in the Messenger client's source code:
+#   NABTA_COMMERCE_ORIGIN
+#   NABTA_COMMERCE_SHARED_SECRET
+#   NABTA_BOT_CONNECTOR_TOKEN

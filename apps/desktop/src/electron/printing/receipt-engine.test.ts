@@ -3,6 +3,7 @@ import {
   escapeReceiptHtml,
   formatQtyForReceipt,
   formatReceiptMoney,
+  purchaseReceiptThermalHtml,
   receiptHtml,
   resolveReceiptDimensions,
 } from "./receipt-engine.js";
@@ -88,6 +89,26 @@ describe("Receipt Engine — Thermal Receipt Geometry and Layout", () => {
     expect(html).toContain("إجمالي المطلوب");
     expect(html).toContain("المدفوع");
     expect(html).toContain("الباقي");
+  });
+
+  it("renders supplier invoices on the same thermal width as sales receipts", () => {
+    const html = purchaseReceiptThermalHtml({
+      storeName: "نبتة",
+      receipt: {
+        id: "00000000-0000-4000-8000-000000000003",
+        invoiceNo: "PUR-100",
+        supplierName: "مورد الاختبار",
+        postedAt: "2026-10-31T10:00:00.000Z",
+        goodsMinor: 1250,
+        supplyExpensesMinor: 100,
+        totalMinor: 1350,
+        receiverName: "أمين المخزن",
+        lines: [{ productId: "00000000-0000-4000-8000-000000000004", nameAr: "صنف توريد", unitKind: "PIECE", qtyMilli: 1000, unitCostMinor: 1250, goodsMinor: 1250 }],
+      },
+    }, "80");
+    expect(html).toContain("@page { size: 72mm auto; margin: 0; }");
+    expect(html).toContain("فاتورة توريد / إذن استلام");
+    expect(html).toContain("إجمالي الفاتورة");
   });
 
   it("generates 58 mm receipt HTML matching 48 mm driver page box", () => {

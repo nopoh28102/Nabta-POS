@@ -35,8 +35,44 @@ export function registerPurchaseRoutes(app: FastifyInstance, db: Database): void
       const kindById = new Map(products.rows.map((row) => [row.id, row.unit_kind]));
       const productById = new Map(products.rows.map((row) => [row.id, row]));
       const calculated = body.lines.map((line) => {
+        const productKind = kindById.get(line.productId);
+        if (productKind === "WEIGHT" && line.entryUnit !== "WEIGHT") {
+          throw new ApiError(422, "WEIGHT_ENTRY_REQUIRED", "الصنف الموزون يُستلم بالكيلو أو الجرام وليس كرتونة أو قطعة");
+        }
+        if (productKind === "PIECE" && line.entryUnit === "WEIGHT") {
+          throw new ApiError(422, "PIECE_ENTRY_REQUIRED", "صنف القطعة لا يُستلم بالوزن");
+        }
         if (kindById.get(line.productId) === "PIECE" && line.qtyMilli % 1000 !== 0) throw new ApiError(422, "PIECE_FRACTION", "صنف القطعة لا يقبل كمية كسرية");
-        return { ...line, id: line.productId, goodsMinor: Number(calculateLineMinor(BigInt(line.unitCostMinor), BigInt(line.qtyMilli))) };
+        if (line.entryUnit === "CARTON") {
+          const expectedQtyMilli = line.packageCount! * line.unitsPerPackage! * 1000;
+          if (line.qtyMilli !== expectedQtyMilli) {
+            throw new ApiError(422, "PACK_QTY_MISMATCH", "كمية الكراتين لا تطابق عدد القطع المحسوب");
+          }
+          const goodsMinor = line.costBasis === "LINE_TOTAL"
+            ? line.lineTotalMinor!
+            : line.packageCount! * line.packageCostMinor!;
+          if (!Number.isSafeInteger(goodsMinor)) throw new ApiError(422, "PACK_VALUE_INVALID", "إجمالي تكلفة الكراتين كبير جداً");
+          return {
+            ...line,
+            id: line.productId,
+            goodsMinor,
+            // This is a display snapshot only; goods_minor remains the exact
+            // financial source of truth when a carton total is not divisible.
+            unitCostMinor: Math.floor((goodsMinor * 1000) / line.qtyMilli),
+          };
+        }
+        if (line.costBasis === "LINE_TOTAL") {
+          const goodsMinor = line.lineTotalMinor!;
+          return {
+            ...line,
+            id: line.productId,
+            goodsMinor,
+            // The stored purchase total is authoritative; this is the derived
+            // per-base-unit snapshot used by historic inventory reports.
+            unitCostMinor: Math.floor((goodsMinor * 1000) / line.qtyMilli),
+          };
+        }
+        return { ...line, id: line.productId, goodsMinor: Number(calculateLineMinor(BigInt(line.unitCostMinor), BigInt(line.qtyMilli)))};
       });
       const goodsMinor = calculated.reduce((sum, line) => sum + line.goodsMinor, 0);
       const expenseAllocation = body.supplyExpensesMinor === 0 ? new Map<string, bigint>() : allocateProportionally(BigInt(body.supplyExpensesMinor), calculated.map((line) => ({ id: line.productId, weight: BigInt(line.goodsMinor) })));
@@ -45,6 +81,16 @@ export function registerPurchaseRoutes(app: FastifyInstance, db: Database): void
           supply_expenses_minor, total_minor, user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id, posted_at
       `, [body.warehouseId, body.supplierId ?? null, body.supplierName, body.supplierInvoiceNo ?? null, goodsMinor, body.supplyExpensesMinor, goodsMinor + body.supplyExpensesMinor, auth.userId]);
+      // The request is committed with the receipt itself.  Consequently a
+      // lost mobile response cannot create a second receipt or a second print
+      // job when its original idempotency key is replayed.
+      if (body.printOnPrimary) {
+        await client.query(`
+          INSERT INTO mobile_purchase_receipt_print_jobs(receipt_id, requested_by_user_id)
+          VALUES ($1, $2)
+          ON CONFLICT (receipt_id) DO NOTHING
+        `, [receipt.rows[0]!.id, auth.userId]);
+      }
       for (const line of calculated.sort((a, b) => a.productId.localeCompare(b.productId, "en"))) {
         const balance = await client.query<{ qty_milli: number; inventory_value_minor: number }>("SELECT qty_milli, inventory_value_minor FROM stock_balances WHERE warehouse_id = $1 AND product_id = $2 FOR UPDATE", [body.warehouseId, line.productId]);
         if (!balance.rows[0]) throw new ApiError(409, "STOCK_BALANCE_MISSING", "رصيد الصنف غير مهيأ في المخزن");
@@ -57,9 +103,13 @@ export function registerPurchaseRoutes(app: FastifyInstance, db: Database): void
           VALUES ($1, $2, $3, $4, $5) RETURNING id
         `, [body.warehouseId, line.productId, line.lotCode ?? null, line.expiresOn ?? null, line.qtyMilli]);
         await client.query(`INSERT INTO purchase_receipt_lines(receipt_id, product_id, qty_milli, unit_cost_minor,
-          goods_minor, allocated_expense_minor, inventory_value_minor, lot_id)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [receipt.rows[0]!.id, line.productId, line.qtyMilli, line.unitCostMinor, line.goodsMinor, allocatedExpense, inventoryValue, lot.rows[0]!.id]);
+          goods_minor, allocated_expense_minor, inventory_value_minor, lot_id, entry_unit, cost_basis, package_count, units_per_package, package_cost_minor, line_total_minor)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        [receipt.rows[0]!.id, line.productId, line.qtyMilli, line.unitCostMinor, line.goodsMinor, allocatedExpense, inventoryValue, lot.rows[0]!.id,
+          line.entryUnit, line.costBasis, line.entryUnit === "CARTON" ? line.packageCount : null,
+          line.entryUnit === "CARTON" ? line.unitsPerPackage : null,
+          line.entryUnit === "CARTON" && line.costBasis === "PACKAGE" ? line.packageCostMinor : null,
+          line.costBasis === "LINE_TOTAL" ? line.lineTotalMinor : null]);
         await client.query("UPDATE stock_balances SET qty_milli = $3, inventory_value_minor = $4, version = version + 1, updated_at = now() WHERE warehouse_id = $1 AND product_id = $2", [body.warehouseId, line.productId, newQty, newValue]);
         await client.query(`INSERT INTO stock_movements(warehouse_id, product_id, movement_type, qty_delta_milli,
           value_delta_minor, balance_qty_milli, balance_value_minor, reference_type, reference_id, actor_user_id)

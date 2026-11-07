@@ -237,6 +237,25 @@ describe("XP-233B TSPL label engine — Comprehensive Verification", () => {
       expect(html).toContain("color: #000000");      // Black text
     });
 
+    it("omits only the printed price when the label requests it", () => {
+      const layout = createLabelLayout(DEFAULT_XP233B_PROFILE, "6221234567891");
+      const html = createLabelRasterHtml(DEFAULT_XP233B_PROFILE, {
+        storeName: "نبتة",
+        name: "طبق فوم",
+        barcode: "6221234567891",
+        priceMinor: 3250,
+        copies: 1,
+        hidePrice: true,
+      }, true);
+
+      expect(html).toContain("طبق فوم");
+      expect(html).toContain("6221234567891");
+      expect(html).not.toContain("32.50 ج.م");
+      expect(html).not.toContain('class="price-tag"');
+      expect(html).toContain('class="header-row no-price"');
+      expect(html).toContain(`width: ${layout.text.width}px;`);
+    });
+
     it("verifies monochrome bitmap pixel stats: white background, quiet zones, and barcode transitions", () => {
       const width = 400;
       const height = 160;
@@ -317,9 +336,14 @@ describe("XP-233B TSPL label engine — Comprehensive Verification", () => {
       expect(job).toBe("SIZE 50 mm,20 mm\r\nGAP 2 mm,0 mm\r\nGAPDETECT\r\n");
     });
 
-    it("rejects multi-copy or batch printing when calibration is unconfirmed", () => {
+    it("builds multi-copy commands even before calibration confirmation", () => {
       const profile = { ...DEFAULT_XP233B_PROFILE, calibrationConfirmed: false };
-      expect(profile.calibrationConfirmed).toBe(false);
+      const multiCopyContent = { storeName: "نبتة", name: "صنف اختبار", barcode: "6221234567891", priceMinor: 1250, copies: 4 };
+      const layout = createLabelLayout(profile, multiCopyContent.barcode);
+      const raster = Buffer.alloc(layout.bytesPerRow * layout.heightDots);
+
+      expect(createTsplNativeBarcodeJob(profile, multiCopyContent).toString("latin1")).toContain("PRINT 4,1");
+      expect(createTsplRasterJob(profile, multiCopyContent, raster).toString("latin1")).toContain("PRINT 4,1");
     });
   });
 });

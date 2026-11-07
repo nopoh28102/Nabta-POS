@@ -1,0 +1,27 @@
+name = "nabta-cloud-core"
+main = "src/index.ts"
+compatibility_date = "2026-10-30"
+
+# Set this once after deployment. It is used only to create the first store
+# and issue its one-store migration key:
+#   wrangler secret put NABTA_CLOUD_BOOTSTRAP_KEY
+
+[[durable_objects.bindings]]
+name = "NABTA_STORE_LEDGER"
+class_name = "NabtaStoreLedger"
+
+[[durable_objects.bindings]]
+name = "NABTA_STORE_DIRECTORY"
+class_name = "NabtaStoreDirectory"
+
+[[r2_buckets]]
+binding = "NABTA_BACKUP_ARCHIVE"
+bucket_name = "nabta-pos-backups"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NabtaStoreLedger"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["NabtaStoreDirectory"]

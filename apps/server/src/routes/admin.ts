@@ -78,12 +78,14 @@ export function registerAdminRoutes(app: FastifyInstance, db: Database, config: 
         sales: number;
         purchases: number;
         customers: number;
+        customerOrders: number;
         shifts: number;
       }>(`
         SELECT
           (SELECT count(*)::int FROM sales) AS sales,
           (SELECT count(*)::int FROM purchase_receipts) AS purchases,
           (SELECT count(*)::int FROM customers) AS customers,
+          (SELECT count(*)::int FROM customer_orders) AS "customerOrders",
           (SELECT count(*)::int FROM shifts) AS shifts
       `);
 
@@ -91,6 +93,17 @@ export function registerAdminRoutes(app: FastifyInstance, db: Database, config: 
       // transaction-local reset flag only for the owner-confirmed workflow.
       await client.query("SELECT set_config('nabta.data_reset_authorized', '1', true)");
 
+      // Payment intents are transient transaction records.  Provider settings
+      // and terminal bindings deliberately survive a business-cycle reset.
+      await client.query("DELETE FROM payment_refunds");
+      await client.query("DELETE FROM payment_provider_events");
+      await client.query("DELETE FROM payment_attempts");
+      await client.query("DELETE FROM payment_reservations");
+      await client.query("DELETE FROM payment_audit_log");
+      await client.query("DELETE FROM payment_intents");
+      await client.query("DELETE FROM payment_reconciliation_runs");
+      await client.query("DELETE FROM customer_order_lines");
+      await client.query("DELETE FROM customer_orders");
       await client.query("DELETE FROM partner_document_payments");
       await client.query("DELETE FROM partner_documents");
       await client.query("DELETE FROM customer_ledger");
@@ -99,15 +112,24 @@ export function registerAdminRoutes(app: FastifyInstance, db: Database, config: 
       await client.query("DELETE FROM sale_return_lines");
       await client.query("DELETE FROM sale_returns");
       await client.query("DELETE FROM sale_lot_allocations");
+      // Labels can point to the sale that consumed them; remove them before
+      // deleting sale headers so a new operating cycle stays referentially safe.
+      await client.query("DELETE FROM weighted_product_labels");
       await client.query("DELETE FROM payments");
       await client.query("DELETE FROM sale_lines");
       await client.query("DELETE FROM sales");
       await client.query("DELETE FROM quotes");
+      await client.query("DELETE FROM financial_period_closures");
+      // Payroll can point at a cash-movement when it was paid from the drawer,
+      // so it must be cleared before the movement and shift records.
+      await client.query("DELETE FROM payroll_entries");
+      await client.query("DELETE FROM shop_consumptions");
       await client.query("DELETE FROM cash_movements");
       await client.query("DELETE FROM shifts");
       await client.query("DELETE FROM purchase_receipt_lines");
       await client.query("DELETE FROM purchase_receipts");
       await client.query("DELETE FROM stock_counts");
+      await client.query("DELETE FROM stock_lot_events");
       await client.query("DELETE FROM stock_lots");
       await client.query("DELETE FROM stock_movements");
       await client.query("DELETE FROM idempotency_requests");
@@ -141,6 +163,7 @@ export function registerAdminRoutes(app: FastifyInstance, db: Database, config: 
         sales: counts.rows[0]!.sales,
         purchases: counts.rows[0]!.purchases,
         customers: counts.rows[0]!.customers,
+        customerOrders: counts.rows[0]!.customerOrders,
         shifts: counts.rows[0]!.shifts,
         backupPath: backup.path,
       });

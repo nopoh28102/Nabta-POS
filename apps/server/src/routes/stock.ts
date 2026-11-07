@@ -1,11 +1,12 @@
 import type { FastifyInstance } from "fastify";
-import { inventoryPeriodicExportRequestSchema, stockCountPostRequestSchema } from "@nabta/contracts";
+import { inventoryPeriodicExportRequestSchema, stockCountPostRequestSchema, stockExpiryRegistrationRequestSchema } from "@nabta/contracts";
 import { calculateInventoryIssueValue, roundHalfUp } from "@nabta/domain";
 import type { Database } from "../db.js";
 import { transaction } from "../db.js";
 import { ApiError } from "../errors.js";
 import { requirePermission } from "../auth.js";
 import { audit } from "../audit.js";
+import { canonicalJson, sha256 } from "../security.js";
 
 function datePartsInCairo(date: Date): { year: number; month: number; day: number } {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -195,17 +196,43 @@ export function registerStockRoutes(app: FastifyInstance, db: Database): void {
     const result = await db.query<{
       product_id: string; name_ar: string; category: string; barcode: string | null;
       unit_kind: "PIECE" | "WEIGHT"; qty_milli: number; reorder_level_milli: number;
+      smart_reorder_level_milli: number; average_daily_demand_milli: number;
     }>(`
-      SELECT p.id AS product_id, p.name_ar, p.category, min(pb.barcode) AS barcode,
-             p.unit_kind, COALESCE(sb.qty_milli, 0)::bigint AS qty_milli, p.reorder_level_milli
-      FROM terminals t
-      JOIN products p ON p.active AND p.reorder_level_milli > 0
-      LEFT JOIN stock_balances sb ON sb.warehouse_id = t.warehouse_id AND sb.product_id = p.id
-      LEFT JOIN product_barcodes pb ON pb.product_id = p.id
-      WHERE t.id = $1 AND COALESCE(sb.qty_milli, 0) <= p.reorder_level_milli
-      GROUP BY p.id, p.name_ar, p.category, p.unit_kind, sb.qty_milli, p.reorder_level_milli
-      ORDER BY CASE WHEN COALESCE(sb.qty_milli, 0) = 0 THEN 0 WHEN COALESCE(sb.qty_milli, 0) < p.reorder_level_milli THEN 1 ELSE 2 END,
-               p.name_ar
+      WITH terminal AS (
+        SELECT warehouse_id FROM terminals WHERE id = $1 AND active
+      ), demand AS (
+        SELECT sm.product_id,
+               GREATEST(0, -sum(sm.qty_delta_milli))::bigint AS sold_qty_milli
+        FROM stock_movements sm
+        JOIN terminal t ON t.warehouse_id = sm.warehouse_id
+        WHERE sm.movement_type IN ('SALE', 'SALE_RETURN')
+          AND sm.occurred_at >= now() - interval '28 days'
+        GROUP BY sm.product_id
+      ), levels AS (
+        SELECT p.id AS product_id, p.name_ar, p.category, p.unit_kind,
+               COALESCE(sb.qty_milli, 0)::bigint AS qty_milli,
+               p.reorder_level_milli AS manual_reorder_level_milli,
+               CASE WHEN p.unit_kind = 'PIECE' THEN
+                 (CEIL((COALESCE(d.sold_qty_milli, 0)::numeric * 10) / 28 / 1000) * 1000)::bigint
+               ELSE CEIL((COALESCE(d.sold_qty_milli, 0)::numeric * 10) / 28)::bigint END AS smart_reorder_level_milli,
+               CEIL(COALESCE(d.sold_qty_milli, 0)::numeric / 28)::bigint AS average_daily_demand_milli
+        FROM terminal t
+        JOIN products p ON p.active
+        LEFT JOIN stock_balances sb ON sb.warehouse_id = t.warehouse_id AND sb.product_id = p.id
+        LEFT JOIN demand d ON d.product_id = p.id
+      )
+      SELECT l.product_id, l.name_ar, l.category, min(pb.barcode) AS barcode,
+             l.unit_kind, l.qty_milli,
+             GREATEST(l.manual_reorder_level_milli, l.smart_reorder_level_milli)::bigint AS reorder_level_milli,
+             l.smart_reorder_level_milli, l.average_daily_demand_milli
+      FROM levels l
+      LEFT JOIN product_barcodes pb ON pb.product_id = l.product_id
+      WHERE GREATEST(l.manual_reorder_level_milli, l.smart_reorder_level_milli) > 0
+        AND l.qty_milli <= GREATEST(l.manual_reorder_level_milli, l.smart_reorder_level_milli)
+      GROUP BY l.product_id, l.name_ar, l.category, l.unit_kind, l.qty_milli, l.manual_reorder_level_milli,
+               l.smart_reorder_level_milli, l.average_daily_demand_milli
+      ORDER BY CASE WHEN l.qty_milli = 0 THEN 0 WHEN l.qty_milli < GREATEST(l.manual_reorder_level_milli, l.smart_reorder_level_milli) THEN 1 ELSE 2 END,
+               l.name_ar
       LIMIT 2_000
     `, [auth.terminalId]);
     const items = result.rows.map((row) => ({
@@ -216,6 +243,8 @@ export function registerStockRoutes(app: FastifyInstance, db: Database): void {
       unitKind: row.unit_kind,
       availableQtyMilli: row.qty_milli,
       reorderLevelMilli: row.reorder_level_milli,
+      smartReorderLevelMilli: row.smart_reorder_level_milli,
+      averageDailyDemandMilli: row.average_daily_demand_milli,
       shortageQtyMilli: Math.max(0, row.reorder_level_milli - row.qty_milli),
       status: row.qty_milli === 0 ? "OUT_OF_STOCK" as const : row.qty_milli < row.reorder_level_milli ? "BELOW_REORDER" as const : "AT_REORDER" as const,
     }));
@@ -231,7 +260,7 @@ export function registerStockRoutes(app: FastifyInstance, db: Database): void {
   });
 
   app.get("/v1/stock-expiry", async (request) => {
-    const auth = requirePermission(request, "STOCK_COUNT");
+    const auth = requirePermission(request, "EXPIRY_REGISTER");
     const rawDays = Number((request.query as Record<string, unknown>).days ?? 30);
     const days = Number.isInteger(rawDays) ? Math.max(0, Math.min(365, rawDays)) : 30;
     const result = await db.query(`
@@ -245,6 +274,97 @@ export function registerStockRoutes(app: FastifyInstance, db: Database): void {
       LIMIT 500
     `, [auth.terminalId, days]);
     return { days, lots: result.rows };
+  });
+
+  /**
+   * Phone barcode scans frequently happen after the goods have already been
+   * received.  This converts only un-dated stock into a dated lot without
+   * changing the stock balance or its value, so expiry registration cannot
+   * accidentally inflate the inventory.
+   */
+  app.post("/v1/stock-lots/expiry-registration", async (request, reply) => {
+    const auth = requirePermission(request, "EXPIRY_REGISTER");
+    const body = stockExpiryRegistrationRequestSchema.parse(request.body);
+    // Electron uses these loopback-only audit hints while reconciling an
+    // immutable cloud event. They never grant access or change the mutation.
+    const loopback = request.ip === "127.0.0.1" || request.ip === "::1" || request.ip === "::ffff:127.0.0.1";
+    const sourceCloudEventId = loopback && typeof request.headers["x-nabta-cloud-event-id"] === "string" ? request.headers["x-nabta-cloud-event-id"] : null;
+    const sourceCloudActorId = loopback && typeof request.headers["x-nabta-cloud-actor-id"] === "string" ? request.headers["x-nabta-cloud-actor-id"] : null;
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || !/^[0-9a-f-]{36}$/i.test(key)) {
+      throw new ApiError(400, "IDEMPOTENCY_REQUIRED", "مفتاح العملية مطلوب لتسجيل الصلاحية");
+    }
+    const hash = sha256(canonicalJson(body));
+    const response = await transaction(db, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`${auth.userId}:${key}`]);
+      const prior = await client.query<{ payload_hash: string; status: string; response_body: unknown }>(
+        "SELECT payload_hash, status, response_body FROM idempotency_requests WHERE user_id = $1 AND key = $2 FOR UPDATE",
+        [auth.userId, key],
+      );
+      if (prior.rows[0]) {
+        if (prior.rows[0].payload_hash !== hash) throw new ApiError(409, "IDEMPOTENCY_CONFLICT", "استُخدم مفتاح العملية نفسه مع بيانات مختلفة");
+        if (prior.rows[0].status === "COMPLETED") return prior.rows[0].response_body;
+      } else {
+        await client.query("INSERT INTO idempotency_requests(user_id, key, payload_hash) VALUES ($1, $2, $3)", [auth.userId, key, hash]);
+      }
+
+      const terminal = await client.query<{ warehouse_id: string }>("SELECT warehouse_id FROM terminals WHERE id = $1 AND active", [auth.terminalId]);
+      if (!terminal.rows[0]) throw new ApiError(409, "TERMINAL_INVALID", "نقطة البيع غير صالحة");
+      const product = await client.query<{ id: string; name_ar: string; unit_kind: "PIECE" | "WEIGHT" }>(
+        "SELECT id, name_ar, unit_kind FROM products WHERE id = $1 AND active FOR SHARE",
+        [body.productId],
+      );
+      if (!product.rows[0]) throw new ApiError(404, "PRODUCT_NOT_FOUND", "الصنف غير موجود أو مؤرشف");
+      if (product.rows[0].unit_kind === "PIECE" && body.qtyMilli % 1000 !== 0) {
+        throw new ApiError(422, "PIECE_FRACTION", "صنف القطعة لا يقبل كمية كسرية");
+      }
+      const sources = await client.query<{ id: string; qty_milli: number }>(`
+        SELECT id, qty_milli FROM stock_lots
+        WHERE warehouse_id = $1 AND product_id = $2 AND qty_milli > 0 AND expires_on IS NULL
+        ORDER BY received_at, id FOR UPDATE
+      `, [terminal.rows[0].warehouse_id, body.productId]);
+      let available = sources.rows.reduce((sum, lot) => sum + lot.qty_milli, 0);
+      if (available < body.qtyMilli) {
+        throw new ApiError(409, "EXPIRY_QTY_UNAVAILABLE", "الكمية غير المؤرخة المتاحة أقل من الكمية المطلوب تسجيل صلاحيتها");
+      }
+      const lot = await client.query<{ id: string }>(`
+        INSERT INTO stock_lots(warehouse_id, product_id, lot_code, expires_on, qty_milli)
+        VALUES ($1, $2, $3, $4, $5) RETURNING id
+      `, [terminal.rows[0].warehouse_id, body.productId, body.lotCode ?? null, body.expiresOn, body.qtyMilli]);
+      let remaining = body.qtyMilli;
+      for (const source of sources.rows) {
+        if (remaining === 0) break;
+        const moved = Math.min(remaining, source.qty_milli);
+        await client.query("UPDATE stock_lots SET qty_milli = qty_milli - $2 WHERE id = $1", [source.id, moved]);
+        remaining -= moved;
+      }
+      if (remaining !== 0 || available < 0) throw new Error("expiry registration allocation invariant failed");
+      const result = { lotId: lot.rows[0]!.id, productId: body.productId, qtyMilli: body.qtyMilli, expiresOn: body.expiresOn };
+      await client.query(`INSERT INTO stock_lot_events(
+        warehouse_id, product_id, target_lot_id, event_type, qty_milli,
+        expires_on, actor_user_id, idempotency_key, metadata
+      ) VALUES ($1, $2, $3, 'EXPIRY_REGISTERED', $4, $5, $6, $7, $8::jsonb)`, [
+        terminal.rows[0].warehouse_id,
+        body.productId,
+        lot.rows[0]!.id,
+        body.qtyMilli,
+        body.expiresOn,
+        auth.userId,
+        key,
+        JSON.stringify({ sourceLotCount: sources.rows.length, lotCode: body.lotCode ?? null }),
+      ]);
+      await audit(client, auth, "STOCK_EXPIRY_REGISTERED", "stock_lot", lot.rows[0]!.id, {
+        ...result,
+        sourceLotCount: sources.rows.length,
+        ...(sourceCloudEventId ? { cloudEventId: sourceCloudEventId, cloudActorUserId: sourceCloudActorId } : {}),
+      });
+      await client.query(
+        "UPDATE idempotency_requests SET status = 'COMPLETED', response_status = 201, response_body = $3::jsonb, completed_at = now() WHERE user_id = $1 AND key = $2",
+        [auth.userId, key, JSON.stringify(result)],
+      );
+      return result;
+    });
+    return reply.status(201).send(response);
   });
 
   app.get("/v1/stock-movements", async (request) => {

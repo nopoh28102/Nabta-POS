@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { cashMovementRequestSchema, closeShiftRequestSchema, openShiftRequestSchema, shiftHistoryQuerySchema } from "@nabta/contracts";
+import { cashMovementRequestSchema, closeShiftRequestSchema, openShiftRequestSchema, shiftHistoryQuerySchema, shopConsumptionListQuerySchema } from "@nabta/contracts";
 import type { Database } from "../db.js";
 import { transaction } from "../db.js";
 import { ApiError } from "../errors.js";
@@ -139,13 +139,53 @@ export function registerShiftRoutes(app: FastifyInstance, db: Database): void {
         throw new ApiError(422, "INSUFFICIENT_CASH", "القيمة أكبر من النقدية المتوقعة في الدرج");
       }
       const movement = await client.query<{ id: string; occurred_at: Date }>(`
-        INSERT INTO cash_movements(shift_id, user_id, type, amount_minor, reason)
-        VALUES ($1, $2, $3, $4, $5) RETURNING id, occurred_at
-      `, [request.params.id, auth.userId, body.type, body.amountMinor, body.reason]);
-      await audit(client, auth, "CASH_MOVEMENT_POSTED", "cash_movement", movement.rows[0]!.id, { type: body.type, amountMinor: body.amountMinor }, body.reason);
+        INSERT INTO cash_movements(shift_id, user_id, type, amount_minor, reason, expense_category)
+        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, occurred_at
+      `, [request.params.id, auth.userId, body.type, body.amountMinor, body.reason, body.consumption?.category ?? body.expenseCategory ?? "مصروفات تشغيل عامة"]);
+      if (body.consumption) {
+        await client.query(`
+          INSERT INTO shop_consumptions(cash_movement_id, item_name, category, quantity_note, supplier_name, consumed_on, note)
+          VALUES ($1, $2, $3, $4, $5, $6::date, $7)
+        `, [
+          movement.rows[0]!.id,
+          body.consumption.itemName,
+          body.consumption.category,
+          body.consumption.quantityNote ?? null,
+          body.consumption.supplierName ?? null,
+          body.consumption.consumedOn,
+          body.consumption.note ?? null,
+        ]);
+      }
+      await audit(client, auth, "CASH_MOVEMENT_POSTED", "cash_movement", movement.rows[0]!.id, {
+        type: body.type, amountMinor: body.amountMinor, expenseCategory: body.expenseCategory ?? null, consumption: body.consumption ?? null,
+      }, body.reason);
       return { id: movement.rows[0]!.id, occurredAt: movement.rows[0]!.occurred_at.toISOString() };
     });
     return reply.status(201).send(response);
+  });
+
+  app.get("/v1/shop-consumptions", async (request) => {
+    const auth = requirePermission(request, "CASH_MOVE");
+    const query = shopConsumptionListQuerySchema.parse(request.query);
+    const result = await db.query<{
+      id: string; item_name: string; category: string; quantity_note: string | null; supplier_name: string | null;
+      consumed_on: string; note: string | null; amount_minor: number; cashier_name: string;
+    }>(`
+      SELECT sc.id, sc.item_name, sc.category, sc.quantity_note, sc.supplier_name, sc.consumed_on::text,
+             sc.note, cm.amount_minor, u.display_name cashier_name
+      FROM shop_consumptions sc
+      JOIN cash_movements cm ON cm.id = sc.cash_movement_id
+      JOIN shifts s ON s.id = cm.shift_id
+      JOIN users u ON u.id = cm.user_id
+      WHERE s.terminal_id = $1 AND sc.consumed_on BETWEEN $2::date AND $3::date
+      ORDER BY sc.consumed_on DESC, sc.created_at DESC
+      LIMIT 500
+    `, [auth.terminalId, query.from, query.to]);
+    return { items: result.rows.map((row) => ({
+      id: row.id, itemName: row.item_name, category: row.category, quantityNote: row.quantity_note,
+      supplierName: row.supplier_name, consumedOn: row.consumed_on, note: row.note,
+      amountMinor: Number(row.amount_minor), cashierName: row.cashier_name,
+    })) };
   });
 
   app.post<{ Params: { id: string } }>("/v1/shifts/:id/close", async (request) => {

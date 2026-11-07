@@ -40,7 +40,18 @@ export function registerInvoiceRoutes(app: FastifyInstance, db: Database): void 
       if (query) {
         values.push(query);
         const queryParam = `$${values.length}`;
-        salesConditions += ` AND (s.invoice_no ILIKE ('%' || ${queryParam} || '%') OR (c.name IS NOT NULL AND c.name ILIKE ('%' || ${queryParam} || '%')))`;
+        salesConditions += ` AND (
+          s.invoice_no ILIKE ('%' || ${queryParam} || '%')
+          OR (c.name IS NOT NULL AND c.name ILIKE ('%' || ${queryParam} || '%'))
+          OR EXISTS (
+            SELECT 1
+            FROM sale_lines sl
+            LEFT JOIN products sp ON sp.id = sl.product_id
+            LEFT JOIN product_barcodes spb ON spb.product_id = sp.id
+            WHERE sl.sale_id = s.id
+              AND (sl.name_snapshot ILIKE ('%' || ${queryParam} || '%') OR spb.barcode ILIKE ('%' || ${queryParam} || '%'))
+          )
+        )`;
       }
 
       parts.push(`
@@ -81,7 +92,19 @@ export function registerInvoiceRoutes(app: FastifyInstance, db: Database): void 
       if (query) {
         values.push(query);
         const queryParam = `$${values.length}`;
-        purchaseConditions += ` AND ((pr.supplier_invoice_no IS NOT NULL AND pr.supplier_invoice_no ILIKE ('%' || ${queryParam} || '%')) OR pr.supplier_name ILIKE ('%' || ${queryParam} || '%') OR (sup.name IS NOT NULL AND sup.name ILIKE ('%' || ${queryParam} || '%')))`;
+        purchaseConditions += ` AND (
+          (pr.supplier_invoice_no IS NOT NULL AND pr.supplier_invoice_no ILIKE ('%' || ${queryParam} || '%'))
+          OR pr.supplier_name ILIKE ('%' || ${queryParam} || '%')
+          OR (sup.name IS NOT NULL AND sup.name ILIKE ('%' || ${queryParam} || '%'))
+          OR EXISTS (
+            SELECT 1
+            FROM purchase_receipt_lines prl
+            JOIN products pp ON pp.id = prl.product_id
+            LEFT JOIN product_barcodes ppb ON ppb.product_id = pp.id
+            WHERE prl.receipt_id = pr.id
+              AND (pp.name_ar ILIKE ('%' || ${queryParam} || '%') OR ppb.barcode ILIKE ('%' || ${queryParam} || '%'))
+          )
+        )`;
       }
 
       parts.push(`
@@ -197,9 +220,11 @@ export function registerInvoiceRoutes(app: FastifyInstance, db: Database): void 
       const saleRow = saleResult.rows[0];
 
       const linesResult = await db.query<{
-        productId: string;
+        productId: string | null;
         nameAr: string;
         unitKind: "PIECE" | "WEIGHT";
+        saleUnit: "UNIT" | "PACKAGE" | null;
+        packageSize: number | null;
         qtyMilli: number;
         unitPriceMinor: number;
         totalMinor: number;
@@ -208,6 +233,8 @@ export function registerInvoiceRoutes(app: FastifyInstance, db: Database): void 
           sl.product_id AS "productId",
           sl.name_snapshot AS "nameAr",
           sl.unit_kind_snapshot AS "unitKind",
+          sl.sale_unit_snapshot AS "saleUnit",
+          sl.sale_package_size_snapshot AS "packageSize",
           sl.qty_milli AS "qtyMilli",
           sl.unit_price_minor AS "unitPriceMinor",
           sl.net_minor AS "totalMinor"
@@ -233,9 +260,11 @@ export function registerInvoiceRoutes(app: FastifyInstance, db: Database): void 
         postedAt: saleRow.posted_at.toISOString(),
         cashierOrReceiverName: saleRow.cashier_or_receiver_name,
         lines: linesResult.rows.map((row) => ({
-          productId: row.productId,
+          productId: row.productId ?? "00000000-0000-4000-8000-000000000000",
           nameAr: row.nameAr,
           unitKind: row.unitKind,
+          ...(row.saleUnit ? { saleUnit: row.saleUnit } : {}),
+          ...(row.packageSize ? { packageSize: Number(row.packageSize) } : {}),
           qtyMilli: Number(row.qtyMilli),
           unitPriceMinor: Number(row.unitPriceMinor),
           totalMinor: Number(row.totalMinor),

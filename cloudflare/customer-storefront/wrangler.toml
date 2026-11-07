@@ -1,0 +1,12 @@
+name = "nabta-customer-storefront"
+main = "src/index.ts"
+compatibility_date = "2026-10-25"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+# Set the following two values as encrypted Worker secrets; never put them in
+# this file or in the customer-facing web application:
+#   NABTA_COMMERCE_ORIGIN=https://<long-lived-cloudflare-tunnel-host>
+#   NABTA_COMMERCE_SHARED_SECRET=<at-least-32-random-characters>

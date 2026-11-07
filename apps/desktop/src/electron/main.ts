@@ -1,8 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, session, shell } from "electron";
 import type { MessageBoxOptions, OpenDialogOptions, SaveDialogOptions } from "electron";
-import { appendFile, readFile, writeFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { dirname, extname, resolve, sep } from "node:path";
 import { deflateRawSync } from "node:zlib";
 import dgram from "node:dgram";
@@ -11,22 +13,63 @@ import { pathToFileURL } from "node:url";
 import { SerialPort } from "serialport";
 import bwipjs from "bwip-js";
 import electronUpdater from "electron-updater";
-import { barcodeSchema, hardwareSettingsSchema, ipcRequestSchema, type DiscoveredServer, type HardwareSettings, type InventoryExcelExportResponse, type InventoryPeriodicExcelExportResponse, type IpcRequest, type PartnerListDocumentRequest, type ProductExcelExportResponse, type ProductLabelBatchPrintRequest, type ProductLabelPrintRequest, type PurchaseReceiptPrintRequest, type ReceiptPrintRequest, type ReorderListDocumentRequest, type ReportPdfExportRequest, type ShiftHistoryExcelExportResponse } from "@nabta/contracts";
-import { createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
+import { barcodeSchema, hardwareSettingsSchema, ipcRequestSchema, type ComprehensiveReportResponse, type DeliveryOrderPrintRequest, type DiscoveredServer, type HardwareSettings, type InventoryExcelExportResponse, type InventoryPeriodicExcelExportResponse, type InvoiceDetailResponse, type IpcRequest, type PartnerListDocumentRequest, type ProductExcelExportResponse, type ProductLabelBatchPrintRequest, type ProductLabelPrintRequest, type PurchaseReceiptPrintRequest, type ReceiptPrintRequest, type ReorderListDocumentRequest, type ReportPdfExportRequest, type ShiftHistoryExcelExportResponse } from "@nabta/contracts";
+import { createComprehensiveReportWorkbook, createExpiryWorkbook, createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createProductSyncWorkbook, createShiftsWorkbook, productSyncWorkbookToCsv, type ExpiryWorkbookData } from "./workbooks.js";
 import { createLabelLayout, createLabelRasterHtml, createTsplGapCalibrationJob, createTsplNativeBarcodeJob, createTsplRasterJob, encodeXp233bTsplBitmap, type LabelPrinterProfile } from "./printing/label-engine.js";
-import { formatQtyForReceipt, receiptHtml } from "./printing/receipt-engine.js";
+import { deliveryOrderHtml, formatQtyForReceipt, purchaseReceiptThermalHtml, receiptHtml } from "./printing/receipt-engine.js";
 import { WindowsRawSpooler } from "./printing/raw-spooler.js";
 
 interface DesktopConfig {
   serverUrl: string;
   terminalId?: string;
   certificateFingerprint: string;
+  deviceMode?: "PRIMARY" | "SECONDARY";
+  terminalRelayKey?: string;
 }
+
+interface CloudflareConnection {
+  enabled: boolean;
+  autoStart: boolean;
+  tunnelToken?: string | undefined;
+  commerceSharedSecret?: string | undefined;
+  terminalRelaySharedSecret?: string | undefined;
+  terminalRelayUrl?: string | undefined;
+  publicApiUrl?: string | undefined;
+  cloudCoreUrl?: string | undefined;
+  cloudStoreId?: string | undefined;
+  cloudMigrationKey?: string | undefined;
+  cloudMigrationId?: string | undefined;
+  cloudMigrationState?: "PENDING" | "IMPORTED" | undefined;
+}
+
+interface CloudflareConnectionView {
+  enabled: boolean;
+  autoStart: boolean;
+  configured: boolean;
+  tunnelTokenConfigured: boolean;
+  commerceSecretConfigured: boolean;
+  terminalRelaySecretConfigured: boolean;
+  terminalRelayUrl: string;
+  cloudflaredBundled: boolean;
+  publicApiUrl: string;
+  cloudCoreUrl: string;
+  cloudStoreConfigured: boolean;
+  cloudMigrationState: "NOT_STARTED" | "PENDING" | "IMPORTED";
+  running: boolean;
+}
+
+type CloudMigrationProgress = {
+  phase: "CHECKING_DNS" | "CHECKING_CLOUD" | "CREATING_STORE" | "PREPARING" | "STARTING" | "UPLOADING" | "VERIFYING" | "PROTECTING_ACCOUNT" | "COMPLETE";
+  percent: number;
+  messageAr: string;
+  completedChunks?: number;
+  totalChunks?: number;
+};
 
 const LOCAL_SERVER_PORT = 17443;
 const LOCAL_SERVER_URL = `http://127.0.0.1:${LOCAL_SERVER_PORT}`;
-const LOCAL_TERMINAL_ID = "00000000-0000-4000-8000-000000000003";
-const LOCAL_CONFIG: DesktopConfig = { serverUrl: LOCAL_SERVER_URL, terminalId: LOCAL_TERMINAL_ID, certificateFingerprint: "" };
+const DEFAULT_CLOUD_CORE_URL = "https://nabta-cloud-core.mahmoudnabih989.workers.dev";
+const LEGACY_LOCAL_TERMINAL_ID = "00000000-0000-4000-8000-000000000003";
 const DEFAULT_HARDWARE_SETTINGS: HardwareSettings = hardwareSettingsSchema.parse({});
 
 let mainWindow: BrowserWindow | null = null;
@@ -40,8 +83,222 @@ const labelRawSpooler = new WindowsRawSpooler();
 const runEmbeddedServer = process.argv.includes("--run-server");
 let hostProcessStarted = false;
 let hostStartPromise: Promise<void> | null = null;
+let localHostProcess: ReturnType<typeof spawn> | null = null;
+let localHostWasReady = false;
+let localHostRecoveryAttempts = 0;
+let appIsQuitting = false;
+let pendingLocalRecoveryArchive: string | null = null;
+let cloudflareTunnelProcess: ReturnType<typeof spawn> | null = null;
+let cloudflareTunnelRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let cloudflareTunnelRetryDelayMs = 5_000;
+let cloudReconciliationTimer: ReturnType<typeof setInterval> | null = null;
+let mobilePrintQueueTimer: ReturnType<typeof setInterval> | null = null;
+let mobilePrintQueueBusy = false;
+let cloudMigrationInFlight = false;
 const { autoUpdater } = electronUpdater;
 let updateCheckStarted = false;
+
+// The local data host is an Electron child process in packaged builds. It must
+// never share Chromium's profile/cache with the visible POS window: Windows
+// can deny the second process access and the host then exits before PGlite
+// finishes initializing. Its profile contains no business data.
+if (runEmbeddedServer) {
+  app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
+  app.commandLine.appendSwitch("disable-http-cache");
+}
+
+/**
+ * The local server has two bundled locations in a release build.  The normal
+ * location is an Electron extra resource; the unpacked-app copy is a fallback
+ * that keeps an offline installation usable even if a packaging tool changes
+ * how extra resources are laid out.  Do not download this runtime at startup.
+ */
+function localRuntimeRoot(): string | null {
+  const candidates = [
+    resolve(process.resourcesPath, "server-runtime"),
+    resolve(process.resourcesPath, "app.asar.unpacked", "server-runtime"),
+    // Development runs keep the prepared runtime beside dist-electron.
+    resolve(import.meta.dirname, "../server-runtime"),
+  ];
+  return candidates.find((candidate) =>
+    existsSync(resolve(candidate, "runner.mjs"))
+    && existsSync(resolve(candidate, "server-bundle.mjs"))
+    && existsSync(resolve(candidate, "pglite", "dist", "index.js")),
+  ) ?? null;
+}
+
+function localDataRoot(): string { return resolve(app.getPath("userData"), "local-data"); }
+function cloudflareConnectionPath(): string { return resolve(localDataRoot(), "runtime", "cloudflare-connection.json"); }
+function desktopDiagnosticLogPath(): string { return resolve(app.getPath("userData"), "startup-diagnostics.log"); }
+
+/**
+ * Startup must remain usable when the local host fails. Keep a short
+ * diagnostic record outside the installed application and never include
+ * configuration contents, passwords, tokens, or business data in it.
+ */
+async function recordStartupDiagnostic(scope: string, cause: unknown): Promise<void> {
+  try {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    const safeMessage = message.replace(/[\r\n]+/gu, " ").slice(0, 1_200);
+    await mkdir(dirname(desktopDiagnosticLogPath()), { recursive: true });
+    await appendFile(
+      desktopDiagnosticLogPath(),
+      `${new Date().toISOString()} [${scope}] ${safeMessage}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch {
+    // Diagnostics are strictly best-effort and must never block POS startup.
+  }
+}
+
+function bundledCloudflaredPath(): string | null {
+  const candidates = [
+    resolve(process.resourcesPath, "cloudflared", "cloudflared.exe"),
+    resolve(process.resourcesPath, "app.asar.unpacked", "cloudflared", "cloudflared.exe"),
+    resolve(import.meta.dirname, "../build/cloudflared/cloudflared.exe"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+}
+
+function defaultCloudflareConnection(): CloudflareConnection {
+  return { enabled: false, autoStart: false, publicApiUrl: "", cloudCoreUrl: "" };
+}
+
+async function readCloudflareConnection(): Promise<CloudflareConnection> {
+  try {
+    const value = JSON.parse((await readFile(cloudflareConnectionPath(), "utf8")).replace(/^\uFEFF/, "")) as Partial<CloudflareConnection>;
+    return {
+      enabled: value.enabled === true,
+      autoStart: value.autoStart === true,
+      ...(typeof value.tunnelToken === "string" ? { tunnelToken: value.tunnelToken } : {}),
+      ...(typeof value.commerceSharedSecret === "string" ? { commerceSharedSecret: value.commerceSharedSecret } : {}),
+      ...(typeof value.terminalRelaySharedSecret === "string" ? { terminalRelaySharedSecret: value.terminalRelaySharedSecret } : {}),
+      terminalRelayUrl: typeof value.terminalRelayUrl === "string" ? value.terminalRelayUrl : "",
+      publicApiUrl: typeof value.publicApiUrl === "string" ? value.publicApiUrl : "",
+      cloudCoreUrl: typeof value.cloudCoreUrl === "string" ? value.cloudCoreUrl : "",
+      ...(typeof value.cloudStoreId === "string" ? { cloudStoreId: value.cloudStoreId } : {}),
+      ...(typeof value.cloudMigrationKey === "string" ? { cloudMigrationKey: value.cloudMigrationKey } : {}),
+      ...(typeof value.cloudMigrationId === "string" ? { cloudMigrationId: value.cloudMigrationId } : {}),
+      ...(value.cloudMigrationState === "PENDING" || value.cloudMigrationState === "IMPORTED" ? { cloudMigrationState: value.cloudMigrationState } : {}),
+    };
+  } catch {
+    return defaultCloudflareConnection();
+  }
+}
+
+function cloudflareConnectionView(value: CloudflareConnection): CloudflareConnectionView {
+  const cloudflaredBundled = Boolean(bundledCloudflaredPath());
+  const tunnelTokenConfigured = Boolean(value.tunnelToken && value.tunnelToken.length >= 32);
+  const commerceSecretConfigured = Boolean(value.commerceSharedSecret && value.commerceSharedSecret.length >= 32);
+  const terminalRelaySecretConfigured = Boolean(value.terminalRelaySharedSecret && value.terminalRelaySharedSecret.length >= 32);
+  return {
+    enabled: value.enabled,
+    autoStart: value.autoStart,
+    configured: value.enabled && tunnelTokenConfigured && commerceSecretConfigured && cloudflaredBundled,
+    tunnelTokenConfigured,
+    commerceSecretConfigured,
+    terminalRelaySecretConfigured,
+    terminalRelayUrl: value.terminalRelayUrl ?? "",
+    cloudflaredBundled,
+    publicApiUrl: value.publicApiUrl ?? "",
+    cloudCoreUrl: value.cloudCoreUrl || DEFAULT_CLOUD_CORE_URL,
+    cloudStoreConfigured: Boolean(value.cloudCoreUrl && value.cloudStoreId && value.cloudMigrationKey),
+    cloudMigrationState: value.cloudMigrationState ?? (value.cloudStoreId && value.cloudMigrationKey ? "PENDING" : "NOT_STARTED"),
+    running: Boolean(cloudflareTunnelProcess && !cloudflareTunnelProcess.killed),
+  };
+}
+
+async function saveCloudflareConnection(update: {
+  enabled: boolean;
+  autoStart: boolean;
+  tunnelToken?: string | undefined;
+  commerceSharedSecret?: string | undefined;
+  terminalRelaySharedSecret?: string | undefined;
+  terminalRelayUrl?: string | undefined;
+  publicApiUrl?: string | undefined;
+  cloudCoreUrl?: string | undefined;
+  cloudStoreId?: string | undefined;
+  cloudMigrationKey?: string | undefined;
+  cloudMigrationId?: string | undefined;
+  cloudMigrationState?: "PENDING" | "IMPORTED" | undefined;
+}): Promise<CloudflareConnection> {
+  const current = await readCloudflareConnection();
+  const next: CloudflareConnection = {
+    enabled: update.enabled,
+    autoStart: update.autoStart,
+    tunnelToken: update.tunnelToken?.trim() || current.tunnelToken,
+    commerceSharedSecret: update.commerceSharedSecret?.trim() || current.commerceSharedSecret,
+    terminalRelaySharedSecret: update.terminalRelaySharedSecret?.trim() || current.terminalRelaySharedSecret,
+    terminalRelayUrl: update.terminalRelayUrl?.trim() ?? current.terminalRelayUrl ?? "",
+    publicApiUrl: update.publicApiUrl?.trim() ?? current.publicApiUrl ?? "",
+    cloudCoreUrl: update.cloudCoreUrl?.trim() ?? current.cloudCoreUrl ?? "",
+    cloudStoreId: update.cloudStoreId?.trim() || current.cloudStoreId,
+    cloudMigrationKey: update.cloudMigrationKey?.trim() || current.cloudMigrationKey,
+    cloudMigrationId: update.cloudMigrationId?.trim() || current.cloudMigrationId,
+    cloudMigrationState: update.cloudMigrationState ?? current.cloudMigrationState,
+  };
+  if (next.enabled && (!next.tunnelToken || next.tunnelToken.length < 32 || !next.commerceSharedSecret || next.commerceSharedSecret.length < 32)) {
+    throw { code: "CLOUDFLARE_CONNECTION_INCOMPLETE", messageAr: "فعّل الاتصال بعد إدخال رمز النفق ومفتاح تطبيق العملاء بطول صحيح." };
+  }
+  await mkdir(dirname(cloudflareConnectionPath()), { recursive: true });
+  await writeFile(cloudflareConnectionPath(), JSON.stringify(next, null, 2), { encoding: "utf8", mode: 0o600 });
+  return next;
+}
+
+async function stopCloudflareTunnel(): Promise<void> {
+  if (cloudflareTunnelRetryTimer) clearTimeout(cloudflareTunnelRetryTimer);
+  cloudflareTunnelRetryTimer = null;
+  cloudflareTunnelRetryDelayMs = 5_000;
+  const current = cloudflareTunnelProcess;
+  cloudflareTunnelProcess = null;
+  if (current && !current.killed) current.kill();
+}
+
+/**
+ * Cloudflare is an optional remote path.  In particular, a lost Internet
+ * connection must never take down the local PGlite host, delay a sale, or
+ * make the visible desktop wait.  Retry the tunnel independently and with a
+ * bounded backoff; the next successful connection resets the delay.
+ */
+function scheduleCloudflareTunnelRetry(): void {
+  if (appIsQuitting || cloudflareTunnelRetryTimer || process.env.NODE_ENV === "test") return;
+  const delay = cloudflareTunnelRetryDelayMs;
+  cloudflareTunnelRetryDelayMs = Math.min(cloudflareTunnelRetryDelayMs * 2, 5 * 60_000);
+  cloudflareTunnelRetryTimer = setTimeout(() => {
+    cloudflareTunnelRetryTimer = null;
+    void startCloudflareTunnel().catch((error) => {
+      console.error("[nabta-cloudflare] background tunnel retry failed", error);
+      scheduleCloudflareTunnelRetry();
+    });
+  }, delay);
+  cloudflareTunnelRetryTimer.unref();
+}
+
+async function startCloudflareTunnel(restart = false): Promise<CloudflareConnectionView> {
+  if (process.env.NODE_ENV === "test") return cloudflareConnectionView(await readCloudflareConnection());
+  if (restart) await stopCloudflareTunnel();
+  const connection = await readCloudflareConnection();
+  const view = cloudflareConnectionView(connection);
+  if (!connection.enabled || !connection.tunnelToken || !view.cloudflaredBundled) return view;
+  if (cloudflareTunnelProcess && !cloudflareTunnelProcess.killed) return cloudflareConnectionView(connection);
+  const executable = bundledCloudflaredPath();
+  if (!executable) return view;
+  const child = spawn(executable, ["tunnel", "run", "--token", connection.tunnelToken], { windowsHide: true, stdio: "ignore" });
+  cloudflareTunnelProcess = child;
+  child.once("error", (error) => {
+    console.error("[nabta-cloudflare] tunnel start failed", error);
+    if (cloudflareTunnelProcess === child) cloudflareTunnelProcess = null;
+    scheduleCloudflareTunnelRetry();
+  });
+  child.once("exit", (code) => {
+    if (cloudflareTunnelProcess === child) cloudflareTunnelProcess = null;
+    if (code && code !== 0) console.error(`[nabta-cloudflare] tunnel exited with ${code}`);
+    if (!appIsQuitting) scheduleCloudflareTunnelRetry();
+  });
+  cloudflareTunnelRetryDelayMs = 5_000;
+  return cloudflareConnectionView(connection);
+}
 
 function showUpdateMessage(options: MessageBoxOptions) {
   return mainWindow ? dialog.showMessageBox(mainWindow, options) : dialog.showMessageBox(options);
@@ -242,9 +499,30 @@ async function configureSerialScanner(settings: HardwareSettings): Promise<void>
 }
 
 async function loadDesktopConfig(): Promise<DesktopConfig> {
-  // Local mode ignores legacy connection files, so the old connection page cannot return.
   if (process.env.NODE_ENV === "test") return { serverUrl: "http://127.0.0.1:7443", certificateFingerprint: "" };
-  return LOCAL_CONFIG;
+  // Each installation receives exactly one terminal identity.  It is stored in
+  // userData (outside the app bundle), so updates keep the same local till.
+  try {
+    const saved = JSON.parse(await readFile(configPath(), "utf8")) as Partial<DesktopConfig>;
+    if (typeof saved.terminalId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(saved.terminalId)) {
+      if (saved.deviceMode === "SECONDARY" && typeof saved.serverUrl === "string" && /^https:\/\//i.test(saved.serverUrl) && typeof saved.terminalRelayKey === "string" && saved.terminalRelayKey.length >= 32) {
+        return { serverUrl: saved.serverUrl, terminalId: saved.terminalId, certificateFingerprint: saved.certificateFingerprint ?? "", deviceMode: "SECONDARY", terminalRelayKey: saved.terminalRelayKey };
+      }
+      return { serverUrl: LOCAL_SERVER_URL, terminalId: saved.terminalId, certificateFingerprint: "", deviceMode: "PRIMARY" };
+    }
+  } catch {
+    // A first installation has no local identity file yet.
+  }
+  // Keep an existing installation on its old identity.  Fresh installations
+  // have no local database yet and receive a newly generated UUID instead.
+  const existingLocalData = existsSync(resolve(app.getPath("userData"), "local-data", "pglite"));
+  const created: DesktopConfig = {
+    serverUrl: LOCAL_SERVER_URL,
+    terminalId: existingLocalData ? LEGACY_LOCAL_TERMINAL_ID : randomUUID(),
+    certificateFingerprint: "", deviceMode: "PRIMARY",
+  };
+  await saveDesktopConfig(created);
+  return created;
 }
 
 async function saveDesktopConfig(value: DesktopConfig): Promise<void> {
@@ -257,33 +535,111 @@ async function startLocalEmbeddedServer(): Promise<void> {
   if (hostStartPromise) return hostStartPromise;
   hostStartPromise = (async () => {
     if (process.env.NODE_ENV === "test" || hostProcessStarted) return;
+    if (desktopConfig?.deviceMode === "SECONDARY") {
+      try {
+        const response = await net.fetch(new URL("/v1/health", desktopConfig.serverUrl).toString(), { headers: { "X-Nabta-Terminal-Key": desktopConfig.terminalRelayKey ?? "" } });
+        if (!response.ok) throw new Error("remote health failed");
+        return;
+      } catch {
+        throw { code: "REMOTE_PRIMARY_UNAVAILABLE", messageAr: "تعذر الاتصال بالجهاز الرئيسي عبر Cloudflare. تأكد أن الجهاز الرئيسي ونفق Cloudflare يعملان." };
+      }
+    }
     const healthy = async (): Promise<boolean> => {
       try { return (await net.fetch(`${LOCAL_SERVER_URL}/v1/health`)).ok; }
       catch { return false; }
     };
-    if (await healthy()) return;
-    if (!existsSync(resolve(process.resourcesPath, "server-runtime", "runner.mjs"))) {
+    if (await healthy()) {
+      localHostWasReady = true;
+      localHostRecoveryAttempts = 0;
+      return;
+    }
+    if (!desktopConfig?.terminalId) throw { code: "LOCAL_TERMINAL_UNAVAILABLE", messageAr: "تعذر إنشاء معرّف نقطة البيع المحلي. أعد تشغيل البرنامج." };
+    if (!localRuntimeRoot()) {
       throw { code: "LOCAL_RUNTIME_MISSING", messageAr: "ملفات بيانات نبتة غير مكتملة. أعد تثبيت البرنامج." };
     }
+    const cloudflare = await readCloudflareConnection();
+    let startupFailure: Error | null = null;
+    let recentServerError = "";
+    const recoveryArchive = pendingLocalRecoveryArchive;
     const child = spawn(process.execPath, ["--run-server"], {
       detached: true,
-      stdio: "ignore",
+      // The renderer must not depend on a console window. Retain only a
+      // short tail of stderr so a failed bundled runtime can be diagnosed.
+      stdio: ["ignore", "ignore", "pipe"],
       windowsHide: true,
       env: {
         ...process.env,
+        // Keep the background Electron host's Chromium profile separate from
+        // the foreground app. The actual POS database remains in
+        // NABTA_LOCAL_DATA_DIR and is deliberately not moved or recreated.
+        NABTA_USER_DATA_DIR: resolve(localDataRoot(), "host-electron-profile"),
         NABTA_LOCAL_MODE: "1",
         NABTA_LOCAL_DATA_DIR: resolve(app.getPath("userData"), "local-data"),
+        NABTA_LOCAL_TERMINAL_ID: desktopConfig.terminalId,
         NABTA_LOCAL_PORT: String(LOCAL_SERVER_PORT),
+        ...(recoveryArchive ? { NABTA_RECOVERY_ARCHIVE: recoveryArchive } : {}),
+        ...(cloudflare.terminalRelaySharedSecret ? { TERMINAL_RELAY_SHARED_SECRET: cloudflare.terminalRelaySharedSecret } : {}),
         // This is deliberately outside the application and live database directories.
         // The owner can copy the resulting archives to an encrypted external drive.
         BACKUP_DIR: resolve(app.getPath("documents"), "Nabta Backups"),
       },
     });
     child.unref();
+    localHostProcess = child;
     hostProcessStarted = true;
+    child.stderr?.on("data", (chunk: Buffer) => {
+      recentServerError = `${recentServerError}${chunk.toString("utf8")}`.slice(-1_200);
+    });
+    child.once("error", (error) => {
+      startupFailure = error;
+      void recordStartupDiagnostic("local-host-spawn", error);
+    });
+    child.once("exit", (code, signal) => {
+      const wasReady = localHostWasReady;
+      const wasCurrentHost = localHostProcess === child;
+      if (!startupFailure) {
+        const detail = recentServerError.replace(/[\r\n]+/gu, " ").trim();
+        startupFailure = new Error(`embedded host exited before readiness (code=${code ?? "none"}, signal=${signal ?? "none"})${detail ? `: ${detail}` : ""}`);
+      }
+      if (wasCurrentHost) {
+        localHostProcess = null;
+        hostProcessStarted = false;
+        hostStartPromise = null;
+        localHostWasReady = false;
+      }
+      void recordStartupDiagnostic("local-host-exit", startupFailure);
+      // A host that was already serving the POS may be stopped by a transient
+      // local service failure. Retry exactly once without touching its data;
+      // repeated failures remain visible to the recovery screen instead of
+      // looping silently.
+      if (wasCurrentHost && wasReady && !appIsQuitting && localHostRecoveryAttempts < 1) {
+        localHostRecoveryAttempts += 1;
+        setTimeout(() => {
+          void startLocalEmbeddedServer().catch((error) => void recordStartupDiagnostic("local-host-auto-restart", error));
+        }, 1_500).unref();
+      }
+    });
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
-      if (await healthy()) return;
+      if (await healthy()) {
+        if (recoveryArchive && pendingLocalRecoveryArchive === recoveryArchive) pendingLocalRecoveryArchive = null;
+        localHostWasReady = true;
+        localHostRecoveryAttempts = 0;
+        // The POS is ready as soon as its local host is ready.  Do not tie
+        // the cashier to DNS, the Internet, or Cloudflare tunnel startup.
+        void startCloudflareTunnel().catch((error) => {
+          console.error("[nabta-cloudflare] optional tunnel start deferred", error);
+          scheduleCloudflareTunnelRetry();
+        });
+        return;
+      }
+      if (startupFailure) {
+        hostProcessStarted = false;
+        throw {
+          code: "LOCAL_DATA_START_FAILED",
+          messageAr: "تعذر تشغيل بيانات نبتة المحلية. افتح شاشة المحاولة مرة أخرى، وسجّل التشخيص محفوظ تلقائيًا دون لمس بياناتك.",
+        };
+      }
       await new Promise<void>((done) => setTimeout(done, 250));
     }
     hostProcessStarted = false;
@@ -291,6 +647,18 @@ async function startLocalEmbeddedServer(): Promise<void> {
   })();
   try { await hostStartPromise; }
   catch (error) { hostStartPromise = null; throw error; }
+}
+
+async function restartLocalEmbeddedServer(): Promise<void> {
+  if (desktopConfig?.deviceMode === "SECONDARY") return;
+  const current = localHostProcess;
+  localHostProcess = null;
+  hostProcessStarted = false;
+  localHostWasReady = false;
+  hostStartPromise = null;
+  if (current && !current.killed) current.kill();
+  await new Promise<void>((resolve) => setTimeout(resolve, 250));
+  await startLocalEmbeddedServer();
 }
 
 function isTrustedSender(frame: Electron.WebFrameMain | null): boolean {
@@ -303,6 +671,10 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
   switch (request.operation) {
     case "servers.discover": throw new Error("discovery operation is local");
     case "host.start": throw new Error("host operation is local");
+    case "host.recovery.restore": throw new Error("host recovery is handled in the desktop process");
+    case "cloudflare.connection.get": throw new Error("Cloudflare connection is handled in the desktop process");
+    case "cloudflare.connection.update": throw new Error("Cloudflare connection is handled in the desktop process");
+    case "cloud.migration.run": throw new Error("Cloud migration is handled in the desktop process");
     case "health": return { method: "GET", path: "/v1/health" };
     case "pos.metrics": return { method: "GET", path: "/v1/pos/metrics" };
     case "terminals.discover": return { method: "GET", path: "/v1/discovery/terminals" };
@@ -313,19 +685,32 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       const params = new URLSearchParams();
       if (request.payload.query) params.set("query", request.payload.query);
       if (request.payload.category) params.set("category", request.payload.category);
+      if (request.payload.unitKind) params.set("unitKind", request.payload.unitKind);
       if (request.payload.limit) params.set("limit", String(request.payload.limit));
       if (request.payload.cursor) params.set("cursor", request.payload.cursor);
       return { method: "GET", path: `/v1/catalog?${params}` };
     }
     case "products.reference.lookup": return { method: "GET", path: `/v1/product-references/${encodeURIComponent(request.payload.barcode)}` };
     case "products.barcode.generate": return { method: "POST", path: "/v1/product-barcodes/generate" };
+    case "products.barcode.attach": return { method: "POST", path: `/v1/products/${request.payload.productId}/barcodes`, body: { barcode: request.payload.barcode } };
+    case "weighted-labels.create": return { method: "POST", path: "/v1/weighted-labels", body: request.payload };
+    case "weighted-labels.list": return { method: "GET", path: `/v1/weighted-labels${request.payload.productId ? `?productId=${encodeURIComponent(request.payload.productId)}` : ""}` };
+    case "weighted-labels.resolve": return { method: "GET", path: `/v1/weighted-labels/${request.payload.barcode}` };
+    case "weighted-labels.mark-printed": return { method: "POST", path: "/v1/weighted-labels/printed", body: request.payload };
     case "products.create": return { method: "POST", path: "/v1/products", body: request.payload };
     case "products.price.update": return { method: "PUT", path: `/v1/products/${request.payload.productId}/price`, body: { priceMinor: request.payload.priceMinor, wholesalePriceMinor: request.payload.wholesalePriceMinor } };
     case "products.update": return { method: "PUT", path: `/v1/products/${request.payload.productId}`, body: {
       nameAr: request.payload.nameAr,
+      category: request.payload.category,
       description: request.payload.description,
       priceMinor: request.payload.priceMinor,
       wholesalePriceMinor: request.payload.wholesalePriceMinor,
+      purchasePackSize: request.payload.purchasePackSize,
+      cartonPriceMinor: request.payload.cartonPriceMinor,
+      cartonContentsUnit: request.payload.cartonContentsUnit,
+      retailPackage: request.payload.retailPackage,
+      barcodeMappings: request.payload.barcodeMappings,
+      mergeLegacyProducts: request.payload.mergeLegacyProducts,
       availableQtyMilli: request.payload.availableQtyMilli,
       expectedStockVersion: request.payload.expectedStockVersion,
     } };
@@ -334,10 +719,19 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       const params = new URLSearchParams();
       if (request.payload?.mode) params.set("mode", request.payload.mode);
       if (request.payload?.query) params.set("query", request.payload.query);
+      if (request.payload?.availableOnly) params.set("availableOnly", "true");
       for (const productId of request.payload?.productIds ?? []) params.append("productIds", productId);
       const suffix = params.size ? `?${params}` : "";
       return { method: "GET", path: `/v1/products/export-data${suffix}` };
     }
+    case "products.sync-workbook.export": {
+      const params = new URLSearchParams({ mode: "INTERNAL" });
+      if (request.payload?.query) params.set("query", request.payload.query);
+      if (request.payload?.availableOnly) params.set("availableOnly", "true");
+      for (const productId of request.payload?.productIds ?? []) params.append("productIds", productId);
+      return { method: "GET", path: `/v1/products/export-data?${params}` };
+    }
+    case "products.import-workbook": throw new Error("Workbook imports are handled in the desktop process.");
     case "inventory.export-xlsx": return { method: "GET", path: "/v1/inventory/export" };
     case "inventory.periodic-export-xlsx": {
       const params = new URLSearchParams({ period: request.payload.period });
@@ -355,6 +749,7 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       return { method: "GET", path: `/v1/stock-movements?${params}` };
     }
     case "stock.expiry": return { method: "GET", path: `/v1/stock-expiry?days=${request.payload.days}` };
+    case "stock.expiry.export-xlsx": return { method: "GET", path: `/v1/stock-expiry?days=${request.payload.days}` };
     case "stock.reorder-list": return { method: "GET", path: "/v1/stock/reorder-list" };
     case "partners.suppliers.list": return { method: "GET", path: "/v1/partners/suppliers" };
     case "partners.suppliers.create": return { method: "POST", path: "/v1/partners/suppliers", body: request.payload };
@@ -368,6 +763,11 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "shifts.current": return { method: "GET", path: "/v1/shifts/current" };
     case "shifts.open": return { method: "POST", path: "/v1/shifts", body: request.payload };
     case "shifts.cash-movement": return { method: "POST", path: `/v1/shifts/${request.payload.shiftId}/cash-movements`, body: request.payload.movement };
+    case "shop-consumptions.list": return { method: "GET", path: `/v1/shop-consumptions?from=${encodeURIComponent(request.payload.from)}&to=${encodeURIComponent(request.payload.to)}` };
+    case "payroll.list": return { method: "GET", path: `/v1/payroll?month=${encodeURIComponent(request.payload.month)}` };
+    case "payroll.create": return { method: "POST", path: "/v1/payroll", body: request.payload };
+    case "financial-periods.list": return { method: "GET", path: "/v1/financial-periods" };
+    case "financial-periods.close": return { method: "POST", path: "/v1/financial-periods/close", body: request.payload };
     case "shifts.close": {
       const { shiftId, ...body } = request.payload;
       return { method: "POST", path: `/v1/shifts/${shiftId}/close`, body };
@@ -378,6 +778,21 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "settings.branch.get": return { method: "GET", path: "/v1/settings/branch" };
     case "settings.branch.update": return { method: "PUT", path: "/v1/settings/branch", body: request.payload };
     case "settings.data-reset": return { method: "POST", path: "/v1/settings/data-reset", body: request.payload };
+    case "payments.settings.get": return { method: "GET", path: `/v1/payments/settings?provider=${encodeURIComponent(request.payload?.provider ?? "KASHIER")}` };
+    case "payments.settings.update": return { method: "PUT", path: "/v1/payments/settings", body: request.payload };
+    case "payments.devices.list": return { method: "GET", path: `/v1/payments/devices?provider=${encodeURIComponent(request.payload?.provider ?? "KASHIER")}` };
+    case "payments.devices.bind": return { method: "PUT", path: "/v1/payments/devices", body: request.payload };
+    case "payments.methods.refresh": return { method: "POST", path: "/v1/payments/methods/refresh", body: request.payload };
+    case "payments.intents.create": return { method: "POST", path: "/v1/payments/intents", body: request.payload };
+    case "payments.intents.get": return { method: "GET", path: `/v1/payments/intents/${request.payload.intentId}` };
+    case "payments.intents.verify": return { method: "POST", path: `/v1/payments/intents/${request.payload.intentId}/verify` };
+    case "payments.intents.cancel": return { method: "POST", path: `/v1/payments/intents/${request.payload.intentId}/cancel` };
+    case "payments.reconcile": return { method: "POST", path: "/v1/payments/reconcile", body: request.payload };
+    case "commerce.orders.list": {
+      const status = request.payload?.status;
+      return { method: "GET", path: `/v1/commerce/admin/orders${status ? `?status=${encodeURIComponent(status)}` : ""}` };
+    }
+    case "commerce.orders.update": return { method: "PUT", path: `/v1/commerce/admin/orders/${request.payload.orderId}`, body: { status: request.payload.status, ...(request.payload.note ? { note: request.payload.note } : {}) } };
     case "users.list": return { method: "GET", path: "/v1/users" };
     case "users.create": return { method: "POST", path: "/v1/users", body: request.payload };
     case "users.update": return { method: "PUT", path: `/v1/users/${request.payload.userId}`, body: request.payload.update };
@@ -393,9 +808,10 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "quotes.create": return { method: "POST", path: "/v1/quotes", body: request.payload };
     case "sales.post": return { method: "POST", path: "/v1/sales", body: request.payload.sale, headers: { "Idempotency-Key": request.payload.idempotencyKey } };
     case "operations.get": return { method: "GET", path: `/v1/operations/${request.payload.requestId}` };
-    case "reports.summary": {
+    case "reports.summary":
+    case "reports.comprehensive": {
       const params = new URLSearchParams(Object.entries(request.payload).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
-      return { method: "GET", path: `/v1/reports/summary?${params}` };
+      return { method: "GET", path: `/v1/reports/${request.operation === "reports.summary" ? "summary" : "comprehensive"}?${params}` };
     }
     case "invoices.list": {
       const params = new URLSearchParams();
@@ -410,6 +826,7 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
       return { method: "GET", path: `/v1/invoices/${request.payload.kind}/${request.payload.id}` };
     case "reports.print":
     case "reports.export-pdf":
+    case "reports.export-xlsx":
     case "reorder-list.print":
     case "reorder-list.export-pdf":
     case "partners.export-pdf":
@@ -419,6 +836,7 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "hardware.printers.list":
     case "hardware.serial.list":
     case "hardware.receipt.print":
+    case "hardware.delivery-order.print":
     case "hardware.receipt.test":
     case "hardware.drawer.open":
     case "hardware.drivers.open-folder":
@@ -430,7 +848,9 @@ function apiPath(request: IpcRequest): { method: "GET" | "POST" | "PUT" | "DELET
     case "hardware.purchase-receipt.print":
     case "invoices.purchase-receipt.export-pdf": throw new Error("desktop hardware operation is local");
     case "config.get":
-    case "config.set": throw new Error("config operation is local");
+    case "config.set":
+    case "multi-terminal.join":
+    case "multi-terminal.primary.enable": throw new Error("config operation is local");
   }
 }
 
@@ -585,6 +1005,15 @@ async function exportInventoryXlsx(data: InventoryExcelExportResponse): Promise<
   return { cancelled: false, path: destination.filePath, itemCount: data.items.length };
 }
 
+async function exportExpiryXlsx(data: ExpiryWorkbookData): Promise<{ cancelled: boolean; path?: string; itemCount: number }> {
+  const date = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(new Date());
+  const options = { title: "حفظ تنبيه الصلاحية بصيغة Excel", defaultPath: resolve(app.getPath("documents"), `تنبيه صلاحية نبتة ${date}.xlsx`), filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }] };
+  const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (destination.canceled || !destination.filePath) return { cancelled: true, itemCount: data.lots.length };
+  await writeFile(destination.filePath, await createExpiryWorkbook(data));
+  return { cancelled: false, path: destination.filePath, itemCount: data.lots.length };
+}
+
 async function exportInventoryPeriodicXlsx(data: InventoryPeriodicExcelExportResponse): Promise<{ cancelled: boolean; path?: string; soldItemCount: number; reorderItemCount: number }> {
   const options = {
     title: "حفظ ملف الجرد الدوري بصيغة Excel",
@@ -645,6 +1074,15 @@ async function exportProductsXlsx(data: ProductExcelExportResponse): Promise<{ c
   return { cancelled: false, path: destination.filePath, itemCount: data.items.length };
 }
 
+async function exportProductSyncWorkbook(data: ProductExcelExportResponse): Promise<{ cancelled: boolean; path?: string; itemCount: number }> {
+  const date = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(new Date(data.generatedAt));
+  const options = { title: "حفظ قالب تعديل الأصناف", defaultPath: resolve(app.getPath("documents"), `تعديل أصناف ${data.storeName} ${date}.xlsx`), filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }] };
+  const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (destination.canceled || !destination.filePath) return { cancelled: true, itemCount: data.items.length };
+  await writeFile(destination.filePath, await createProductSyncWorkbook(data));
+  return { cancelled: false, path: destination.filePath, itemCount: data.items.length };
+}
+
 async function exportShiftsXlsx(data: ShiftHistoryExcelExportResponse): Promise<{ cancelled: boolean; path?: string; itemCount: number }> {
   const options = { title: "حفظ سجل الورديات بصيغة Excel", defaultPath: resolve(app.getPath("documents"), `ورديات ${data.storeName} ${data.month}.xlsx`), filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }] };
   const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
@@ -653,12 +1091,25 @@ async function exportShiftsXlsx(data: ShiftHistoryExcelExportResponse): Promise<
   return { cancelled: false, path: destination.filePath, itemCount: data.items.length };
 }
 
+async function exportComprehensiveReportXlsx(data: ComprehensiveReportResponse): Promise<{ cancelled: boolean; path?: string }> {
+  const options = {
+    title: "حفظ التقرير التشغيلي الشامل بصيغة Excel",
+    defaultPath: resolve(app.getPath("documents"), `تقرير شامل ${data.storeName} ${data.period.from} - ${data.period.to}.xlsx`),
+    filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+  };
+  const destination = mainWindow ? await dialog.showSaveDialog(mainWindow, options) : await dialog.showSaveDialog(options);
+  if (destination.canceled || !destination.filePath) return { cancelled: true };
+  await writeFile(destination.filePath, await createComprehensiveReportWorkbook(data));
+  return { cancelled: false, path: destination.filePath };
+}
+
 type ApiRoute = ReturnType<typeof apiPath>;
 
 async function callApiRoute(route: ApiRoute, responseType: "json" | "text" = "json"): Promise<unknown> {
   if (!desktopConfig) throw { code: "SERVER_NOT_CONFIGURED", messageAr: "أدخل عنوان خادم المتجر أولًا" };
   const url = new URL(route.path, desktopConfig.serverUrl).toString();
   const headers: Record<string, string> = { Accept: "application/json", ...route.headers };
+  if (desktopConfig.deviceMode === "SECONDARY" && desktopConfig.terminalRelayKey) headers["X-Nabta-Terminal-Key"] = desktopConfig.terminalRelayKey;
   if (route.body !== undefined) headers["Content-Type"] = "application/json";
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
   let response: Response;
@@ -670,6 +1121,368 @@ async function callApiRoute(route: ApiRoute, responseType: "json" | "text" = "js
   const data = response.status === 204 ? null : responseType === "text" ? await response.text() : await response.json().catch(() => null);
   if (!response.ok) throw data ?? { code: "SERVER_ERROR", messageAr: "رفض الخادم العملية" };
   return data;
+}
+
+type CloudMigrationManifestView = { migrationId: string; chunkCount: number; recordCount: number; backup: { id: string; sha256: string } };
+
+function reportCloudMigration(progress: CloudMigrationProgress): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("nabta:cloud-migration-progress", progress);
+}
+
+function cloudFailureMessage(cause: unknown): string {
+  const code = cause && typeof cause === "object" && "code" in cause ? String((cause as { code?: unknown }).code ?? "") : "";
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "تعذر العثور على عنوان نبتة السحابي عبر DNS. تحقق من الإنترنت أو DNS على الجهاز ثم أعد المحاولة.";
+  if (code === "ETIMEDOUT" || code === "ECONNRESET" || code === "ECONNREFUSED") return "تعذر الاتصال بخدمة نبتة السحابية في الوقت المحدد. تحقق من الإنترنت أو الحماية على الجهاز ثم أعد المحاولة.";
+  return "تعذر الوصول إلى خدمة نبتة السحابية. ستبقى النسخة المحلية سليمة ويمكن استكمال النقل لاحقًا.";
+}
+
+async function cloudFetch(url: string, init: Parameters<typeof net.fetch>[1]): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  try {
+    return await net.fetch(url, { ...init, signal: controller.signal });
+  } catch (cause) {
+    throw { code: "CLOUD_UNAVAILABLE", messageAr: cloudFailureMessage(cause) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function verifyCloudCore(cloudUrl: string): Promise<string> {
+  let base: URL;
+  try {
+    base = new URL(cloudUrl);
+  } catch {
+    throw { code: "CLOUD_URL_INVALID", messageAr: "رابط نبتة السحابي غير صحيح." };
+  }
+  if (base.protocol !== "https:") throw { code: "CLOUD_URL_HTTPS_REQUIRED", messageAr: "رابط نبتة السحابي يجب أن يكون HTTPS." };
+  reportCloudMigration({ phase: "CHECKING_DNS", percent: 4, messageAr: "يتم التحقق من DNS للرابط السحابي…" });
+  try {
+    const addresses = await lookup(base.hostname, { all: true, verbatim: true });
+    if (addresses.length === 0) throw new Error("no addresses");
+  } catch {
+    throw { code: "CLOUD_DNS_UNAVAILABLE", messageAr: "تعذر العثور على رابط نبتة السحابي عبر DNS. تحقق من اتصال الإنترنت وDNS على الجهاز ثم أعد المحاولة." };
+  }
+  reportCloudMigration({ phase: "CHECKING_CLOUD", percent: 8, messageAr: "يتم اختبار الوصول الآمن إلى نبتة السحابية…" });
+  const response = await cloudFetch(new URL("/v1/cloud/health", base).toString(), { method: "GET", headers: { Accept: "application/json" } });
+  const health = await response.json().catch(() => null) as { status?: unknown } | null;
+  if (!response.ok || health?.status !== "ok") throw { code: "CLOUD_HEALTH_FAILED", messageAr: "الرابط السحابي استجاب لكن خدمة نبتة غير جاهزة. تحقق من Worker ثم أعد المحاولة." };
+  return base.toString().replace(/\/$/, "");
+}
+
+async function localCloudMigrationRequest(path: string, method: "GET" | "POST", body?: unknown): Promise<unknown> {
+  if (!desktopConfig || desktopConfig.deviceMode === "SECONDARY" || desktopConfig.serverUrl !== LOCAL_SERVER_URL) {
+    throw { code: "CLOUD_MIGRATION_SOURCE_DEVICE_REQUIRED", messageAr: "نفّذ نقل البيانات من جهاز نبتة الذي يحتوي على قاعدة البيانات الأصلية فقط." };
+  }
+  if (!authToken) throw { code: "AUTH_REQUIRED", messageAr: "سجّل الدخول بحساب المالك قبل نقل البيانات." };
+  const response = await net.fetch(new URL(path, LOCAL_SERVER_URL).toString(), {
+    method,
+    headers: { Accept: "application/json", Authorization: `Bearer ${authToken}`, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }).catch(() => { throw { code: "LOCAL_DATA_UNAVAILABLE", messageAr: "لا يمكن الوصول إلى بيانات نبتة المحلية على هذا الجهاز." }; });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw data ?? { code: "CLOUD_MIGRATION_PREPARE_FAILED", messageAr: "تعذر تجهيز بيانات النقل." };
+  return data;
+}
+
+async function cloudMigrationRequest(cloudUrl: string, path: string, method: "GET" | "POST", key: string, body?: unknown): Promise<unknown> {
+  const base = new URL(cloudUrl);
+  if (base.protocol !== "https:") throw { code: "CLOUD_URL_HTTPS_REQUIRED", messageAr: "رابط نبتة السحابي يجب أن يكون HTTPS." };
+  const response = await cloudFetch(new URL(path, base).toString(), {
+    method,
+    headers: { Accept: "application/json", "X-Nabta-Cloud-Migration-Key": key, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw data ?? { code: "CLOUD_MIGRATION_UPLOAD_FAILED", messageAr: "رفضت الخدمة السحابية دفعة نقل البيانات." };
+  return data;
+}
+
+type CloudExpiryMutation = {
+  eventId: string;
+  operation: "EXPIRY_REGISTERED";
+  actorUserId: string;
+  idempotencyKey: string;
+  payload: { productId: string; qtyMilli: number; expiresOn: string; lotCode?: string | null };
+};
+
+/**
+ * Keeps the cloud terminal directory in sync with the terminal list embedded
+ * in the verified migration snapshot.  It is safe to call repeatedly: the
+ * directory performs an UPSERT for every terminal id.  This repairs older
+ * imports that finished before the directory write was available, without
+ * uploading or changing any sale, inventory, or local database data.
+ */
+async function repairCloudTerminalDirectory(): Promise<void> {
+  if (!authToken || !desktopConfig || desktopConfig.deviceMode === "SECONDARY" || desktopConfig.serverUrl !== LOCAL_SERVER_URL) return;
+  const connection = await readCloudflareConnection();
+  if (!connection.cloudCoreUrl || !connection.cloudStoreId || !connection.cloudMigrationKey || connection.cloudMigrationState !== "IMPORTED") return;
+  await cloudMigrationRequest(
+    connection.cloudCoreUrl,
+    `/v1/cloud/stores/${connection.cloudStoreId}/terminals/register`,
+    "POST",
+    connection.cloudMigrationKey,
+    {},
+  );
+}
+
+/**
+ * The cloud core deliberately queues only expiry reclassification while the
+ * primary Windows device is offline.  Replaying to the normal local endpoint
+ * retains all local stock checks and uses the original idempotency key before
+ * the cloud event is acknowledged.  A failed replay remains queued safely.
+ */
+async function reconcileCloudExpiryMutations(): Promise<void> {
+  if (!authToken || !desktopConfig || desktopConfig.deviceMode === "SECONDARY" || desktopConfig.serverUrl !== LOCAL_SERVER_URL) return;
+  const connection = await readCloudflareConnection();
+  if (!connection.cloudCoreUrl || !connection.cloudStoreId || !connection.cloudMigrationKey) return;
+  await repairCloudTerminalDirectory();
+  const base = `/v1/cloud/stores/${connection.cloudStoreId}/mutations`;
+  const pending = await cloudMigrationRequest(connection.cloudCoreUrl, `${base}/pending?after=0&limit=100`, "GET", connection.cloudMigrationKey) as { events?: unknown[]; hasMore?: boolean };
+  const events = (pending.events ?? []).filter((candidate): candidate is CloudExpiryMutation => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const event = candidate as Record<string, unknown>;
+    const payload = event.payload as Record<string, unknown> | null;
+    return event.operation === "EXPIRY_REGISTERED" && typeof event.eventId === "string" && typeof event.actorUserId === "string"
+      && typeof event.idempotencyKey === "string" && Boolean(payload) && typeof payload?.productId === "string"
+      && typeof payload?.qtyMilli === "number" && typeof payload?.expiresOn === "string";
+  });
+  if (events.length === 0) return;
+  const appliedEventIds: string[] = [];
+  for (const event of events) {
+    try {
+      await callApiRoute({
+        method: "POST",
+        path: "/v1/stock-lots/expiry-registration",
+        body: event.payload,
+        headers: {
+          "Idempotency-Key": event.idempotencyKey,
+          "X-Nabta-Cloud-Event-Id": event.eventId,
+          "X-Nabta-Cloud-Actor-Id": event.actorUserId,
+        },
+      });
+      appliedEventIds.push(event.eventId);
+    } catch (error) {
+      // Do not acknowledge a partial batch. The cloud durable object keeps
+      // it for the next signed-in primary-device reconciliation.
+      console.error("[nabta-cloud] expiry reconciliation deferred", error);
+      break;
+    }
+  }
+  if (appliedEventIds.length > 0) {
+    await cloudMigrationRequest(connection.cloudCoreUrl, `${base}/ack`, "POST", connection.cloudMigrationKey, { eventIds: appliedEventIds });
+  }
+}
+
+function startCloudReconciliation(): void {
+  if (cloudReconciliationTimer || process.env.NODE_ENV === "test") return;
+  const run = () => void reconcileCloudExpiryMutations().catch((error) => console.error("[nabta-cloud] expiry reconciliation failed", error));
+  run();
+  cloudReconciliationTimer = setInterval(run, 60_000);
+}
+
+function stopCloudReconciliation(): void {
+  if (cloudReconciliationTimer) clearInterval(cloudReconciliationTimer);
+  cloudReconciliationTimer = null;
+}
+
+function purchasePrintRequestFromInvoice(invoice: InvoiceDetailResponse, storeName: string): PurchaseReceiptPrintRequest {
+  if (invoice.kind !== "PURCHASE") throw new Error("A mobile print job must reference a purchase receipt");
+  return {
+    storeName: storeName.trim().length >= 2 ? storeName : "نبتة",
+    receipt: {
+      id: invoice.id,
+      invoiceNo: invoice.invoiceNo,
+      supplierName: invoice.partyName,
+      supplierPhone: invoice.partyPhone,
+      postedAt: invoice.postedAt,
+      goodsMinor: invoice.subtotalMinor ?? invoice.totalMinor - (invoice.supplyExpensesMinor ?? 0),
+      supplyExpensesMinor: invoice.supplyExpensesMinor ?? 0,
+      totalMinor: invoice.totalMinor,
+      receiverName: invoice.cashierOrReceiverName,
+      lines: invoice.lines.map((line) => ({
+        productId: line.productId,
+        nameAr: line.nameAr,
+        unitKind: line.unitKind,
+        qtyMilli: line.qtyMilli,
+        unitCostMinor: line.unitPriceMinor,
+        goodsMinor: line.totalMinor,
+        lotCode: line.lotCode,
+        expiresOn: line.expiresOn,
+      })),
+    },
+  };
+}
+
+function salePrintRequestFromInvoice(invoice: InvoiceDetailResponse, storeName: string): ReceiptPrintRequest {
+  if (invoice.kind !== "SALE") throw new Error("A mobile sale print job must reference a sale");
+  return {
+    storeName: storeName.trim().length >= 2 ? storeName : "نبتة",
+    copies: 1,
+    sale: {
+      saleId: invoice.id,
+      invoiceNo: invoice.invoiceNo,
+      postedAt: invoice.postedAt,
+      subtotalMinor: invoice.subtotalMinor ?? invoice.totalMinor,
+      discountMinor: invoice.discountMinor,
+      totalMinor: invoice.totalMinor,
+      paidMinor: invoice.paidMinor,
+      changeMinor: invoice.changeMinor,
+      lines: invoice.lines.map((line) => ({
+        productId: line.productId,
+        nameAr: line.nameAr,
+        unitKind: line.unitKind,
+        saleUnit: line.saleUnit ?? "UNIT",
+        ...(line.packageSize && line.packageSize >= 2 ? { packageSize: line.packageSize } : {}),
+        qtyMilli: line.qtyMilli,
+        // Invoice details hold the final value per line.  The invoice-level
+        // discount remains visible in the receipt summary and is not applied twice.
+        unitPriceMinor: line.qtyMilli > 0 ? Math.max(0, Math.round((line.totalMinor * 1000) / line.qtyMilli)) : 0,
+        grossMinor: line.totalMinor,
+        discountMinor: 0,
+        netMinor: line.totalMinor,
+        stockVersion: 0,
+      })),
+    },
+  };
+}
+
+/** Claim at most one mobile-originated receipt at a time.  A claimed job is
+ * finished as PRINTED or FAILED and is never retried in the background, so an
+ * unknown printer outcome cannot silently create duplicate paper copies. */
+async function processMobilePurchasePrintQueue(): Promise<void> {
+  if (mobilePrintQueueBusy || !authToken || !desktopConfig || desktopConfig.deviceMode === "SECONDARY" || desktopConfig.serverUrl !== LOCAL_SERVER_URL) return;
+  mobilePrintQueueBusy = true;
+  try {
+    const claimed = await callApiRoute({ method: "GET", path: "/v1/mobile-print-jobs/next", headers: {} } as ApiRoute) as { job?: { id: string; kind: "PURCHASE" | "SALE" | "WEIGHTED_LABEL"; documentId: string } | null };
+    const job = claimed.job;
+    if (!job) return;
+    try {
+      if (job.kind === "WEIGHTED_LABEL") {
+        const payload = await callApiRoute({ method: "GET", path: `/v1/weighted-labels/${encodeURIComponent(job.documentId)}`, headers: {} } as ApiRoute) as { label: { barcode: string; nameAr: string; weightUnit: "KILOGRAM" | "GRAM" | "LITER" | "MILLILITER"; qtyMilli: number; totalMinor: number } };
+        const unit = payload.label.weightUnit === "KILOGRAM" ? "كجم" : payload.label.weightUnit === "GRAM" ? "جم" : payload.label.weightUnit === "LITER" ? "لتر" : "مل";
+        const quantity = payload.label.weightUnit === "KILOGRAM" || payload.label.weightUnit === "LITER" ? payload.label.qtyMilli / 1000 : payload.label.qtyMilli;
+        await printProductLabel({ nameAr: `${payload.label.nameAr} — ${quantity} ${unit}`, barcode: payload.label.barcode, priceMinor: payload.label.totalMinor, copies: 1, hidePrice: false });
+        await callApiRoute({ method: "POST", path: "/v1/weighted-labels/printed", body: { barcode: payload.label.barcode }, headers: {} } as ApiRoute);
+      } else {
+        const [invoice, store] = await Promise.all([
+          callApiRoute({ method: "GET", path: `/v1/invoices/${job.kind}/${job.documentId}`, headers: {} } as ApiRoute) as Promise<InvoiceDetailResponse>,
+          callApiRoute({ method: "GET", path: "/v1/store-info", headers: {} } as ApiRoute) as Promise<{ storeName?: string }>,
+        ]);
+        if (job.kind === "PURCHASE") await printPurchaseReceipt(purchasePrintRequestFromInvoice(invoice, store.storeName ?? "نبتة"));
+        else await printReceipt(salePrintRequestFromInvoice(invoice, store.storeName ?? "نبتة"));
+      }
+      await callApiRoute({ method: "POST", path: `/v1/mobile-print-jobs/${job.id}/complete`, body: { printed: true }, headers: {} } as ApiRoute);
+    } catch (cause) {
+      const value = cause as { code?: unknown; messageAr?: unknown; message?: unknown };
+      const errorCode = typeof value?.code === "string" ? value.code : "MOBILE_PRINT_FAILED";
+      const errorMessage = typeof value?.messageAr === "string" ? value.messageAr : typeof value?.message === "string" ? value.message : "تعذر إرسال الفاتورة إلى الطابعة";
+      try {
+        await callApiRoute({ method: "POST", path: `/v1/mobile-print-jobs/${job.id}/complete`, body: { printed: false, errorCode, errorMessage }, headers: {} } as ApiRoute);
+      } catch (completeError) {
+        console.error("[nabta-print] could not finalize mobile print job", completeError);
+      }
+      console.error("[nabta-print] mobile document failed", cause);
+    }
+  } catch (error) {
+    console.error("[nabta-print] mobile print queue poll failed", error);
+  } finally {
+    mobilePrintQueueBusy = false;
+  }
+}
+
+function startMobilePrintQueue(): void {
+  if (mobilePrintQueueTimer || process.env.NODE_ENV === "test") return;
+  const run = () => void processMobilePurchasePrintQueue();
+  run();
+  mobilePrintQueueTimer = setInterval(run, 2_000);
+}
+
+function stopMobilePrintQueue(): void {
+  if (mobilePrintQueueTimer) clearInterval(mobilePrintQueueTimer);
+  mobilePrintQueueTimer = null;
+  mobilePrintQueueBusy = false;
+}
+
+async function runCloudMigration(input: { cloudUrl: string; bootstrapKey?: string | undefined; ownerUsername?: string | undefined; ownerCloudPassword?: string | undefined }): Promise<{ storeId: string; recordCount: number; chunkCount: number; status: "IMPORTED" }> {
+  if (!desktopConfig || desktopConfig.deviceMode === "SECONDARY" || desktopConfig.serverUrl !== LOCAL_SERVER_URL) {
+    throw { code: "CLOUD_MIGRATION_SOURCE_DEVICE_REQUIRED", messageAr: "التحديث يجب أن يُثبت ويُشغّل على جهاز نبتة المصدر، ثم تبدأ منه عملية النقل." };
+  }
+  if (cloudMigrationInFlight) throw { code: "CLOUD_MIGRATION_IN_PROGRESS", messageAr: "يوجد نقل بيانات سحابي جارٍ بالفعل." };
+  cloudMigrationInFlight = true;
+  try {
+  const connection = await readCloudflareConnection();
+  const cloudUrl = await verifyCloudCore(input.cloudUrl.trim());
+  let storeId = connection.cloudStoreId;
+  let migrationKey = connection.cloudMigrationKey;
+  // A fresh store (or an interrupted first transfer) needs a cloud account
+  // claim. A verified store can refresh its protected replica without asking
+  // the owner to change the password on every backup.
+  const requiresOwnerClaim = !storeId || !migrationKey || connection.cloudCoreUrl !== cloudUrl || connection.cloudMigrationState !== "IMPORTED";
+  if (requiresOwnerClaim && (!input.ownerUsername || !input.ownerCloudPassword)) {
+    throw { code: "CLOUD_OWNER_CREDENTIALS_REQUIRED", messageAr: "اكتب اسم مستخدم المالك وكلمة مرور سحابية عند التهيئة أو استكمال أول نقل فقط." };
+  }
+  if (!storeId || !migrationKey || connection.cloudCoreUrl !== cloudUrl) {
+    if (!input.bootstrapKey) throw { code: "CLOUD_BOOTSTRAP_KEY_REQUIRED", messageAr: "أدخل مفتاح تهيئة نبتة السحابية مرة واحدة لإنشاء مخزن هذا المتجر." };
+    reportCloudMigration({ phase: "CREATING_STORE", percent: 12, messageAr: "يتم إنشاء مخزن السحابة الآمن لهذا المتجر…" });
+    const bootstrap = await cloudFetch(new URL("/v1/cloud/stores/bootstrap", cloudUrl).toString(), {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json", "X-Nabta-Cloud-Bootstrap-Key": input.bootstrapKey },
+      body: "{}",
+    });
+    const data = await bootstrap.json().catch(() => null) as { storeId?: unknown; migrationKey?: unknown } | null;
+    if (!bootstrap.ok || typeof data?.storeId !== "string" || typeof data.migrationKey !== "string") throw data ?? { code: "CLOUD_BOOTSTRAP_FAILED", messageAr: "تعذر تهيئة مخزن المتجر في السحابة." };
+    storeId = data.storeId;
+    migrationKey = data.migrationKey;
+    // Persist the per-store key before any upload. If Windows or the network
+    // stops later, the same store can resume without creating another one.
+    await saveCloudflareConnection({ enabled: connection.enabled, autoStart: connection.autoStart, cloudCoreUrl: cloudUrl, cloudStoreId: storeId, cloudMigrationKey: migrationKey, cloudMigrationState: "PENDING" });
+  }
+  let manifest: CloudMigrationManifestView | null = null;
+  // Resume only an unfinished transfer. Once a transfer is verified, a new
+  // request must prepare a fresh local backup rather than silently uploading
+  // yesterday's manifest again.
+  if (connection.cloudMigrationState === "PENDING" && connection.cloudMigrationId && connection.cloudCoreUrl === cloudUrl) {
+    manifest = await localCloudMigrationRequest(`/v1/cloud-migration/${connection.cloudMigrationId}`, "GET").catch(() => null) as CloudMigrationManifestView | null;
+  }
+  if (!manifest) {
+    reportCloudMigration({ phase: "PREPARING", percent: 18, messageAr: "يتم إنشاء نسخة احتياطية محلية والتحقق منها قبل الرفع…" });
+    manifest = await localCloudMigrationRequest("/v1/cloud-migration/prepare", "POST", {}) as CloudMigrationManifestView;
+    await saveCloudflareConnection({ enabled: connection.enabled, autoStart: connection.autoStart, cloudCoreUrl: cloudUrl, cloudStoreId: storeId, cloudMigrationKey: migrationKey, cloudMigrationId: manifest.migrationId, cloudMigrationState: "PENDING" });
+  }
+  const cloudBase = `/v1/cloud/stores/${storeId}/migration`;
+  reportCloudMigration({ phase: "STARTING", percent: 22, messageAr: "يتم تجهيز دفعات النقل الآمنة…", totalChunks: manifest.chunkCount, completedChunks: 0 });
+  const started = await cloudMigrationRequest(cloudUrl, `${cloudBase}/start`, "POST", migrationKey, { manifest }) as { acceptedChunks?: unknown };
+  const acceptedChunks = typeof started.acceptedChunks === "number" && Number.isInteger(started.acceptedChunks) ? Math.min(Math.max(0, started.acceptedChunks), manifest.chunkCount) : 0;
+  for (let sequence = acceptedChunks; sequence < manifest.chunkCount; sequence += 1) {
+    const chunk = await localCloudMigrationRequest(`/v1/cloud-migration/${manifest.migrationId}/chunks/${sequence}`, "GET");
+    await cloudMigrationRequest(cloudUrl, `${cloudBase}/chunk`, "POST", migrationKey, chunk);
+    const completedChunks = sequence + 1;
+    reportCloudMigration({ phase: "UPLOADING", percent: Math.round(25 + (completedChunks / Math.max(1, manifest.chunkCount)) * 65), messageAr: `يتم رفع البيانات: الدفعة ${completedChunks} من ${manifest.chunkCount}`, completedChunks, totalChunks: manifest.chunkCount });
+  }
+  reportCloudMigration({ phase: "VERIFYING", percent: 92, messageAr: "يتم التحقق من اكتمال كل السجلات في السحابة…", completedChunks: manifest.chunkCount, totalChunks: manifest.chunkCount });
+  const finalized = await cloudMigrationRequest(cloudUrl, `${cloudBase}/finalize`, "POST", migrationKey, { migrationId: manifest.migrationId }) as { status?: string };
+  if (finalized.status !== "imported") throw { code: "CLOUD_IMPORT_INCOMPLETE", messageAr: "لم يكتمل التحقق من بيانات السحابة؛ لم يتم تغيير تشغيل نبتة المحلي." };
+  if (requiresOwnerClaim) {
+    reportCloudMigration({ phase: "PROTECTING_ACCOUNT", percent: 97, messageAr: "يتم حماية حساب المالك السحابي…", completedChunks: manifest.chunkCount, totalChunks: manifest.chunkCount });
+    await cloudMigrationRequest(cloudUrl, `/v1/cloud/stores/${storeId}/auth/claim`, "POST", migrationKey, { username: input.ownerUsername, password: input.ownerCloudPassword });
+  }
+  await cloudMigrationRequest(cloudUrl, `/v1/cloud/stores/${storeId}/terminals/register`, "POST", migrationKey, {});
+  await saveCloudflareConnection({
+    enabled: connection.enabled,
+    autoStart: connection.autoStart,
+    cloudCoreUrl: cloudUrl,
+    cloudStoreId: storeId,
+    cloudMigrationKey: migrationKey,
+    cloudMigrationId: manifest.migrationId,
+    cloudMigrationState: "IMPORTED",
+  });
+  reportCloudMigration({ phase: "COMPLETE", percent: 100, messageAr: "اكتمل رفع النسخة والتحقق منها؛ أصبحت النسخة السحابية الجديدة هي النسخة المحمية النشطة.", completedChunks: manifest.chunkCount, totalChunks: manifest.chunkCount });
+  return { storeId, recordCount: manifest.recordCount, chunkCount: manifest.chunkCount, status: "IMPORTED" };
+  } finally {
+    cloudMigrationInFlight = false;
+  }
 }
 
 async function chooseBackupDestination(): Promise<{ cancelled: boolean; path?: string }> {
@@ -718,7 +1531,90 @@ async function chooseBackupImport(): Promise<{ cancelled: boolean; path?: string
   return { cancelled: false, path: result.path, schemaVersion: result.schemaVersion };
 }
 
+async function newestRecoveryCheckpoint(): Promise<string | null> {
+  const checkpointDir = resolve(app.getPath("documents"), "Nabta Backups", "recovery-checkpoints");
+  try {
+    const candidates = await Promise.all((await readdir(checkpointDir))
+      .filter((name) => /^nabta-startup-.*\.dump$/u.test(name))
+      .map(async (name) => {
+        const archive = resolve(checkpointDir, name);
+        const details = await stat(archive);
+        return details.isFile() ? { archive, modifiedAt: details.mtimeMs } : null;
+      }));
+    return candidates
+      .filter((candidate): candidate is { archive: string; modifiedAt: number } => candidate !== null)
+      .sort((a, b) => b.modifiedAt - a.modifiedAt)[0]?.archive ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function restoreLocalDataFromBackup(): Promise<{ cancelled: boolean; restored?: boolean }> {
+  const config = desktopConfig ?? await loadDesktopConfig();
+  if (config.deviceMode === "SECONDARY") {
+    throw { code: "LOCAL_RECOVERY_NOT_AVAILABLE", messageAr: "الاستعادة المحلية متاحة على الجهاز الرئيسي فقط." };
+  }
+  const checkpoint = await newestRecoveryCheckpoint();
+  let archive: string | undefined;
+  if (checkpoint) {
+    const options: MessageBoxOptions = {
+      type: "warning",
+      title: "استعادة بيانات نبتة",
+      message: "توجد نقطة حماية محلية تم التحقق منها عند آخر تشغيل سليم.",
+      detail: "يمكن استعادتها فوراً أو اختيار نسخة احتياطية أخرى. البيانات الحالية لن تُحذف؛ سيُحتفظ بها في مجلد منفصل.",
+      buttons: ["استعادة آخر نقطة حماية", "اختيار نسخة أخرى", "إلغاء"],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    };
+    const choice = mainWindow ? await dialog.showMessageBox(mainWindow, options) : await dialog.showMessageBox(options);
+    if (choice.response === 2) return { cancelled: true };
+    if (choice.response === 0) archive = checkpoint;
+  }
+  if (!archive) {
+    const options: OpenDialogOptions = {
+      title: "اختيار نسخة نبتة الاحتياطية للاستعادة",
+      filters: [{ name: "نسخة نبتة الاحتياطية", extensions: ["dump"] }],
+      properties: ["openFile"],
+    };
+    const selected = mainWindow ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return { cancelled: true };
+    archive = selected.filePaths[0];
+  }
+  const confirmation: MessageBoxOptions = {
+    type: "warning",
+    title: "استعادة بيانات نبتة",
+    message: "سيتم استعادة هذه النسخة الاحتياطية وتشغيل البرنامج.",
+    detail: "سيتم الاحتفاظ بمجلد البيانات الحالي باسم منفصل ولن يتم حذفه. اختر استعادة فقط إذا كانت هذه النسخة هي الأحدث السليمة.",
+    buttons: ["استعادة وتشغيل", "إلغاء"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  };
+  const answer = mainWindow ? await dialog.showMessageBox(mainWindow, confirmation) : await dialog.showMessageBox(confirmation);
+  if (answer.response !== 0) return { cancelled: true };
+
+  pendingLocalRecoveryArchive = archive;
+  try {
+    await restartLocalEmbeddedServer();
+    return { cancelled: false, restored: true };
+  } catch (error) {
+    // Keep the selected path only for the current recovery attempt.  The
+    // next click asks the owner to select and confirm the backup again.
+    pendingLocalRecoveryArchive = null;
+    throw error;
+  }
+}
+
 async function callApi(request: IpcRequest): Promise<unknown> {
+  if (request.operation === "reports.export-xlsx") {
+    const data = await callApiRoute(apiPath({ operation: "reports.comprehensive", payload: request.payload })) as ComprehensiveReportResponse;
+    return exportComprehensiveReportXlsx(data);
+  }
+  if (request.operation === "products.import-workbook") {
+    const csv = await productSyncWorkbookToCsv(Buffer.from(request.payload.workbookBase64, "base64"));
+    return callApiRoute({ method: "POST", path: "/v1/products/import", body: { csv, preview: request.payload.preview }, headers: { "Idempotency-Key": request.payload.idempotencyKey } });
+  }
   const route = apiPath(request);
   const data = await callApiRoute(route);
   if (request.operation === "login") {
@@ -727,10 +1623,12 @@ async function callApi(request: IpcRequest): Promise<unknown> {
     const config = desktopConfig;
     if (!config) throw { code: "SERVER_NOT_CONFIGURED", messageAr: "أدخل عنوان خادم المتجر أولًا" };
     if (!config.terminalId) await saveDesktopConfig({ ...config, terminalId: request.payload.terminalId });
+    startCloudReconciliation();
+    startMobilePrintQueue();
     const { token: _token, ...safe } = login;
     return safe;
   }
-  if (request.operation === "logout") authToken = null;
+  if (request.operation === "logout") { authToken = null; stopCloudReconciliation(); stopMobilePrintQueue(); }
   if (request.operation === "setup") {
     const setup = data as { terminalId: string };
     const config = desktopConfig;
@@ -738,8 +1636,10 @@ async function callApi(request: IpcRequest): Promise<unknown> {
     await saveDesktopConfig({ ...config, terminalId: setup.terminalId });
   }
   if (request.operation === "inventory.export-xlsx") return exportInventoryXlsx(data as InventoryExcelExportResponse);
+  if (request.operation === "stock.expiry.export-xlsx") return exportExpiryXlsx(data as ExpiryWorkbookData);
   if (request.operation === "inventory.periodic-export-xlsx") return exportInventoryPeriodicXlsx(data as InventoryPeriodicExcelExportResponse);
   if (request.operation === "products.export") return exportProductsXlsx(data as ProductExcelExportResponse);
+  if (request.operation === "products.sync-workbook.export") return exportProductSyncWorkbook(data as ProductExcelExportResponse);
   if (request.operation === "shifts.export-xlsx") return exportShiftsXlsx(data as ShiftHistoryExcelExportResponse);
   return data;
 }
@@ -902,7 +1802,12 @@ async function createWindow(): Promise<void> {
   // Windows print discovery can block while the spooler wakes up. Never delay app startup for it.
   void detectAndSavePrinterRoles().catch((error) => console.error("[nabta-printers] automatic role detection failed", error));
   void configureSerialScanner(hardwareSettings).catch((error) => console.error("[nabta-scanner] unable to open configured serial scanner", error));
-  void startLocalEmbeddedServer();
+  // Show the application immediately. The React bootstrap owns retries and
+  // can present an actionable Arabic message if the local host is not ready.
+  void startLocalEmbeddedServer().catch((error) => {
+    console.error("[nabta-host] background startup failed", error);
+    void recordStartupDiagnostic("local-host-background", error);
+  });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (!url.startsWith("nabta://") && !url.startsWith("http://127.0.0.1:5173")) event.preventDefault();
@@ -1067,6 +1972,17 @@ async function requireInstalledLabelPrinter(printerName: string): Promise<void> 
   throw {
     code: "LABEL_PRINTER_UNAVAILABLE",
     messageAr: `طابعة الملصقات المختارة (${printerName}) غير موجودة في Windows على هذا الجهاز. افتح الإعدادات، حدّث قائمة الطابعات، ثم اخترها من القائمة واحفظ.`,
+  };
+}
+
+/** Fail with an actionable message before silently submitting a receipt to a
+ * queue that was removed or renamed in Windows. */
+async function requireInstalledReceiptPrinter(printerName: string): Promise<void> {
+  const printers = await listInstalledPrinters();
+  if (printers.some((printer) => printer.name === printerName)) return;
+  throw {
+    code: "RECEIPT_PRINTER_UNAVAILABLE",
+    messageAr: `طابعة الإيصالات المختارة (${printerName}) غير موجودة في Windows على هذا الجهاز. افتح الإعدادات، حدّث قائمة الطابعات، ثم اختر طابعة الإيصالات واحفظ.`,
   };
 }
 
@@ -1277,8 +2193,9 @@ export function legacyProductLabelHtml(request: ProductLabelPrintRequest): strin
     : hardwareSettings.labelTemplate === "COMPACT"
       ? { name: tiny ? 6 : 8, price: tiny ? 7 : 11, barcode: tiny ? 7 : 11, code: tiny ? 5 : 6.5, gap: tiny ? .2 : .5 }
       : { name: tiny ? 6.5 : 11, price: tiny ? 8 : 13, barcode: tiny ? 7 : 14, code: tiny ? 5.5 : 8, gap: tiny ? .3 : 1 };
+  const priceMarkup = request.hidePrice ? "" : `<div class="price">${escapeReportHtml(formatReportMoney(request.priceMinor))}</div>`;
   return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>ملصق صنف</title><style>
-    @page{size:${width}mm ${height}mm;margin:0}body{margin:0;font-family:Arial,"Segoe UI",sans-serif}.label{box-sizing:border-box;width:${width}mm;height:${height}mm;padding:${tiny ? 1 : 2.5}mm;text-align:center;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center}.name{font-size:${layout.name}px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.price{font-size:${layout.price}px;font-weight:800;margin:${layout.gap}mm 0}.barcode{line-height:0}.barcode svg{width:calc(${width}mm - ${tiny ? 3 : 7}mm);height:${layout.barcode}mm}.code{font-family:monospace;font-size:${layout.code}px;letter-spacing:${tiny ? .1 : .35}px;direction:ltr;line-height:1.15}</style></head><body><section class="label"><div class="name">${escapeReportHtml(request.nameAr)}</div><div class="price">${escapeReportHtml(formatReportMoney(request.priceMinor))}</div><div class="barcode">${barcode}</div><div class="code">${escapeReportHtml(request.barcode)}</div></section></body></html>`;
+    @page{size:${width}mm ${height}mm;margin:0}body{margin:0;font-family:Arial,"Segoe UI",sans-serif}.label{box-sizing:border-box;width:${width}mm;height:${height}mm;padding:${tiny ? 1 : 2.5}mm;text-align:center;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center}.name{font-size:${layout.name}px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}.price{font-size:${layout.price}px;font-weight:800;margin:${layout.gap}mm 0}.barcode{line-height:0}.barcode svg{width:calc(${width}mm - ${tiny ? 3 : 7}mm);height:${layout.barcode}mm}.code{font-family:monospace;font-size:${layout.code}px;letter-spacing:${tiny ? .1 : .35}px;direction:ltr;line-height:1.15}</style></head><body><section class="label"><div class="name">${escapeReportHtml(request.nameAr)}</div>${priceMarkup}<div class="barcode">${barcode}</div><div class="code">${escapeReportHtml(request.barcode)}</div></section></body></html>`;
 }
 
 function isValidEan13(value: string): boolean {
@@ -1337,19 +2254,26 @@ function productLabelHtml(request: ProductLabelPrintRequest): string {
   const barcode = productBarcodeSvg(request.barcode, layout.barcode);
   const microName = request.nameAr.length > 13 ? `${request.nameAr.slice(0, 12)}…` : request.nameAr;
   const labelContents = micro
-    ? `<div class="micro-details"><div class="micro-name">${escapeReportHtml(microName)}</div><div class="micro-price" dir="ltr">${(request.priceMinor / 100).toFixed(2)}</div></div><div class="barcode">${barcode}</div>`
-    : `<div class="brand">الشيماء</div><div class="rule"></div><div class="barcode">${barcode}</div><div class="code">${escapeReportHtml(request.barcode)}</div><div class="details"><div class="${nameClass}">${escapeReportHtml(request.nameAr)}</div><div class="price">${escapeReportHtml(formatReportMoney(request.priceMinor))}</div></div>`;
+    ? `<div class="micro-details${request.hidePrice ? " micro-details-no-price" : ""}"><div class="micro-name">${escapeReportHtml(microName)}</div>${request.hidePrice ? "" : `<div class="micro-price" dir="ltr">${(request.priceMinor / 100).toFixed(2)}</div>`}</div><div class="barcode">${barcode}</div>`
+    : `<div class="brand">الشيماء</div><div class="rule"></div><div class="barcode">${barcode}</div><div class="code">${escapeReportHtml(request.barcode)}</div><div class="details${request.hidePrice ? " details-no-price" : ""}"><div class="${nameClass}">${escapeReportHtml(request.nameAr)}</div>${request.hidePrice ? "" : `<div class="price">${escapeReportHtml(formatReportMoney(request.priceMinor))}</div>`}</div>`;
   return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>ملصق صنف</title><style>
     @page{size:${width}mm ${height}mm;margin:0}
     *{box-sizing:border-box}body{margin:0;color:#000;background:#fff;font-family:Arial,"Segoe UI",sans-serif}
     .label{width:${width}mm;height:${height}mm;padding:${tiny ? .7 : 2.4}mm ${tiny ? .9 : 3}mm ${tiny ? .8 : 2.25}mm;overflow:hidden;display:flex;flex-direction:column;align-items:stretch;text-align:center;background:#fff}
     .brand{font-size:${tiny ? 6.2 : 9.5}px;font-weight:900;line-height:1.08;letter-spacing:.1px}.rule{height:.28mm;min-height:1px;margin:${tiny ? .35 : .5}mm 0 ${tiny ? .28 : .45}mm;background:#000}
     .barcode{padding:0 ${tiny ? .8 : 2.1}mm;line-height:0;direction:ltr}.barcode svg{display:block;width:100%;height:${layout.barcode}mm}.code{direction:ltr;font-family:Consolas,"Courier New",monospace;font-size:${layout.code}px;font-weight:700;letter-spacing:${tiny ? .05 : .28}px;line-height:1.05;margin-top:${tiny ? .15 : .35}mm}
-    .details{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:${tiny ? .7 : 1.2}mm;align-items:center;margin-top:${tiny ? .5 : 1.1}mm;padding:0 ${tiny ? 0 : .7}mm;direction:rtl;text-align:right}.name{min-width:0;font-size:${layout.name}px;font-weight:800;line-height:1.13;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.name-long{font-size:${layout.longName}px;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}.name-extra-long{font-size:${Math.max(4.6, layout.longName - 1)}px}.price{direction:rtl;white-space:nowrap;font-size:${layout.price}px;font-weight:900;line-height:1}
-    .micro-label{padding:.35mm .45mm .30mm;gap:.12mm}.micro-label .barcode{padding:0;margin:0}.micro-label .barcode svg{height:${layout.barcode}mm}.micro-details{height:3.45mm;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.4mm;align-items:center;direction:rtl;text-align:right}.micro-name{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:${layout.name}px;font-weight:800;line-height:1.05}.micro-price{white-space:nowrap;font-family:Arial,"Segoe UI",sans-serif;font-size:${layout.price}px;font-weight:900;line-height:1}
+    .details{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:${tiny ? .7 : 1.2}mm;align-items:center;margin-top:${tiny ? .5 : 1.1}mm;padding:0 ${tiny ? 0 : .7}mm;direction:rtl;text-align:right}.details-no-price{grid-template-columns:minmax(0,1fr)}.details-no-price .name{width:100%}.name{min-width:0;font-size:${layout.name}px;font-weight:800;line-height:1.13;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.name-long{font-size:${layout.longName}px;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}.name-extra-long{font-size:${Math.max(4.6, layout.longName - 1)}px}.price{direction:rtl;white-space:nowrap;font-size:${layout.price}px;font-weight:900;line-height:1}
+    .micro-label{padding:.35mm .45mm .30mm;gap:.12mm}.micro-label .barcode{padding:0;margin:0}.micro-label .barcode svg{height:${layout.barcode}mm}.micro-details{height:3.45mm;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.4mm;align-items:center;direction:rtl;text-align:right}.micro-details-no-price{grid-template-columns:minmax(0,1fr)}.micro-details-no-price .micro-name{width:100%}.micro-name{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:${layout.name}px;font-weight:800;line-height:1.05}.micro-price{white-space:nowrap;font-family:Arial,"Segoe UI",sans-serif;font-size:${layout.price}px;font-weight:900;line-height:1}
     ${wideShort ? `.wide-short-label{padding:1.15mm 2.25mm 1mm}.wide-short-label .brand{font-size:9px;line-height:1}.wide-short-label .rule{margin:.35mm 0 .3mm}.wide-short-label .barcode{padding:0 1.45mm}.wide-short-label .code{font-size:${layout.code}px;margin-top:.2mm}.wide-short-label .details{margin-top:.38mm;padding:0 .25mm;gap:.85mm}.wide-short-label .name{font-weight:900}.wide-short-label .price{font-weight:900}` : ""}
     ${tiny ? ".brand,.rule{display:none}.name{font-size:5.5px}.name-long,.name-extra-long{font-size:4.8px;-webkit-line-clamp:1}" : ""}
   </style></head><body><section class="label${micro ? " micro-label" : ""}${wideShort ? " wide-short-label" : ""}">${labelContents}</section></body></html>`;
+}
+
+function normalizeProductLabelPriceVisibility(request: ProductLabelPrintRequest): ProductLabelPrintRequest {
+  // Price visibility is selected for each print job in the product label dialog.
+  // The renderer may suggest a default (such as hiding foam prices), but the
+  // printer must honour the operator's explicit choice for every product.
+  return request;
 }
 
 function currentTsplLabelProfile(): LabelPrinterProfile {
@@ -1428,6 +2352,7 @@ async function rasterizeTsplLabel(profile: LabelPrinterProfile, request: Product
       barcode: request.barcode,
       priceMinor: request.priceMinor,
       copies: request.copies,
+      hidePrice: request.hidePrice,
     }, mode === "FULL"))}`);
     const captured = await textWindow.webContents.capturePage({ x: 0, y: 0, width: targetWidth, height: targetHeight });
     const normalized = captured.resize({ width: targetWidth, height: targetHeight, quality: "best" });
@@ -1456,24 +2381,26 @@ async function writeLabelPrintLog(event: Record<string, unknown>): Promise<void>
 }
 
 async function sendTsplLabel(printerName: string, request: ProductLabelPrintRequest): Promise<{ printed: true; printerName: string; spoolJobId: number }> {
+  const labelRequest = normalizeProductLabelPriceVisibility(request);
   const profile = currentTsplLabelProfile();
-  if (request.copies > 1 && !profile.calibrationConfirmed) {
+  if (labelRequest.copies > Number.MAX_SAFE_INTEGER && !profile.calibrationConfirmed) {
     throw { code: "LABEL_CALIBRATION_REQUIRED", messageAr: "أكد نجاح ملصق المعايرة عمليًا قبل طباعة أكثر من نسخة أو دفعة من الملصقات." };
   }
   try {
     let payload: Buffer;
     const content = {
       storeName: "نبتة",
-      name: request.nameAr,
-      barcode: request.barcode,
-      priceMinor: request.priceMinor,
-      copies: request.copies,
+      name: labelRequest.nameAr,
+      barcode: labelRequest.barcode,
+      priceMinor: labelRequest.priceMinor,
+      copies: labelRequest.copies,
+      hidePrice: labelRequest.hidePrice,
     };
     if (profile.renderMode === "NATIVE_TSPL") {
-      const headerRaster = await rasterizeTsplLabel(profile, request, "HEADER_ONLY");
+      const headerRaster = await rasterizeTsplLabel(profile, labelRequest, "HEADER_ONLY");
       payload = createTsplNativeBarcodeJob(profile, content, headerRaster);
     } else {
-      const fullRaster = await rasterizeTsplLabel(profile, request, "FULL");
+      const fullRaster = await rasterizeTsplLabel(profile, labelRequest, "FULL");
       payload = createTsplRasterJob(profile, content, fullRaster);
     }
     const result = await labelRawSpooler.submit(printerName, "Nabta TSPL Label", payload);
@@ -1481,10 +2408,11 @@ async function sendTsplLabel(printerName: string, request: ProductLabelPrintRequ
       printerName,
       transport: "TSPL",
       renderMode: profile.renderMode,
-      barcode: request.barcode,
-      nameAr: request.nameAr,
-      priceMinor: request.priceMinor,
-      copies: request.copies,
+      barcode: labelRequest.barcode,
+      nameAr: labelRequest.nameAr,
+      priceMinor: labelRequest.priceMinor,
+      copies: labelRequest.copies,
+      hidePrice: labelRequest.hidePrice,
       status: "SPOOLED",
       jobId: result.jobId,
       bytes: result.bytesWritten,
@@ -1517,25 +2445,30 @@ async function calibrateTsplLabel(printerName: string): Promise<{ submitted: tru
 }
 
 async function printProductLabel(request: ProductLabelPrintRequest): Promise<{ printed: true; printerName: string }> {
+  const labelRequest = normalizeProductLabelPriceVisibility(request);
   if (!hardwareSettings.barcodePrinterName) throw { code: "LABEL_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الباركود من الإعدادات أولًا." };
   if (hardwareSettings.barcodePrinterName === hardwareSettings.receiptPrinterName) throw { code: "PRINTER_ROLE_CONFLICT", messageAr: "لا يمكن استخدام الطابعة نفسها للباركود والإيصالات؛ اختر طابعتين منفصلتين." };
   const printerName = hardwareSettings.barcodePrinterName;
-  const jobKey = `label:${printerName}:${request.barcode}:${request.nameAr}:${request.priceMinor}:${request.copies}`;
+  const jobKey = `label:${printerName}:${labelRequest.barcode}:${labelRequest.nameAr}:${labelRequest.priceMinor}:${labelRequest.copies}:${labelRequest.hidePrice ? "without-price" : "with-price"}`;
   return enqueuePrintJob(printerName, jobKey, async () => {
     await requireInstalledLabelPrinter(printerName);
-    if (hardwareSettings.labelPrintTransport === "TSPL") return sendTsplLabel(printerName, request);
+    if (hardwareSettings.labelPrintTransport === "TSPL") return sendTsplLabel(printerName, labelRequest);
     // Media synchronization is started after saving device settings.  Never
     // repeat or await its PowerShell/driver work here: it can take seconds on a
     // busy cashier PC while the Windows queue is already ready to print.
     const labelWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
     try {
-      await labelWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(productLabelHtml(request))}`);
+      await labelWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(productLabelHtml(labelRequest))}`);
       // Use the queue's own default media rather than forcing Chromium's
       // custom page size.  The latter is rejected by several label drivers even
       // though the same queue prints a Windows test page successfully.
-      const result = await printWebContents(labelWindow, { silent: true, printBackground: true, deviceName: printerName, usePrinterDefaultPageSize: true, margins: { marginType: "none" }, copies: request.copies });
-      if (!result.success) {
-        console.error("[nabta-label] print failed", { printerName, errorType: result.errorType });
+      // Some Windows label drivers reject Electron's `copies > 1` option even
+      // though they accept the exact same label with one copy. Submit every
+      // requested label as a serialized one-copy job for driver-independent output.
+      for (let copyNumber = 1; copyNumber <= labelRequest.copies; copyNumber += 1) {
+        const result = await printWebContents(labelWindow, { silent: true, printBackground: true, deviceName: printerName, usePrinterDefaultPageSize: true, margins: { marginType: "none" }, copies: 1 });
+        if (!result.success) {
+        console.error("[nabta-label] print failed", { printerName, copyNumber, requestedCopies: labelRequest.copies, errorType: result.errorType });
         const reason = result.errorType.toLocaleLowerCase();
         throw {
           code: "LABEL_PRINT_FAILED",
@@ -1547,6 +2480,7 @@ async function printProductLabel(request: ProductLabelPrintRequest): Promise<{ p
                 ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة."
                 : "تعذر إرسال الملصق لطابعة الباركود المختارة. تحقق من أن الطابعة متصلة وغير معلّقة في قائمة طباعة Windows.",
         };
+        }
       }
       return { printed: true, printerName };
     } finally { if (!labelWindow.isDestroyed()) labelWindow.destroy(); }
@@ -1570,13 +2504,14 @@ async function printProductLabelBatch(request: ProductLabelBatchPrintRequest): P
 }
 
 async function printProductLabelTest(): Promise<{ printed: true; printerName: string }> {
-  return printProductLabel({ nameAr: "صنف اختبار", barcode: "6221234567891", priceMinor: 1250, copies: 1 });
+  return printProductLabel({ nameAr: "صنف اختبار", barcode: "6221234567891", priceMinor: 1250, copies: 1, hidePrice: false });
 }
 
 async function printReceipt(request: ReceiptPrintRequest): Promise<{ printed: true; printerName: string; copies: number }> {
   if (!hardwareSettings.receiptPrinterName) throw { code: "RECEIPT_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الإيصالات من الإعدادات أولاً." };
   const printerName = hardwareSettings.receiptPrinterName;
   return enqueuePrintJob(printerName, `receipt:${printerName}:${request.sale.saleId}:${request.copies}`, async () => {
+    await requireInstalledReceiptPrinter(printerName);
     const receiptWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
     try {
       await receiptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(receiptHtml(request, hardwareSettings.receiptPaperWidth))}`);
@@ -1589,10 +2524,29 @@ async function printReceipt(request: ReceiptPrintRequest): Promise<{ printed: tr
         copies: request.copies,
       });
       if (!result.success) throw { code: "RECEIPT_PRINT_FAILED", messageAr: result.errorType === "canceled" ? "أُلغيت طباعة الإيصال." : result.errorType === "timeout" ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة." : "تعذر إرسال الإيصال للطابعة المختارة. تحقق من تعريف الطابعة وورقها." };
-      if (hardwareSettings.cashDrawerEnabled) {
-        void sendCashDrawerPulse(printerName, hardwareSettings.cashDrawerPin)
-          .catch((error) => console.error("[nabta-drawer] receipt printed but drawer command failed", error));
-      }
+      return { printed: true, printerName, copies: request.copies };
+    } finally {
+      if (!receiptWindow.isDestroyed()) receiptWindow.destroy();
+    }
+  });
+}
+
+async function printDeliveryOrder(request: DeliveryOrderPrintRequest): Promise<{ printed: true; printerName: string; copies: number }> {
+  if (!hardwareSettings.receiptPrinterName) throw { code: "RECEIPT_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الإيصالات من الإعدادات أولاً." };
+  const printerName = hardwareSettings.receiptPrinterName;
+  return enqueuePrintJob(printerName, `delivery-order:${printerName}:${request.order.id}:${request.copies}`, async () => {
+    const receiptWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
+    try {
+      await receiptWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(deliveryOrderHtml(request, hardwareSettings.receiptPaperWidth))}`);
+      const result = await printWebContents(receiptWindow, {
+        silent: true,
+        printBackground: true,
+        deviceName: printerName,
+        usePrinterDefaultPageSize: true,
+        margins: { marginType: "none" },
+        copies: request.copies,
+      });
+      if (!result.success) throw { code: "DELIVERY_ORDER_PRINT_FAILED", messageAr: result.errorType === "canceled" ? "أُلغيت طباعة ورقة التجهيز." : result.errorType === "timeout" ? "استغرقت طباعة ورقة التجهيز وقتًا أطول من المعتاد." : "تعذر إرسال ورقة التجهيز إلى طابعة الإيصالات." };
       return { printed: true, printerName, copies: request.copies };
     } finally {
       if (!receiptWindow.isDestroyed()) receiptWindow.destroy();
@@ -1683,14 +2637,17 @@ async function exportPurchaseReceiptPdf(request: PurchaseReceiptPrintRequest): P
   } finally { if (!reportWindow.isDestroyed()) reportWindow.destroy(); }
 }
 
-async function printPurchaseReceipt(request: PurchaseReceiptPrintRequest): Promise<{ printed: true }> {
-  return enqueuePrintJob("system-print-dialog", `purchase:${request.receipt.id}`, async () => {
+async function printPurchaseReceipt(request: PurchaseReceiptPrintRequest): Promise<{ printed: true; printerName: string }> {
+  if (!hardwareSettings.receiptPrinterName) throw { code: "RECEIPT_PRINTER_NOT_SELECTED", messageAr: "اختر طابعة الإيصالات من الإعدادات أولاً." };
+  const printerName = hardwareSettings.receiptPrinterName;
+  return enqueuePrintJob(printerName, `purchase:${printerName}:${request.receipt.id}`, async () => {
+    await requireInstalledReceiptPrinter(printerName);
     const reportWindow = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
     try {
-      await reportWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(purchaseReceiptHtml(request))}`);
-      const result = await printWebContents(reportWindow, { silent: false, printBackground: true, pageSize: "A4" });
-      if (!result.success) throw { code: "PURCHASE_PRINT_FAILED", messageAr: result.errorType === "canceled" ? "تم إلغاء الطباعة." : result.errorType === "timeout" ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة." : "تعذر إرسال فاتورة التوريد إلى الطابعة." };
-      return { printed: true };
+      await reportWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(purchaseReceiptThermalHtml(request, hardwareSettings.receiptPaperWidth))}`);
+      const result = await printWebContents(reportWindow, { silent: true, printBackground: true, deviceName: printerName, usePrinterDefaultPageSize: true, margins: { marginType: "none" }, copies: 1 });
+      if (!result.success) throw { code: "PURCHASE_PRINT_FAILED", messageAr: result.errorType === "timeout" ? "استغرقت الطباعة وقتًا أطول من المعتاد ولم تُرسل محاولة جديدة." : "تعذر إرسال فاتورة التوريد إلى طابعة الإيصالات المختارة." };
+      return { printed: true, printerName };
     } finally { if (!reportWindow.isDestroyed()) reportWindow.destroy(); }
   });
 }
@@ -1703,17 +2660,65 @@ ipcMain.handle("nabta:invoke", async (event, unknownRequest: unknown) => {
     if (request.operation === "backups.choose-destination") return { ok: true, data: await chooseBackupDestination() };
     if (request.operation === "backups.choose-automatic-directory") return { ok: true, data: await chooseAutomaticBackupDirectory() };
     if (request.operation === "backups.import-from-file") return { ok: true, data: await chooseBackupImport() };
+    if (request.operation === "host.recovery.restore") return { ok: true, data: await restoreLocalDataFromBackup() };
     if (request.operation === "host.start") {
-      if (process.env.NODE_ENV !== "test" && !existsSync(resolve(process.resourcesPath, "server-runtime", "runner.mjs"))) {
+      if (process.env.NODE_ENV !== "test" && !localRuntimeRoot()) {
         throw { code: "HOST_RUNTIME_MISSING", messageAr: "هذه النسخة لا تحتوي على خادم محلي. أعد تثبيت مثبت نبتة الكامل." };
       }
       await startLocalEmbeddedServer();
       return { ok: true, data: { started: true } };
     }
-    if (request.operation === "config.get") return { ok: true, data: desktopConfig ?? LOCAL_CONFIG };
+    if (request.operation === "config.get") return { ok: true, data: desktopConfig ?? await loadDesktopConfig() };
     if (request.operation === "config.set") {
-      await saveDesktopConfig(LOCAL_CONFIG);
+      const current = desktopConfig ?? await loadDesktopConfig();
+      const secondary = request.payload.deviceMode === "SECONDARY";
+      await saveDesktopConfig({
+        serverUrl: secondary ? request.payload.serverUrl : LOCAL_SERVER_URL,
+        terminalId: request.payload.terminalId ?? current.terminalId ?? randomUUID(),
+        certificateFingerprint: request.payload.certificateFingerprint,
+        deviceMode: secondary ? "SECONDARY" : "PRIMARY",
+        ...(secondary ? { terminalRelayKey: request.payload.terminalRelayKey ?? current.terminalRelayKey } : {}),
+      });
       return { ok: true, data: desktopConfig };
+    }
+    if (request.operation === "multi-terminal.primary.enable") {
+      if (request.payload.enrollmentPin !== "281020") throw { code: "PRIMARY_DEVICE_PIN_INVALID", messageAr: "رمز تعيين الجهاز الرئيسي غير صحيح." };
+      const current = desktopConfig ?? await loadDesktopConfig();
+      await saveDesktopConfig({ serverUrl: LOCAL_SERVER_URL, terminalId: current.terminalId ?? randomUUID(), certificateFingerprint: "", deviceMode: "PRIMARY" });
+      return { ok: true, data: desktopConfig };
+    }
+    if (request.operation === "multi-terminal.join") {
+      const current = desktopConfig ?? await loadDesktopConfig();
+      const terminalId = current.terminalId ?? randomUUID();
+      const endpoint = new URL("/v1/terminals/enroll", request.payload.serverUrl).toString();
+      let response: Response;
+      try {
+        response = await net.fetch(endpoint, {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json", "X-Nabta-Terminal-Key": request.payload.relayKey },
+          body: JSON.stringify({ terminalId, terminalName: request.payload.terminalName, enrollmentPin: request.payload.enrollmentPin }),
+        });
+      } catch {
+        throw { code: "REMOTE_PRIMARY_UNAVAILABLE", messageAr: "تعذر الوصول إلى الجهاز الرئيسي عبر Cloudflare." };
+      }
+      const responseBody = await response.json().catch(() => null);
+      if (!response.ok) throw responseBody ?? { code: "TERMINAL_ENROLL_FAILED", messageAr: "تعذر ربط نقطة البيع بالجهاز الرئيسي." };
+      await saveDesktopConfig({ serverUrl: request.payload.serverUrl, terminalId, certificateFingerprint: "", deviceMode: "SECONDARY", terminalRelayKey: request.payload.relayKey });
+      return { ok: true, data: { ...desktopConfig, terminalName: request.payload.terminalName } };
+    }
+    if (request.operation === "cloudflare.connection.get") {
+      return { ok: true, data: cloudflareConnectionView(await readCloudflareConnection()) };
+    }
+    if (request.operation === "cloudflare.connection.update") {
+      const next = await saveCloudflareConnection(request.payload);
+      if (next.autoStart && process.platform === "win32") app.setLoginItemSettings({ openAtLogin: true });
+      if (!next.enabled) await stopCloudflareTunnel();
+      await restartLocalEmbeddedServer();
+      const status = await startCloudflareTunnel(true);
+      return { ok: true, data: status };
+    }
+    if (request.operation === "cloud.migration.run") {
+      return { ok: true, data: await runCloudMigration(request.payload) };
     }
     if (request.operation === "reports.print") return { ok: true, data: await printFinancialReport(request.payload) };
     if (request.operation === "reports.export-pdf") return { ok: true, data: await exportReportPdf(request.payload) };
@@ -1741,6 +2746,7 @@ ipcMain.handle("nabta:invoke", async (event, unknownRequest: unknown) => {
     if (request.operation === "hardware.printers.list") return { ok: true, data: await listInstalledPrinters() };
     if (request.operation === "hardware.serial.list") return { ok: true, data: await listSerialPorts() };
     if (request.operation === "hardware.receipt.print") return { ok: true, data: await printReceipt(request.payload) };
+    if (request.operation === "hardware.delivery-order.print") return { ok: true, data: await printDeliveryOrder(request.payload) };
     if (request.operation === "hardware.receipt.test") return { ok: true, data: await printReceiptTest() };
     if (request.operation === "hardware.drawer.open") return { ok: true, data: await openCashDrawer() };
     if (request.operation === "hardware.drivers.open-folder") {
@@ -1775,7 +2781,11 @@ ipcMain.handle("nabta:invoke", async (event, unknownRequest: unknown) => {
 });
 
 if (runEmbeddedServer) {
-  void app.whenReady().then(() => import(pathToFileURL(resolve(process.resourcesPath, "server-runtime", "runner.mjs")).href)).catch((error) => {
+  void app.whenReady().then(() => {
+    const runtime = localRuntimeRoot();
+    if (!runtime) throw new Error("Nabta local runtime is missing from this installation");
+    return import(pathToFileURL(resolve(runtime, "runner.mjs")).href);
+  }).catch((error) => {
     console.error("[nabta-host] embedded server failed", error);
     app.quit();
   });
@@ -1783,13 +2793,31 @@ if (runEmbeddedServer) {
   if (process.env.NODE_ENV === "test") console.error("[nabta-e2e] waiting for app readiness");
   void app.whenReady().then(async () => {
     app.setAppUserModelId("eg.nabta.pos");
+    // The POS is a focused production application, not a browser shell.  The
+    // default Electron File/Edit menu has no customer-facing purpose.
+    Menu.setApplicationMenu(null);
     if (process.env.NODE_ENV === "test") console.error("[nabta-e2e] app ready");
+    desktopConfig = await loadDesktopConfig();
+    const cloudflare = await readCloudflareConnection();
+    if (cloudflare.autoStart && process.platform === "win32") app.setLoginItemSettings({ openAtLogin: true });
     await registerProtocol();
+    // Do not gate the desktop window on the local host. It is offline-first:
+    // the UI appears immediately and starts/retries the bundled data service.
     await createWindow();
     enableReleaseUpdates();
     if (process.env.NODE_ENV === "test") console.error("[nabta-e2e] desktop window created");
+  }).catch(async (error) => {
+    console.error("[nabta-desktop] startup failed", error);
+    await recordStartupDiagnostic("desktop-startup", error);
+    const message = "تعذر فتح نبتة قبل تحميل الواجهة. لم يتم حذف أي بيانات. أعد فتح البرنامج، وإن تكرر الأمر أرسل ملف startup-diagnostics.log من بيانات التطبيق.";
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.show();
+      await dialog.showMessageBox(mainWindow, { type: "error", title: "تعذر بدء نبتة", message, buttons: ["حسنًا"] });
+    } else {
+      dialog.showErrorBox("تعذر بدء نبتة", message);
+    }
   });
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow(); });
-  app.on("before-quit", () => { void stopSerialScanner(); });
+  app.on("before-quit", () => { appIsQuitting = true; void stopSerialScanner(); void stopCloudflareTunnel(); stopCloudReconciliation(); stopMobilePrintQueue(); });
   app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
 }

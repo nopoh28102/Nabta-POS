@@ -29,6 +29,10 @@ API lives on the trusted store server. Shared TypeScript contracts + runtime val
 | POST /v1/backups | Run backup; accepts a chosen destination only from local desktop loopback | Admin only, audited and integrity checked |
 | POST /v1/backups/import | Import and isolated-verify an owner-selected PGlite archive | Local desktop loopback only; never overwrites live data |
 | GET /v1/health | Connection state | No secrets; separate authenticated diagnostics |
+| GET /v1/commerce/catalog | Customer app catalogue | Cloudflare Worker key required; returns public prices, live availability, and barcodes only to the trusted Worker; the Worker adds any Cloudinary image outside Nabta and never forwards barcodes to the browser |
+| POST /v1/commerce/orders | Register a web delivery request | Worker key, idempotent `clientOrderId`, server recalculates prices and adds the current EGP 20 delivery fee; does not post a sale or deduct stock |
+| POST /v1/commerce/messenger/orders | Register a Messenger delivery request | Same server-to-Worker key and contract as the web request, but records source `MESSENGER`; this path is not exposed by the public storefront Worker |
+| GET/PUT /v1/commerce/admin/orders | Staff review of delivery requests | Authenticated `SALE_POST` permission; confirmation prints a preparation slip locally and is distinct from final POS sale. Direct `FULFILLED` is rejected so an online request can never deduct stock without a real invoice |
 
 Example `POST /v1/sales`:
 

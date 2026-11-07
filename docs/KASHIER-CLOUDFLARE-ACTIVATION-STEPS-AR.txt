@@ -1,0 +1,157 @@
+دليل تفعيل Kashier وربطه ببرنامج Nabta POS
+============================================
+
+الحالة الحالية
+-------------
+- تم إنشاء Cloudflare Worker وقاعدة D1 بالفعل.
+- Worker: nabta-kashier-webhook-relay
+- D1: nabta-kashier-events
+- رابط Webhook للاختبار TEST:
+  https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev/kashier/TEST
+- رابط Webhook للوضع الفعلي LIVE:
+  https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev/kashier/LIVE
+- رابط Cloudflare Event Relay (نفسه لـ TEST وLIVE):
+  https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev
+- لا توجد مفاتيح Kashier محفوظة في المشروع أو في Cloudflare حالياً.
+
+مهم جداً قبل البدء
+-----------------
+1) ابدأ دائماً ببيئة TEST. لا تُدخل أو تستخدم مفاتيح LIVE قبل نجاح اختبار كامل.
+2) لا ترسل المفاتيح في واتساب أو بريد أو GitHub، ولا تحفظها في ملف داخل المشروع.
+3) لا تدخل بيانات بطاقة العميل في Nabta. العميل يدفع على ماكينة Kashier أو صفحة Kashier المستضافة فقط.
+4) يجب أن يفعّل Kashier بنفسه الوسائل التي تريدها في عقدك: POS، بطاقات، محافظ، تقسيط، InstaPay، Payment Link... إلخ.
+
+الخطوة 1: تجهيز بيانات Kashier
+------------------------------
+من لوحة التاجر لدى Kashier اجمع بيانات TEST التالية:
+
+- Merchant ID
+- Secret Key
+- API Key
+- Payment API Key
+- الرقم التسلسلي Serial Number لكل ماكينة POS
+
+واطلب من دعم Kashier تأكيد ما تم تفعيله فعلاً لحسابك:
+
+- Kashier POS
+- Hosted Card Payments
+- Mobile Wallets
+- Bank Installments
+- Meeza / BNPL، إن كانت ضمن عقدك
+- InstaPay QR أو Request-to-Pay، إن كانت ضمن عقدك
+- Payment Link، إن كانت ضمن عقدك
+
+كرر نفس القائمة لاحقاً لمفاتيح LIVE، لكن لا تستخدمها الآن.
+
+الخطوة 2: ضبط أسرار Cloudflare مرة واحدة
+-----------------------------------------
+ادخل إلى Cloudflare Dashboard ثم:
+
+Workers & Pages -> nabta-kashier-webhook-relay -> Settings -> Variables and Secrets
+
+أضف الأسرار التالية كـ Secret وليس Text variable:
+
+1) KASHIER_TEST_PAYMENT_API_KEY
+   القيمة: Payment API Key الخاص ببيئة TEST من Kashier.
+
+2) KASHIER_LIVE_PAYMENT_API_KEY
+   القيمة: Payment API Key الخاص ببيئة LIVE.
+   يمكن تركه لوقت تفعيل LIVE، لكنه يجب أن يكون موجوداً قبل استخدام رابط LIVE.
+
+3) RELAY_BEARER_TOKEN
+   القيمة: رمز عشوائي قوي بطول 32 حرفاً أو أكثر.
+   مثال توليد محلي في PowerShell:
+   [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Maximum 256 }))
+
+احتفظ بقيمة RELAY_BEARER_TOKEN في مدير كلمات مرور. ستدخل نفس القيمة لاحقاً داخل Nabta.
+
+بعد الحفظ اضغط Deploy إذا طلبت لوحة Cloudflare ذلك.
+
+الخطوة 3: إضافة Webhook في Kashier
+----------------------------------
+من لوحة Kashier لبيئة TEST:
+
+1) افتح إعدادات Webhook / Reconciliation.
+2) أضف رابط TEST التالي:
+   https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev/kashier/TEST
+3) فعّل أحداث نجاح وفشل الدفع وأحداث الاسترجاع إن كانت اللوحة تسمح باختيارها.
+4) نفّذ اختبار webhook من لوحة Kashier إن كان متاحاً.
+
+عند الانتقال إلى LIVE لاحقاً، استبدل الرابط برابط LIVE فقط:
+https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev/kashier/LIVE
+
+الخطوة 4: إعداد مفتاح تشفير Nabta المحلي
+-----------------------------------------
+على جهاز تشغيل Nabta، أضف متغير بيئة للخادم باسم:
+
+NABTA_PAYMENT_ENCRYPTION_KEY
+
+قيمته يجب أن تكون مفتاحاً عشوائياً Base64URL يمثل 32 بايت.
+لا تضعه داخل واجهة البرنامج ولا داخل قاعدة البيانات ولا في GitHub.
+احتفظ بنسخة آمنة منه؛ فقدانه يجعل المفاتيح المشفرة المخزنة في Nabta غير قابلة للفتح.
+
+الخطوة 5: إدخال الإعدادات داخل Nabta
+-------------------------------------
+سجل الدخول بحساب المالك ثم افتح:
+
+الإعدادات -> المدفوعات والتكاملات -> وضع الاختبار TEST
+
+املأ الحقول التالية:
+
+- Merchant ID: من Kashier TEST.
+- Kashier Secret Key: من Kashier TEST.
+- Kashier API Key: من Kashier TEST.
+- Payment API Key للتوقيع: من Kashier TEST.
+- Webhook URL: رابط Worker TEST المذكور أعلاه.
+- Merchant Redirect URL: رابط HTTPS تملكه لإعادة العميل بعد جلسة دفع مستضافة.
+  لا تستخدم localhost أو عنوان IP محلياً.
+- Cloudflare Event Relay URL: رابط Worker الأساسي فقط، من دون أي مسار:
+  https://nabta-kashier-webhook-relay.mahmoudnabih989.workers.dev
+- Cloudflare Relay Bearer Token: نفس قيمة RELAY_BEARER_TOKEN التي وضعتها في Cloudflare.
+- فعّل فقط وسائل الدفع التي أكد Kashier أنها مفعلة لحساب TEST.
+- أدخل كلمة مرور المالك ثم اضغط حفظ.
+
+بعدها في قسم ربط ماكينة Kashier:
+
+- اكتب Terminal ID الخاص بنقطة البيع في Nabta.
+- اكتب Serial Number الحقيقي لماكينة Kashier.
+- اترك الماكينة نشطة.
+- احفظ الربط. آخر ماكينة تُربط تصبح الافتراضية لنقطة البيع.
+
+الخطوة 6: اختبار TEST المطلوب
+-----------------------------
+نفّذ هذه الحالات بالترتيب:
+
+1) من الإعدادات اضغط اختبار الاتصال وتحديث الوسائل.
+2) افتح وردية على نقطة البيع وارفع فاتورة صغيرة.
+3) اختر Kashier POS وأرسل الدفع للماكينة.
+4) أكمل الدفع ببطاقة TEST أو بالطريقة التي يوفرها Kashier.
+5) تأكد أن Nabta لا يسجل الفاتورة قبل وصول حالة SUCCEEDED.
+6) افتح الإعدادات واضغط مراجعة وتسوية المعلّق؛ يجب أن تسحب الأحداث من Cloudflare عند الحاجة.
+7) تأكد من تسجيل الفاتورة، خصم المخزون، وحفظ وسيلة الدفع الصحيحة.
+8) جرّب فشل الدفع؛ يجب ألا تسجل Nabta فاتورة أو تخصم مخزوناً.
+9) جرّب استرجاعاً جزئياً فقط بعد نجاح عملية دفع TEST.
+
+لا تنتقل إلى LIVE قبل نجاح الحالات السابقة وتوثيق نتيجتها.
+
+الخطوة 7: تفعيل LIVE
+--------------------
+بعد موافقة Kashier ونجاح TEST:
+
+1) أضف KASHIER_LIVE_PAYMENT_API_KEY في Cloudflare.
+2) أضف رابط LIVE في لوحة Kashier.
+3) داخل Nabta اختر LIVE وأدخل مفاتيح LIVE فقط، ثم احفظها بكلمة مرور المالك.
+4) اربط الماكينة الفعلية/الأرقام التسلسلية الصحيحة إن اختلفت عن TEST.
+5) نفّذ عملية صغيرة حقيقية متفق عليها، ثم تحقق من webhook والتسوية والاسترجاع.
+
+ما الذي لا تفعله الآن
+---------------------
+- لا تفعل InstaPay أو Payment Link لمجرد ظهورها في الواجهة؛ فعّلها فقط بعد تأكيد Kashier أنها متاحة في عقدك وتزويدك بتفاصيلها المعتمدة.
+- لا تضع مفاتيح LIVE في TEST أو العكس.
+- لا تغير قيمة NABTA_PAYMENT_ENCRYPTION_KEY بعد حفظ مفاتيح Nabta.
+- لا تشارك RELAY_BEARER_TOKEN مع أي شخص لا يحتاجه.
+
+ماذا تطلب منّي بعد إتمام الخطوات؟
+-----------------------------------
+أرسل فقط عبارة: "تم إدخال إعدادات TEST".
+سأراجع إعداد البرنامج محلياً، أختبر اتصال Kashier الآمن، وأجهز اختبار عملية TEST دون كشف أي مفتاح في المحادثة.

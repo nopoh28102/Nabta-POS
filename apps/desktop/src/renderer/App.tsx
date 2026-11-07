@@ -10,6 +10,7 @@ import {
 } from "react";
 import type {
   CatalogProduct,
+  ComprehensiveReportResponse,
   DiscoveredServer,
   HardwareSettings,
   InvoiceDetailResponse,
@@ -32,9 +33,54 @@ import {
   type ApiFailure,
 } from "./api";
 
+function productUnitLabel(product: CatalogProduct): string {
+  if (product.unitKind === "PIECE") return "قطعة";
+  return product.weightUnit === "GRAM" ? "جرام"
+    : product.weightUnit === "LITER" ? "لتر"
+      : product.weightUnit === "MILLILITER" ? "ملليلتر"
+        : "كيلو";
+}
+
+function productQuantityLabel(product: CatalogProduct, qtyMilli = product.availableQtyMilli): string {
+  if (product.unitKind === "WEIGHT" && (product.weightUnit === "GRAM" || product.weightUnit === "MILLILITER")) {
+    return `${new Intl.NumberFormat("ar-EG").format(qtyMilli)} ${product.weightUnit === "GRAM" ? "جرام" : "ملليلتر"}`;
+  }
+  return `${formatQty(qtyMilli, product.unitKind)} ${productUnitLabel(product)}`;
+}
+
+function productDisplayPriceMinor(product: CatalogProduct, priceMinor = product.priceMinor): number {
+  return product.unitKind === "WEIGHT" && (product.weightUnit === "GRAM" || product.weightUnit === "MILLILITER")
+    ? Math.round(priceMinor / 1000)
+    : priceMinor;
+}
+
+function isSmallMeasuredUnit(weightUnit: CatalogProduct["weightUnit"]): boolean {
+  return weightUnit === "GRAM" || weightUnit === "MILLILITER";
+}
+
+function measurementUnitLabel(weightUnit: CatalogProduct["weightUnit"]): string {
+  return weightUnit === "GRAM" ? "جرام" : weightUnit === "MILLILITER" ? "ملليلتر" : weightUnit === "LITER" ? "لتر" : "كيلو";
+}
+
+/** A final price is only a faster way to derive the physical quantity from
+ * the registered unit price; the resulting quantity is still what the stock
+ * ledger deducts when the sale is posted. */
+function parseWeightQuantityFromTotal(product: CatalogProduct, totalInput: string): number {
+  const totalMinor = minorFromInput(totalInput);
+  if (totalMinor <= 0 || product.priceMinor <= 0) throw new Error("أدخل إجمالي سعر صحيح بعد ضبط سعر الوحدة للصنف.");
+  const quantity = Math.round((totalMinor * 1000) / product.priceMinor);
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error("لا يمكن استخراج وزن صحيح من هذا السعر.");
+  return quantity;
+}
+
+function retailPackageLabel(product: CatalogProduct): string {
+  return product.retailPackage?.label === "STACK" ? "عمود" : product.retailPackage?.label === "PACKET" ? "باكيت" : "عبوة";
+}
+
 type Screen =
   | "pos"
   | "products"
+  | "weight-labels"
   | "inventory"
   | "reorder"
   | "partners"
@@ -55,6 +101,8 @@ interface Config {
   serverUrl: string;
   terminalId?: string;
   certificateFingerprint: string;
+  deviceMode?: "PRIMARY" | "SECONDARY";
+  terminalRelayKey?: string;
 }
 interface CatalogPage {
   products: CatalogProduct[];
@@ -93,13 +141,166 @@ interface ShiftHistoryItem {
 interface CartLine {
   product: CatalogProduct;
   qtyMilli: number;
+  /** Printed only on the current invoice; never saved in the catalogue or stock. */
+  manualItem?: boolean;
+  saleUnit?: "UNIT" | "PACKAGE" | "CARTON";
+  weightedLabelBarcode?: string;
+  weightedLabelUnitPriceMinor?: number;
+  weightedLabelTotalMinor?: number;
+  /** Exact cashier amount for an unlabelled weighed sale. */
+  enteredTotalMinor?: number;
+  /** Keeps independently priced weighed entries from being merged in the cart. */
+  enteredWeightId?: string;
+}
+interface ShopConsumption {
+  id: string;
+  itemName: string;
+  category: string;
+  quantityNote: string | null;
+  supplierName: string | null;
+  consumedOn: string;
+  note: string | null;
+  amountMinor: number;
+  cashierName: string;
+}
+
+function cartLineSaleUnit(line: CartLine): "UNIT" | "PACKAGE" | "CARTON" {
+  return line.saleUnit ?? "UNIT";
+}
+
+function cartLineUnitPriceMinor(line: CartLine): number {
+  if (line.weightedLabelUnitPriceMinor !== undefined) return line.weightedLabelUnitPriceMinor;
+  if (cartLineSaleUnit(line) === "PACKAGE") return line.product.retailPackage!.packagePriceMinor;
+  if (cartLineSaleUnit(line) === "CARTON") return line.product.cartonPriceMinor!;
+  return line.product.priceMinor;
+}
+
+function cartLineTotalMinor(line: CartLine): number {
+  if (line.weightedLabelTotalMinor !== undefined) return line.weightedLabelTotalMinor;
+  if (line.enteredTotalMinor !== undefined) return line.enteredTotalMinor;
+  if (cartLineSaleUnit(line) === "PACKAGE") {
+    return (line.qtyMilli / (line.product.retailPackage!.unitsPerPackage * 1000)) * line.product.retailPackage!.packagePriceMinor;
+  }
+  if (cartLineSaleUnit(line) === "CARTON") {
+    return (line.qtyMilli / (line.product.purchasePackSize * 1000)) * line.product.cartonPriceMinor!;
+  }
+  return Math.round((line.product.priceMinor * line.qtyMilli) / 1000);
+}
+
+function cartLineKey(line: CartLine): string {
+  return line.weightedLabelBarcode
+    ? `label:${line.weightedLabelBarcode}`
+    : line.enteredWeightId
+      ? `entered-weight:${line.enteredWeightId}`
+      : line.manualItem
+        ? `manual:${line.product.id}`
+      : `product:${line.product.id}:${cartLineSaleUnit(line)}`;
+}
+
+function cartLineQuantityText(line: CartLine): string {
+  const saleUnit = cartLineSaleUnit(line);
+  if (saleUnit === "PACKAGE") return String(line.qtyMilli / (line.product.retailPackage!.unitsPerPackage * 1000));
+  if (saleUnit === "CARTON") return String(line.qtyMilli / (line.product.purchasePackSize * 1000));
+  if (line.product.unitKind === "PIECE") return String(line.qtyMilli / 1000);
+  if (isSmallMeasuredUnit(line.product.weightUnit)) return String(line.qtyMilli);
+  return (line.qtyMilli / 1000).toFixed(3).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+}
+
+function cartLineQuantityUnit(line: CartLine): string {
+  const saleUnit = cartLineSaleUnit(line);
+  if (saleUnit === "PACKAGE") return "عبوة";
+  if (saleUnit === "CARTON") return "كرتونة";
+  return productUnitLabel(line.product);
+}
+
+function parseManualCartQuantity(line: CartLine, rawValue: string): number {
+  const normalized = rawValue.trim()
+    .replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)))
+    .replace(/[٫,]/g, ".");
+  const saleUnit = cartLineSaleUnit(line);
+  if (saleUnit === "PACKAGE" || saleUnit === "CARTON" || line.product.unitKind === "PIECE" || isSmallMeasuredUnit(line.product.weightUnit)) {
+    if (!/^\d+$/.test(normalized)) throw new Error("أدخل عددًا صحيحًا أكبر من صفر.");
+    const entered = Number(normalized);
+    const multiplier = saleUnit === "PACKAGE"
+      ? line.product.retailPackage!.unitsPerPackage * 1000
+      : saleUnit === "CARTON"
+        ? line.product.purchasePackSize * 1000
+        : line.product.unitKind === "PIECE"
+          ? 1000
+          : 1;
+    const quantity = entered * multiplier;
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) throw new Error("الكمية غير صحيحة.");
+    return quantity;
+  }
+  const quantity = qtyFromInput(normalized);
+  if (quantity <= 0) throw new Error("أدخل كمية أكبر من صفر.");
+  return quantity;
+}
+
+interface WeightedLabelResult {
+  barcode: string;
+  productId: string;
+  nameAr: string;
+  weightUnit: "KILOGRAM" | "GRAM" | "LITER" | "MILLILITER";
+  qtyMilli: number;
+  unitPriceMinor: number;
+  totalMinor: number;
+  createdAt: string;
+  printCount: number;
+  usedAt?: string;
 }
 interface ReceiptLineDraft {
   productId: string;
+  /** A barcode scanned on a supplier invoice before its product card exists. */
+  pendingBarcode?: string;
+  entryUnit: "PIECE" | "CARTON" | "WEIGHT";
+  costBasis: "UNIT" | "PACKAGE" | "LINE_TOTAL";
+  /** Number of base pieces in a carton; ignored when entryUnit is PIECE. */
+  unitsPerPackage: string;
+  /** A cashier-facing label only; stock remains in the product's base unit. */
+  cartonContent?: "PIECE" | "PACK" | "BAG";
   qty: string;
+  /** Total paid to the supplier for the entire line, never a per-unit cost. */
   cost: string;
+  /** Selling price for one piece, pack, bag, kilogram, or gram as applicable. */
+  retail: string;
   lot: string;
   expires: string;
+}
+
+const PURCHASE_RECEIPT_DRAFT_KEY = "nabta-purchase-receipt-draft-v1";
+const EMPTY_RECEIPT_LINE = (): ReceiptLineDraft => ({
+  productId: "", entryUnit: "PIECE", costBasis: "LINE_TOTAL", unitsPerPackage: "1", qty: "", cost: "", retail: "", lot: "", expires: "",
+});
+interface PurchaseReceiptDraft {
+  lines: ReceiptLineDraft[];
+  supplier: string;
+  invoiceNo: string;
+  expenses: string;
+  issuedAt: string;
+}
+function loadPurchaseReceiptDraft(): PurchaseReceiptDraft {
+  const fallback: PurchaseReceiptDraft = { lines: [EMPTY_RECEIPT_LINE()], supplier: "", invoiceNo: "", expenses: "0.00", issuedAt: new Date().toISOString() };
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PURCHASE_RECEIPT_DRAFT_KEY) ?? "null") as Partial<PurchaseReceiptDraft> | null;
+    if (!parsed || !Array.isArray(parsed.lines)) return fallback;
+    return {
+      lines: parsed.lines.length ? parsed.lines.map((line) => ({ ...EMPTY_RECEIPT_LINE(), ...line })) : [EMPTY_RECEIPT_LINE()],
+      supplier: typeof parsed.supplier === "string" ? parsed.supplier : "",
+      invoiceNo: typeof parsed.invoiceNo === "string" ? parsed.invoiceNo : "",
+      expenses: typeof parsed.expenses === "string" ? parsed.expenses : "0.00",
+      issuedAt: typeof parsed.issuedAt === "string" ? parsed.issuedAt : fallback.issuedAt,
+    };
+  } catch {
+    return fallback;
+  }
+}
+interface PurchasePriceAlert {
+  productName: string;
+  currentUnitCostMinor: number;
+  cheaperUnitCostMinor: number;
+  supplierName: string;
+  postedAt: string;
 }
 interface Health {
   status: string;
@@ -168,6 +369,7 @@ const DRAFT_KEY = "nabta-cart-draft-v1";
 const PENDING_KEY = "nabta-pending-sale-v1";
 const PENDING_RECEIPT_SCAN_KEY = "nabta-pending-receipt-scan-v1";
 const HELD_INVOICES_KEY = "nabta-held-invoices-v1";
+const POS_SESSIONS_KEY = "nabta-pos-sessions-v1";
 
 interface HeldInvoice {
   id: string;
@@ -285,7 +487,7 @@ function barcodeKind(barcode: string): string {
   if (/^\d{13}$/.test(barcode)) return "EAN-13";
   if (/^\d{8}$/.test(barcode)) return "EAN-8";
   if (/^\d{12}$/.test(barcode)) return "UPC-A";
-  if (/^NABTA-[A-Z0-9-]+$/i.test(barcode)) return "باركود داخلي";
+  if (/^\d+$/.test(barcode)) return "باركود رقمي";
   return "Code 128 / نصي";
 }
 
@@ -426,11 +628,30 @@ function printProductLabel(
   barcode: string,
   priceMinor: number,
   copies = 1,
+  hidePrice = false,
 ): Promise<{ printerName: string }> {
   return invoke({
     operation: "hardware.label.print",
-    payload: { nameAr: name, barcode, priceMinor, copies },
+    payload: { nameAr: name, barcode, priceMinor, copies, hidePrice },
   });
+}
+
+/**
+ * A live cashier workspace.  Unlike a held invoice, a workspace remains open
+ * while the cashier serves another customer, so both carts can be continued
+ * without re-entering products.
+ */
+interface PosSession {
+  id: string;
+  label: string;
+  cart: CartLine[];
+  discount: string;
+  customerId: string;
+  createdAt: string;
+}
+
+function shouldHidePriceOnProductLabel(product: CatalogProduct): boolean {
+  return /فوم|foam/iu.test(`${product.nameAr} ${product.category}`);
 }
 
 function ManualConnectionSetup({
@@ -1096,6 +1317,257 @@ function ProductArt({ product }: { product: CatalogProduct }): ReactNode {
   );
 }
 
+type ProductCreationMode = "PIECE" | "KILOGRAM" | "GRAM" | "LITER" | "MILLILITER" | "CARTON" | "PACKAGE" | "PLATE_CARTON";
+
+function productEditorMode(product: CatalogProduct): ProductCreationMode {
+  if (product.unitKind === "WEIGHT") return product.weightUnit ?? "KILOGRAM";
+  if (product.cartonPriceMinor && product.retailPackage?.label === "STACK") return "PLATE_CARTON";
+  if (product.cartonPriceMinor || (product.purchasePackSize >= 2 && product.cartonContentsUnit)) return "CARTON";
+  if (product.retailPackage) return "PACKAGE";
+  return "PIECE";
+}
+
+interface ProductCreationResult {
+  product: CatalogProduct;
+  mode: ProductCreationMode;
+  entryUnit: "PIECE" | "CARTON" | "WEIGHT";
+  quantity: string;
+  /** The complete supplier-line cost, suitable for a purchase invoice line. */
+  totalCost: string;
+  /** Selling price in the product's actual selling unit. */
+  retailPrice: string;
+  purchasePackSize: number;
+}
+
+/**
+ * The full product card used when a barcode is not yet registered.  Keeping this
+ * beside the POS screen means a cashier or storekeeper can finish a product
+ * without leaving the sale or supplier invoice they are currently entering.
+ */
+function ProductCreateModal({
+  barcode: initialBarcode,
+  initialName = "",
+  products,
+  refresh,
+  canViewCost = true,
+  stockTarget = "OPENING",
+  title = "إضافة صنف",
+  description,
+  onClose,
+  onCreated,
+}: {
+  barcode?: string | undefined;
+  initialName?: string;
+  products: CatalogProduct[];
+  refresh: () => Promise<CatalogProduct[]>;
+  canViewCost?: boolean;
+  /** A supplier invoice receives stock later, so creating its product must not duplicate it. */
+  stockTarget?: "OPENING" | "RECEIPT";
+  title?: string;
+  description?: ReactNode;
+  onClose: () => void;
+  onCreated: (result: ProductCreationResult) => void | Promise<void>;
+}): ReactNode {
+  const [mode, setMode] = useState<ProductCreationMode>("PIECE");
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+  const categories = useMemo(
+    () => [...new Set(products.map((product) => product.category))]
+      .sort((a, b) => a.localeCompare(b, "ar")),
+    [products],
+  );
+
+  async function create(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (saving) return;
+    const data = new FormData(event.currentTarget);
+    try {
+      setSaving(true);
+      const isWeighted = mode === "KILOGRAM" || mode === "GRAM" || mode === "LITER" || mode === "MILLILITER";
+      const weightUnit = mode === "GRAM" ? "GRAM" : mode === "LITER" ? "LITER" : mode === "MILLILITER" ? "MILLILITER" : "KILOGRAM";
+      const cartonCount = Number(data.get("openingCartons") || 0);
+      const supportsLooseContainerStock = mode === "CARTON" || mode === "PLATE_CARTON";
+      const looseUnits = supportsLooseContainerStock ? Number(data.get("openingLooseUnits") || 0) : 0;
+      const looseStacks = mode === "PLATE_CARTON" ? Number(data.get("openingLooseStacks") || 0) : 0;
+      const stackSize = mode === "PLATE_CARTON" ? Number(data.get("stackSize") || 0) : 0;
+      const stacksPerCarton = mode === "PLATE_CARTON" ? Number(data.get("stacksPerCarton") || 0) : 0;
+      const purchasePackSize = mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON"
+        ? mode === "PLATE_CARTON" ? stacksPerCarton * stackSize : Number(data.get("purchasePackSize") || 0)
+        : 1;
+      const totalContainerUnits = mode === "PLATE_CARTON"
+        ? cartonCount * purchasePackSize + looseStacks * stackSize + looseUnits
+        : cartonCount * purchasePackSize + looseUnits;
+      if (mode !== "PLATE_CARTON" && (mode === "CARTON" || mode === "PACKAGE") &&
+        (!Number.isInteger(purchasePackSize) || purchasePackSize < 1 ||
+          (supportsLooseContainerStock
+            ? (!Number.isFinite(cartonCount) || cartonCount < 0 || !Number.isInteger(cartonCount * 2) || !Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= purchasePackSize || !Number.isInteger(totalContainerUnits) || totalContainerUnits < 1)
+            : (!Number.isInteger(cartonCount) || cartonCount < 1)))) {
+        throw new Error("أدخل عدد الكراتين والفرط بصورة صحيحة؛ يسمح بنصف كرتونة فقط إذا كان الناتج عدد أكياس/عبوات صحيحًا، والفرط أقل من السعة.");
+      }
+      if (mode === "PLATE_CARTON") {
+        const stackPriceMinor = minorFromInput(String(data.get("stackPrice") || "0"));
+        if (!Number.isInteger(cartonCount) || cartonCount < 0 || !Number.isInteger(stacksPerCarton) || stacksPerCarton < 1 || !Number.isInteger(stackSize) || stackSize < 2 || !Number.isInteger(looseStacks) || looseStacks < 0 || looseStacks >= stacksPerCarton || !Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= stackSize || !Number.isSafeInteger(totalContainerUnits) || totalContainerUnits < 1 || stackPriceMinor <= 0) {
+          throw new Error("أدخل الكراتين والأعمدة والأكواب/الأطباق الفرط بصورة صحيحة. الكرتونة = عدد الأعمدة × سعة العمود.");
+        }
+      }
+      const openingQuantity = String(data.get("openingQty") || "0").trim();
+      const rawGramQty = Number(openingQuantity);
+      if ((mode === "GRAM" || mode === "MILLILITER") && (!Number.isSafeInteger(rawGramQty) || rawGramQty < 0)) {
+        throw new Error("أدخل عدد الجرامات كعدد صحيح.");
+      }
+      const qtyMilli = mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON"
+        ? totalContainerUnits * 1000
+        : mode === "GRAM" || mode === "MILLILITER" ? rawGramQty : qtyFromInput(openingQuantity);
+      if (!Number.isSafeInteger(qtyMilli) || qtyMilli < 0 ||
+        (mode === "PIECE" && qtyMilli % 1000 !== 0)) {
+        throw new Error("أدخل كمية صحيحة للصنف.");
+      }
+      const cartonTotalCostMinor = mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON"
+        ? minorFromInput(String(data.get("cartonTotalWholesale") || "0"))
+        : undefined;
+      const enteredWholesaleMinor = canViewCost
+        ? minorFromInput(String(data.get("wholesalePrice") || "0"))
+        : 0;
+      const wholesalePriceMinor = mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON"
+        ? Math.floor((cartonTotalCostMinor! * 1000) / qtyMilli)
+        : mode === "GRAM" || mode === "MILLILITER" ? enteredWholesaleMinor * 1000 : enteredWholesaleMinor;
+      if (canViewCost && qtyMilli > 0 && wholesalePriceMinor <= 0) {
+        throw new Error("أدخل سعر الجملة قبل حفظ كمية متاحة.");
+      }
+      const requestedBarcode = String(data.get("unitBarcode") ?? initialBarcode ?? "").trim();
+      const generated = requestedBarcode
+        ? undefined
+        : await invoke<{ barcode: string }>({ operation: "products.barcode.generate" });
+      const barcode = requestedBarcode || generated!.barcode;
+      const packageBarcode = String(data.get("packageBarcode") ?? "").trim();
+      const cartonBarcode = String(data.get("cartonBarcode") ?? "").trim();
+      const cartonPriceMinor = mode === "CARTON" || mode === "PLATE_CARTON"
+        ? (() => { const value = minorFromInput(String(data.get("cartonPrice") || "0")); return value > 0 ? value : undefined; })()
+        : undefined;
+      const barcodeMappings = [
+        ...(barcode !== packageBarcode && (barcode !== cartonBarcode || !cartonPriceMinor) ? [{ barcode, saleUnit: "UNIT" as const }] : []),
+        ...(packageBarcode ? [{ barcode: packageBarcode, saleUnit: "PACKAGE" as const }] : []),
+        ...(cartonBarcode && cartonPriceMinor ? [{ barcode: cartonBarcode, saleUnit: "CARTON" as const }] : []),
+      ];
+      const retailPriceText = String(data.get(mode === "CARTON" || mode === "PLATE_CARTON" ? "piecePrice" : mode === "PACKAGE" ? "unitPrice" : "price") || "");
+      const enteredPriceMinor = minorFromInput(retailPriceText);
+      const packagePriceMinor = mode === "PACKAGE" ? minorFromInput(String(data.get("packagePrice") || "")) : undefined;
+      const priceMinor = mode === "GRAM" || mode === "MILLILITER" ? enteredPriceMinor * 1000 : enteredPriceMinor;
+      const created = await invoke<{ id: string }>({
+        operation: "products.create",
+        payload: {
+          nameAr: String(data.get("nameAr") || "").trim(),
+          category: String(data.get("category") || "").trim(),
+          unitKind: isWeighted ? "WEIGHT" : "PIECE",
+          weightUnit,
+          priceMinor,
+          wholesalePriceMinor,
+          purchasePackSize,
+          ...(mode === "PACKAGE" ? { retailPackage: { unitsPerPackage: purchasePackSize, packagePriceMinor: packagePriceMinor!, contentsUnit: String(data.get("packageContentsUnit")) as "PIECE" | "BAG", label: String(data.get("packageLabel")) as "PACKAGE" | "PACKET" } } : {}),
+          ...(mode === "PLATE_CARTON" ? { retailPackage: { unitsPerPackage: stackSize, packagePriceMinor: minorFromInput(String(data.get("stackPrice") || "0")), contentsUnit: "PIECE" as const, label: "STACK" as const } } : {}),
+          ...(cartonPriceMinor !== undefined ? { cartonPriceMinor } : {}),
+          ...(mode === "CARTON" || mode === "PLATE_CARTON" ? { cartonContentsUnit: mode === "PLATE_CARTON" ? "PIECE" as const : String(data.get("cartonContentsUnit")) as "PIECE" | "BAG" } : {}),
+          reorderLevelMilli: 0,
+          barcodes: barcodeMappings.map((item) => item.barcode),
+          barcodeMappings,
+          openingQtyMilli: stockTarget === "OPENING" ? qtyMilli : 0,
+          openingUnitCostMinor: stockTarget === "OPENING" && qtyMilli > 0 ? wholesalePriceMinor : 0,
+          ...(stockTarget === "OPENING" && cartonTotalCostMinor !== undefined
+            ? { openingTotalCostMinor: cartonTotalCostMinor }
+            : {}),
+        },
+      });
+      const catalog = await refresh();
+      const product = catalog.find((item) => item.id === created.id) ??
+        (await invoke<{ products: CatalogProduct[] }>({
+          operation: "catalog.list", payload: { query: barcode, limit: 10 },
+        })).products.find((item) => item.id === created.id);
+      if (!product) throw new Error("حُفظ الصنف، لكن تعذر تحميله لإكمال العملية الحالية.");
+      const receiptTotalCostMinor = cartonTotalCostMinor ??
+        Math.round((wholesalePriceMinor * qtyMilli) / 1000);
+      await onCreated({
+        product,
+        mode,
+        entryUnit: mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON" ? "CARTON" : isWeighted ? "WEIGHT" : "PIECE",
+        quantity: mode === "CARTON" || mode === "PACKAGE" || mode === "PLATE_CARTON" ? String(cartonCount) : openingQuantity,
+        totalCost: (receiptTotalCostMinor / 100).toFixed(2),
+        retailPrice: mode === "PACKAGE" ? (priceMinor / 100).toFixed(2) : retailPriceText,
+        purchasePackSize,
+      });
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <form className="modal form-grid" onSubmit={(event) => void create(event)}>
+        <h2 className="full">{title}</h2>
+        <p className="hint full">{description ?? <>الباركود {initialBarcode ? <b dir="ltr">{initialBarcode}</b> : "سيُولَّد تلقائياً عند الحفظ"}. اختر طريقة البيع والاستلام المناسبة؛ لن يتم إرسال أمر طباعة باركود تلقائياً.</>}</p>
+        {message && <p className="notice warning full">{message}</p>}
+        <Field label="الاسم"><input name="nameAr" required autoFocus defaultValue={initialName} /></Field>
+        <Field label="التصنيف"><input name="category" required list="nabta-inline-product-category-options" placeholder="اكتب أول حرفين لعرض التصنيفات" /></Field>
+        <Field label="باركود القطعة / الكيس الفردي"><input name="unitBarcode" inputMode="numeric" dir="ltr" defaultValue={initialBarcode} placeholder="اتركه فارغًا لتوليد باركود" /></Field>
+        <Field label="طريقة البيع والاستلام">
+          <select value={mode} onChange={(event) => setMode(event.target.value as ProductCreationMode)}>
+            <option value="KILOGRAM">كيلو</option><option value="GRAM">جرام</option><option value="LITER">لتر (منتج سائل)</option><option value="MILLILITER">ملليلتر (منتج سائل)</option><option value="PIECE">قطعة منفردة</option><option value="PACKAGE">عبوة (تباع عبوة أو فرط)</option><option value="CARTON">كرتونة/علبة (تباع فرط أو كرتونة)</option><option value="PLATE_CARTON">أطباق وفوم (طبق / عمود / كرتونة)</option>
+          </select>
+        </Field>
+        {(mode === "KILOGRAM" || mode === "GRAM" || mode === "LITER" || mode === "MILLILITER") && <>
+          <Field label={mode === "KILOGRAM" ? "الكمية المستلمة بالكيلو" : mode === "GRAM" ? "الكمية المستلمة بالجرام" : mode === "LITER" ? "الكمية المستلمة باللتر" : "الكمية المستلمة بالملليلتر"}><input name="openingQty" defaultValue="0" required inputMode={mode === "KILOGRAM" || mode === "LITER" ? "decimal" : "numeric"} dir="ltr" placeholder={mode === "KILOGRAM" || mode === "LITER" ? "مثال: 8 أو 0.250" : "مثال: 8000 أو 250"} /></Field>
+          <Field label={`سعر البيع لكل ${mode === "KILOGRAM" ? "كيلو" : mode === "GRAM" ? "جرام" : mode === "LITER" ? "لتر" : "ملليلتر"}`}><input name="price" required inputMode="decimal" dir="ltr" /></Field>
+          {canViewCost && <Field label={`سعر الجملة لكل ${mode === "KILOGRAM" ? "كيلو" : mode === "GRAM" ? "جرام" : mode === "LITER" ? "لتر" : "ملليلتر"}`}><input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" /></Field>}
+          <p className="hint full">يُحفظ الوزن بالجرام والسوائل بالملليلتر للحساب الدقيق.</p>
+        </>}
+        {mode === "PIECE" && <>
+          <Field label="عدد القطع المستلمة"><input name="openingQty" defaultValue="0" required inputMode="numeric" dir="ltr" /></Field>
+          <Field label="سعر البيع للقطعة"><input name="price" required inputMode="decimal" dir="ltr" /></Field>
+          {canViewCost && <Field label="سعر الجملة للقطعة"><input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" /></Field>}
+        </>}
+        {mode === "CARTON" && <>
+          <Field label="عدد الكراتين المتاحة الآن (يسمح بـ 0.5)"><input name="openingCartons" required min="0" step="0.5" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="محتوى الكرتونة"><select name="cartonContentsUnit" defaultValue="BAG"><option value="BAG">أكياس</option><option value="PIECE">قطع</option></select></Field>
+          <Field label="سعة الكرتونة الواحدة (عدد القطع / العبوات / الأكياس داخلها)"><input name="purchasePackSize" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="عدد الأكياس / القطع الفرط خارج الكراتين"><input name="openingLooseUnits" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="إجمالي سعر الجملة للكراتين المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع الكرتونة إن كانت تُباع كاملة (اختياري)"><input name="cartonPrice" min="0" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر البيع للقطعة / العبوة / الكيس"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="باركود الكرتونة الكامل (اختياري)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" placeholder="يمسح ويبيع كرتونة كاملة" /></Field>
+          <p className="hint full">اكتب الكراتين الكاملة أو النصفية ثم الفرط خارجها. مثال: سعة 12، كرتونة ونصف و3 أكياس = 1.5 كرتونة و3 فرط. لا يقبل النظام جزءًا من كيس أو قطعة.</p>
+        </>}
+        {mode === "PLATE_CARTON" && <>
+          <Field label="عدد الكراتين المستلمة"><input name="openingCartons" required min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="عدد الأعمدة داخل الكرتونة (مثال: 40)"><input name="stacksPerCarton" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="سعة العمود (عدد الأكواب أو الأطباق)"><input name="stackSize" required min="2" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="عدد الأعمدة الفرط خارج الكراتين"><input name="openingLooseStacks" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="عدد الأكواب أو الأطباق الفرط خارج الأعمدة"><input name="openingLooseUnits" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="إجمالي سعر الجملة للكراتين المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع الكوب أو الطبق"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع العمود"><input name="stackPrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="باركود الكرتونة الكامل (اختياري)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" placeholder="يمسح ويبيع كرتونة كاملة" /></Field>
+          <Field label="سعر بيع الكرتونة"><input name="cartonPrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <p className="hint full">مثال الأكواب: كرتونة بها 40 عمودًا، وكل عمود 50 كوبًا = 2000 كوب. تبيع الكرتونة أو العمود أو كوبًا/طبقًا مفردًا، ويُخصم دائمًا من نفس رصيد القطع.</p>
+        </>}
+        {mode === "PACKAGE" && <>
+          <Field label="شكل البيع الكامل"><select name="packageLabel" defaultValue="PACKAGE"><option value="PACKAGE">عبوة</option><option value="PACKET">باكيت (كانز أو زجاجات)</option></select></Field>
+          <Field label="عدد العبوات المستلمة"><input name="openingCartons" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="محتوى العبوة"><select name="packageContentsUnit" defaultValue="PIECE"><option value="PIECE">قطع</option><option value="BAG">أكياس</option></select></Field>
+          <Field label="عدد القطع / الأكياس داخل العبوة"><input name="purchasePackSize" required min="2" step="1" inputMode="numeric" dir="ltr" /></Field>
+          <Field label="إجمالي سعر الجملة للعبوات المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع العبوة"><input name="packagePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع الكيس أو القطعة (فرط)"><input name="unitPrice" required min="0.01" inputMode="decimal" dir="ltr" placeholder="السعر المُعلن للوحدة" /></Field>
+          <Field label="باركود العبوة الكامل (اختياري)"><input name="packageBarcode" inputMode="numeric" dir="ltr" placeholder="يمسح ويبيع عبوة كاملة" /></Field>
+          <p className="hint full">سعر العبوة الكاملة وسعر الكيس أو القطعة مستقلان؛ اكتب السعر المُعلن لكلٍ منهما. في نقطة البيع يمكنك اختيار بيع عبوة كاملة أو البيع فرطاً بالسعر الذي أدخلته.</p>
+        </>}
+        <datalist id="nabta-inline-product-category-options">{categories.map((category) => <option key={category} value={category} />)}</datalist>
+        <div className="modal-actions full"><button type="button" disabled={saving} onClick={onClose}>إلغاء</button><button className="primary" disabled={saving}>{saving ? "جارٍ الحفظ…" : "حفظ"}</button></div>
+      </form>
+    </div>
+  );
+}
+
 function PosScreen({
   products,
   shift,
@@ -1103,10 +1575,11 @@ function PosScreen({
   refreshProducts,
   lookupProducts,
   refreshShift,
-  storeName,
+  storeName = "نبتة",
   branding,
   onOpenShift,
-  onUnregisteredBarcode = () => undefined,
+  canViewCost = true,
+  onEditProductByQuery = () => undefined,
   onPurchaseScan = (barcode: string) =>
     window.dispatchEvent(
       new CustomEvent("nabta:purchase-scan", { detail: barcode }),
@@ -1127,19 +1600,52 @@ function PosScreen({
   storeName: string;
   branding?: ReceiptBranding | undefined;
   onOpenShift: () => void;
-  onUnregisteredBarcode?: (barcode: string) => void;
+  canViewCost?: boolean;
+  onEditProductByQuery?: (query: string) => void;
   onPurchaseScan?: (barcode: string) => void;
   globalSearch?: string;
   posMetrics?: PosMetricsResponse | null;
   refreshPosMetrics?: () => Promise<PosMetricsResponse | null>;
   taxSettings?: TaxSettings;
 }): ReactNode {
+  const [activePosSessionId, setActivePosSessionId] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(POS_SESSIONS_KEY) ?? "[]") as PosSession[];
+      return stored[0]?.id ?? "primary";
+    } catch {
+      return "primary";
+    }
+  });
   const [cart, setCart] = useState<CartLine[]>(() => {
     try {
+      const sessions = JSON.parse(localStorage.getItem(POS_SESSIONS_KEY) ?? "[]") as PosSession[];
+      if (sessions[0]) return sessions[0].cart;
       return JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "[]") as CartLine[];
     } catch {
       return [];
     }
+  });
+  const [posSessions, setPosSessions] = useState<PosSession[]>(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(POS_SESSIONS_KEY) ?? "[]") as PosSession[];
+      if (stored.length) return stored;
+    } catch {
+      // The legacy single-cart draft below remains a safe migration fallback.
+    }
+    let legacyCart: CartLine[] = [];
+    try {
+      legacyCart = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "[]") as CartLine[];
+    } catch {
+      legacyCart = [];
+    }
+    return [{
+      id: "primary",
+      label: "العميل 1",
+      cart: legacyCart,
+      discount: "0.00",
+      customerId: "",
+      createdAt: new Date().toISOString(),
+    }];
   });
   const [heldInvoices, setHeldInvoices] = useState<HeldInvoice[]>(() => {
     try {
@@ -1150,6 +1656,7 @@ function PosScreen({
   });
   const [showHeldModal, setShowHeldModal] = useState(false);
   const [cartSaleTab, setCartSaleTab] = useState<"direct" | "customer">("direct");
+  const [cartQuantityDrafts, setCartQuantityDrafts] = useState<Record<string, string>>({});
   const [sortOption, setSortOption] = useState<"default" | "price-asc" | "price-desc" | "name-asc">("default");
   const [filterOption, setFilterOption] = useState<"all" | "in-stock" | "weight-only">("all");
   const [query, setQuery] = useState("");
@@ -1159,18 +1666,42 @@ function PosScreen({
   const [nextCatalogCursor, setNextCatalogCursor] = useState<string | null>(null);
   const [category, setCategory] = useState("الكل");
   const [catalogPage, setCatalogPage] = useState(0);
-  const [discount, setDiscount] = useState("0.00");
+  const [discount, setDiscount] = useState(() => {
+    try {
+      return (JSON.parse(localStorage.getItem(POS_SESSIONS_KEY) ?? "[]") as PosSession[])[0]?.discount ?? "0.00";
+    } catch { return "0.00"; }
+  });
+  /** Cashier-only aid: it is never submitted as an invoice line or payment value. */
+  const [cashReceived, setCashReceived] = useState("");
   const [dialog, setDialog] = useState<{
     quote: QuoteResponse;
-    method: "CASH" | "CARD" | "MIXED" | "CREDIT";
+    method: "CASH" | "CARD" | "MIXED" | "CREDIT" | "KASHIER_POS_CARD" | "FAWRY_REFERENCE";
+  } | null>(null);
+  const [electronicIntent, setElectronicIntent] = useState<{
+    intentId: string;
+    status: string;
+    amountMinor: number;
+    merchantOrderId: string;
+    deviceSerialNo?: string | null;
   } | null>(null);
   const [customers, setCustomers] = useState<Partner[]>([]);
-  const [customerId, setCustomerId] = useState("");
+  const [customerId, setCustomerId] = useState(() => {
+    try {
+      return (JSON.parse(localStorage.getItem(POS_SESSIONS_KEY) ?? "[]") as PosSession[])[0]?.customerId ?? "";
+    } catch { return ""; }
+  });
   const [weightTarget, setWeightTarget] = useState<CatalogProduct | null>(null);
-  const [weightInput, setWeightInput] = useState("0.250");
+  const [weightTotalInput, setWeightTotalInput] = useState("");
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [packageTarget, setPackageTarget] = useState<CatalogProduct | null>(null);
   const [notice, setNotice] = useState("");
   const [receipt, setReceipt] = useState<SaleResponse | null>(null);
   const [unknownBarcode, setUnknownBarcode] = useState("");
+  const [newProductBarcode, setNewProductBarcode] = useState("");
+  const [newProductName, setNewProductName] = useState("");
+  const [quickSaleProductOpen, setQuickSaleProductOpen] = useState(false);
+  const [quickSaleProductSaving, setQuickSaleProductSaving] = useState(false);
+  const [quickSaleProductError, setQuickSaleProductError] = useState("");
   const [pendingScan, setPendingScan] = useState("");
   const [salesSheetOpen, setSalesSheetOpen] = useState(() => cart.length > 0);
   const [hardware, setHardware] = useState<HardwareSettings>(DEFAULT_HARDWARE);
@@ -1179,6 +1710,14 @@ function PosScreen({
   const [receiptPrinting, setReceiptPrinting] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const catalogRequestRef = useRef(0);
+  /**
+   * State updates are asynchronous, while USB scanners can send the next
+   * barcode immediately.  Keep this ref in sync so the next scan can safely
+   * complete an unanswered package choice as one loose unit.
+   */
+  const packageTargetRef = useRef<CatalogProduct | null>(null);
+  /** Serializes scanner input so rapid scans cannot overtake each other. */
+  const scanQueueRef = useRef<Promise<void>>(Promise.resolve());
   const scanHandlerRef = useRef<
     (barcode: string, source: "HID" | "SERIAL") => Promise<void>
   >(async () => undefined);
@@ -1188,9 +1727,25 @@ function PosScreen({
   const paymentPreparingRef = useRef(false);
   const salePostingRef = useRef(false);
   const receiptPrintingRef = useRef(false);
+  const cashReceivedMinor = useMemo(() => {
+    try {
+      return minorFromInput(cashReceived.trim() || "0");
+    } catch {
+      return 0;
+    }
+  }, [cashReceived]);
+  const cashChangeMinor = dialog?.method === "CASH"
+    ? cashReceivedMinor - dialog.quote.totalMinor
+    : null;
   useEffect(() => {
     localStorage.setItem(DRAFT_KEY, JSON.stringify(cart));
-  }, [cart]);
+    setPosSessions((sessions) => sessions.map((session) => session.id === activePosSessionId
+      ? { ...session, cart, discount, customerId }
+      : session));
+  }, [activePosSessionId, cart, customerId, discount]);
+  useEffect(() => {
+    localStorage.setItem(POS_SESSIONS_KEY, JSON.stringify(posSessions));
+  }, [posSessions]);
   useEffect(() => {
     void invoke<Partner[]>({ operation: "partners.customers.list" })
       .then(setCustomers)
@@ -1284,15 +1839,27 @@ function PosScreen({
     } else if (filterOption === "weight-only") {
       list = list.filter((p) => p.unitKind === "WEIGHT");
     }
+    const stockFirst = (left: CatalogProduct, right: CatalogProduct): number =>
+      Number(right.availableQtyMilli > 0) - Number(left.availableQtyMilli > 0);
     if (sortOption === "price-asc") {
-      list = [...list].sort((a, b) => a.priceMinor - b.priceMinor);
+      list = [...list].sort((a, b) => stockFirst(a, b) || a.priceMinor - b.priceMinor);
     } else if (sortOption === "price-desc") {
-      list = [...list].sort((a, b) => b.priceMinor - a.priceMinor);
+      list = [...list].sort((a, b) => stockFirst(a, b) || b.priceMinor - a.priceMinor);
     } else if (sortOption === "name-asc") {
-      list = [...list].sort((a, b) => a.nameAr.localeCompare(b.nameAr, "ar"));
+      list = [...list].sort((a, b) => stockFirst(a, b) || a.nameAr.localeCompare(b.nameAr, "ar"));
+    } else {
+      // Keep the server relevance order inside each group, but always put
+      // sellable stock in front of unavailable search matches.
+      list = [...list].sort(stockFirst);
     }
     return list;
   }, [category, filterOption, searchResults, sortOption]);
+  const searchSuggestions = useMemo(() => {
+    if (!query.trim()) return [];
+    return [...searchResults]
+      .sort((left, right) => Number(right.availableQtyMilli > 0) - Number(left.availableQtyMilli > 0))
+      .slice(0, 7);
+  }, [query, searchResults]);
 
   const visible = filteredProducts;
   const catalogPageCount = Math.max(
@@ -1328,11 +1895,7 @@ function PosScreen({
     return () => { cancelled = true; };
   }, [activeCatalogPage, catalogHasMore, catalogSearching, lookupProducts, nextCatalogCursor, query, visible.length]);
   useEffect(() => setCatalogPage(0), [query, category, filterOption, sortOption]);
-  const subtotal = cart.reduce(
-    (sum, line) =>
-      sum + Math.round((line.product.priceMinor * line.qtyMilli) / 1000),
-    0,
-  );
+  const subtotal = cart.reduce((sum, line) => sum + cartLineTotalMinor(line), 0);
   const discountMinor = (() => {
     try {
       return minorFromInput(discount);
@@ -1346,6 +1909,68 @@ function PosScreen({
       ? Math.round(discountedSubtotal * (taxSettings.ratePercent / 100))
       : 0;
   const grandTotal = discountedSubtotal + taxMinor;
+  const weightPreview = useMemo(() => {
+    if (!weightTarget) return null;
+    try {
+      const totalMinor = minorFromInput(weightTotalInput);
+      const qtyMilli = parseWeightQuantityFromTotal(weightTarget, weightTotalInput);
+      return {
+        qtyMilli,
+        // Keep the cashier's final amount exactly as entered. The derived
+        // quantity is used only for stock deduction at sale posting.
+        totalMinor,
+        remainingQtyMilli: Math.max(0, weightTarget.availableQtyMilli - qtyMilli),
+        enoughStock: qtyMilli <= weightTarget.availableQtyMilli,
+      };
+    } catch {
+      return null;
+    }
+  }, [weightTarget, weightTotalInput]);
+
+  function activatePosSession(session: PosSession): void {
+    if (salePosting || paymentPreparing) {
+      setNotice("أكمل أو ألغِ عملية الدفع الحالية قبل الانتقال إلى عميل آخر.");
+      return;
+    }
+    setActivePosSessionId(session.id);
+    setCart(session.cart);
+    setDiscount(session.discount || "0.00");
+    setCustomerId(session.customerId || "");
+    setCartSaleTab(session.customerId ? "customer" : "direct");
+    setCartQuantityDrafts({});
+    setDialog(null);
+    setElectronicIntent(null);
+  }
+
+  function openNewPosSession(): void {
+    const id = crypto.randomUUID();
+    const session: PosSession = {
+      id,
+      label: `العميل ${posSessions.length + 1}`,
+      cart: [],
+      discount: "0.00",
+      customerId: "",
+      createdAt: new Date().toISOString(),
+    };
+    setPosSessions((sessions) => [
+      ...sessions.map((item) => item.id === activePosSessionId ? { ...item, cart, discount, customerId } : item),
+      session,
+    ]);
+    activatePosSession(session);
+    setNotice("تم فتح فاتورة مستقلة لعميل جديد. الفاتورة السابقة محفوظة في تبويبها.");
+  }
+
+  function closePosSession(id: string): void {
+    if (posSessions.length <= 1) {
+      setNotice("لا يمكن إغلاق آخر فاتورة مفتوحة. يمكنك تفريغها أو تعليقها.");
+      return;
+    }
+    const session = posSessions.find((item) => item.id === id);
+    if (session?.cart.length && !window.confirm(`سيُغلق تبويب «${session.label}» وتُحذف مسودته. هل تريد المتابعة؟`)) return;
+    const remaining = posSessions.filter((item) => item.id !== id);
+    setPosSessions(remaining);
+    if (id === activePosSessionId) activatePosSession(remaining[0]!);
+  }
 
   function clearCurrentCart(): void {
     if (!cart.length) return;
@@ -1395,26 +2020,66 @@ function PosScreen({
     localStorage.setItem(HELD_INVOICES_KEY, JSON.stringify(updated));
   }
 
-  function addWithQty(product: CatalogProduct, qtyMilli: number): void {
+  function addWithQty(product: CatalogProduct, qtyMilli: number, saleUnit: "UNIT" | "PACKAGE" | "CARTON" = "UNIT"): void {
     if (!Number.isInteger(qtyMilli) || qtyMilli <= 0) {
       setNotice("الكمية غير صحيحة");
       return;
     }
     setCart((current) => {
-      const found = current.find((line) => line.product.id === product.id);
+      const found = current.find((line) => line.product.id === product.id && cartLineSaleUnit(line) === saleUnit && !line.weightedLabelBarcode);
+      const productQtyInCart = current.filter((line) => line.product.id === product.id).reduce((sum, line) => sum + line.qtyMilli, 0);
       const nextQty = (found?.qtyMilli ?? 0) + qtyMilli;
-      if (nextQty > product.availableQtyMilli) {
+      if (productQtyInCart + qtyMilli > product.availableQtyMilli) {
         setNotice("المخزون الظاهر غير كافٍ؛ سيعيد الخادم التحقق عند الإتمام");
         return current;
       }
       return found
         ? current.map((line) =>
-            line.product.id === product.id
+            line.product.id === product.id && cartLineSaleUnit(line) === saleUnit && !line.weightedLabelBarcode
               ? { ...line, qtyMilli: nextQty }
               : line,
           )
-        : [...current, { product, qtyMilli }];
+        : [...current, { product, qtyMilli, saleUnit }];
     });
+  }
+
+  function addWeightedLabel(product: CatalogProduct, label: WeightedLabelResult): void {
+    if (label.qtyMilli > product.availableQtyMilli) {
+      setNotice("المخزون الظاهر لا يكفي لهذا الملصق؛ سيُتحقق منه نهائيًا عند إتمام البيع.");
+      return;
+    }
+    setCart((current) => current.some((line) => line.weightedLabelBarcode === label.barcode)
+      ? current
+      : [...current, { product, qtyMilli: label.qtyMilli, weightedLabelBarcode: label.barcode, weightedLabelUnitPriceMinor: label.unitPriceMinor, weightedLabelTotalMinor: label.totalMinor }]);
+  }
+
+  function openPackageSaleChoice(product: CatalogProduct): void {
+    packageTargetRef.current = product;
+    setPackageTarget(product);
+  }
+
+  function closePackageSaleChoice(): void {
+    packageTargetRef.current = null;
+    setPackageTarget(null);
+  }
+
+  function looseUnitLabel(product: CatalogProduct): string {
+    return (product.retailPackage?.contentsUnit ?? product.cartonContentsUnit) === "BAG"
+      ? "كيس"
+      : "قطعة";
+  }
+
+  /**
+   * A second scan means the cashier has moved on.  Do not throw away the
+   * previous sale merely because its carton/package chooser was unanswered:
+   * record it as the smallest sellable unit, then handle the new scan.
+   */
+  function commitUnansweredPackageAsLooseUnit(): CatalogProduct | null {
+    const pending = packageTargetRef.current;
+    if (!pending) return null;
+    closePackageSaleChoice();
+    addWithQty(pending, 1000, "UNIT");
+    return pending;
   }
 
   function add(product: CatalogProduct): void {
@@ -1425,17 +2090,29 @@ function PosScreen({
     setSalesSheetOpen(true);
     if (product.unitKind === "WEIGHT") {
       setWeightTarget(product);
-      setWeightInput("0.250");
+      setWeightTotalInput("");
+      return;
+    }
+    if (product.retailPackage || (product.cartonPriceMinor && product.purchasePackSize >= 2)) {
+      openPackageSaleChoice(product);
       return;
     }
     addWithQty(product, 1000);
   }
 
-  function changeCartQty(product: CatalogProduct, direction: 1 | -1): void {
-    const delta = product.unitKind === "WEIGHT" ? 250 : 1000;
+  function changeCartQty(target: CartLine, direction: 1 | -1): void {
+    if (target.weightedLabelBarcode || target.manualItem) return;
+    const product = target.product;
+    const saleUnit = cartLineSaleUnit(target);
+    const delta = saleUnit === "PACKAGE" ? product.retailPackage!.unitsPerPackage * 1000 : saleUnit === "CARTON" ? product.purchasePackSize * 1000 : product.unitKind === "WEIGHT" ? 250 : 1000;
+    setCartQuantityDrafts((current) => {
+      const { [cartLineKey(target)]: _discarded, ...remaining } = current;
+      return remaining;
+    });
     setCart((current) =>
       current.flatMap((line) => {
-        if (line.product.id !== product.id) return [line];
+        if (line.product.id !== product.id || cartLineSaleUnit(line) !== saleUnit) return [line];
+        if (line.weightedLabelBarcode) return [line];
         const nextQty = line.qtyMilli + direction * delta;
         return nextQty > 0 && nextQty <= product.availableQtyMilli
           ? [{ ...line, qtyMilli: nextQty }]
@@ -1446,19 +2123,99 @@ function PosScreen({
     );
   }
 
+  function commitManualCartQuantity(target: CartLine, value: string): void {
+    if (target.weightedLabelBarcode || target.manualItem) return;
+    const key = cartLineKey(target);
+    let requestedQuantity: number;
+    try {
+      requestedQuantity = parseManualCartQuantity(target, value);
+    } catch (cause) {
+      setNotice(errorMessage(cause));
+      setCartQuantityDrafts((current) => ({ ...current, [key]: cartLineQuantityText(target) }));
+      return;
+    }
+    setCart((current) => {
+      const otherQuantity = current
+        .filter((line) => line.product.id === target.product.id && cartLineKey(line) !== key)
+        .reduce((sum, line) => sum + line.qtyMilli, 0);
+      if (otherQuantity + requestedQuantity > target.product.availableQtyMilli) {
+        setNotice("الكمية المطلوبة أكبر من المخزون المتاح.");
+        return current;
+      }
+      return current.map((line) => cartLineKey(line) === key ? { ...line, qtyMilli: requestedQuantity } : line);
+    });
+    setCartQuantityDrafts((current) => {
+      const { [key]: _discarded, ...remaining } = current;
+      return remaining;
+    });
+  }
+
   function confirmWeight(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
     if (!weightTarget) return;
-    const normalized = weightInput
-      .trim()
-      .replace(/[٠-٩]/g, (digit) => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)))
-      .replace("٫", ".");
-    if (!/^\d+(?:\.\d{1,3})?$/.test(normalized)) {
-      setNotice("اكتب وزنًا حتى 0.001 كجم");
+    const qtyMilli = weightPreview?.qtyMilli;
+    if (!qtyMilli) { setNotice("أدخل السعر النهائي بصورة صحيحة."); return; }
+    if (qtyMilli > weightTarget.availableQtyMilli) {
+      setNotice(`الوزن المطلوب أكبر من الرصيد المتاح (${productQuantityLabel(weightTarget)}).`);
       return;
     }
-    addWithQty(weightTarget, Math.round(Number(normalized) * 1000));
+    setCart((current) => {
+      const alreadyInCart = current
+        .filter((line) => line.product.id === weightTarget.id)
+        .reduce((sum, line) => sum + line.qtyMilli, 0);
+      if (alreadyInCart + qtyMilli > weightTarget.availableQtyMilli) {
+        setNotice("المخزون الظاهر لا يكفي لهذا السعر؛ خفّض السعر أو راجع الرصيد.");
+        return current;
+      }
+      return [...current, {
+        product: weightTarget,
+        qtyMilli,
+        saleUnit: "UNIT",
+        enteredTotalMinor: weightPreview.totalMinor,
+        enteredWeightId: crypto.randomUUID(),
+      }];
+    });
     setWeightTarget(null);
+  }
+
+  function createQuickSaleProduct(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    if (quickSaleProductSaving) return;
+    const data = new FormData(event.currentTarget);
+    try {
+      setQuickSaleProductSaving(true);
+      setQuickSaleProductError("");
+      const nameAr = String(data.get("nameAr") ?? "").trim();
+      const priceMinor = minorFromInput(String(data.get("price") ?? ""));
+      if (!nameAr || priceMinor <= 0) {
+        throw new Error("اكتب اسم الصنف وسعر بيع صحيح.");
+      }
+      const product: CatalogProduct = {
+        id: crypto.randomUUID(), warehouseId: "", nameAr, description: "صنف بيع مباشر غير مسجل",
+        category: "بيع مباشر", unitKind: "PIECE", weightUnit: "KILOGRAM", purchasePackSize: 1,
+        priceMinor, availableQtyMilli: 1000, reorderLevelMilli: 0, barcodes: [], version: 0,
+      };
+      setSalesSheetOpen(true);
+      setCart((current) => [...current, { product, qtyMilli: 1000, saleUnit: "UNIT", manualItem: true }]);
+      setQuickSaleProductOpen(false);
+      setNotice(`أُضيف «${product.nameAr}» إلى الفاتورة فقط، ولن يُحفظ في الأصناف أو المخزون.`);
+    } catch (cause) {
+      setQuickSaleProductError(errorMessage(cause));
+    } finally {
+      setQuickSaleProductSaving(false);
+    }
+  }
+
+  function choosePackageSale(saleUnit: "UNIT" | "PACKAGE" | "CARTON"): void {
+    const target = packageTargetRef.current ?? packageTarget;
+    if (!target) return;
+    const qtyMilli = saleUnit === "PACKAGE"
+      ? target.retailPackage!.unitsPerPackage * 1000
+      : saleUnit === "CARTON"
+        ? target.purchasePackSize * 1000
+      : 1000;
+    closePackageSaleChoice();
+    addWithQty(target, qtyMilli, saleUnit);
   }
 
   async function addSaleBarcode(barcode: string): Promise<boolean> {
@@ -1470,10 +2227,28 @@ function PosScreen({
       candidates.push(raw.slice(1));
     }
 
+    for (const code of candidates) {
+      try {
+        const resolved = await invoke<{ label: WeightedLabelResult; product: CatalogProduct }>({ operation: "weighted-labels.resolve", payload: { barcode: code } });
+        addWeightedLabel(resolved.product, resolved.label);
+        setQuery("");
+        playScanTone("known");
+        return true;
+      } catch (cause) {
+        const failure = cause as Partial<ApiFailure>;
+        if (failure.code === "WEIGHT_LABEL_USED") {
+          setNotice("تم بيع ملصق الوزن هذا بالفعل ولا يمكن إضافته مرة أخرى.");
+          playScanTone("unknown");
+          return false;
+        }
+      }
+    }
+
     let exact: CatalogProduct | undefined;
+    let matchedCode = "";
     for (const code of candidates) {
       exact = products.find((product) => product.barcodes.includes(code));
-      if (exact) break;
+      if (exact) { matchedCode = code; break; }
     }
     if (!exact) {
       for (const code of candidates) {
@@ -1482,18 +2257,31 @@ function PosScreen({
         );
         if (found) {
           exact = found;
+          matchedCode = code;
           break;
         }
       }
     }
     if (exact) {
-      add(exact);
+      const mapping = exact.barcodeMappings?.find((item) => item.barcode === matchedCode);
+      if (mapping && mapping.saleUnit !== "UNIT") {
+        const qtyMilli = mapping.saleUnit === "PACKAGE"
+          ? (exact.retailPackage?.unitsPerPackage ?? 0) * 1000
+          : exact.purchasePackSize * 1000;
+        if (qtyMilli <= 0) {
+          setNotice("باركود العبوة أو الكرتونة غير مكتمل الإعداد؛ راجع بطاقة الصنف.");
+          playScanTone("unknown");
+          return false;
+        }
+        addWithQty(exact, qtyMilli, mapping.saleUnit);
+      } else add(exact);
       setQuery("");
       playScanTone("known");
       return true;
     }
     playScanTone("unknown");
-    setUnknownBarcode(raw);
+    if (/^\d+$/.test(raw)) setUnknownBarcode(raw);
+    else setNewProductName(raw);
     return false;
   }
 
@@ -1511,19 +2299,31 @@ function PosScreen({
     )
       return;
     recentScanRef.current = { barcode: normalized, at: now };
+    const autoCommitted = commitUnansweredPackageAsLooseUnit();
     setNotice(`تمت قراءة ${barcodeKind(normalized)}: ${normalized}`);
     if (!salesSheetOpen && cart.length === 0) {
       setPendingScan(normalized);
       return;
     }
     await addSaleBarcode(normalized);
+    if (autoCommitted) {
+      setNotice(`أُضيف «${autoCommitted.nameAr}» تلقائيًا كـ${looseUnitLabel(autoCommitted)} لأن مسحًا جديدًا وصل قبل اختيار الكرتونة أو العبوة.`);
+    }
+  }
+
+  function queueBarcode(barcode: string, source: "HID" | "SERIAL" = "HID"): Promise<void> {
+    const next = scanQueueRef.current.then(() => handleBarcode(barcode, source));
+    // Keep future scans alive even if a lookup fails; the individual scan
+    // already shows its own Arabic error/notice.
+    scanQueueRef.current = next.catch(() => undefined);
+    return next;
   }
 
   async function scan(): Promise<void> {
     const barcode = query.trim();
     if (!barcode) return;
     setQuery("");
-    await handleBarcode(barcode, "HID");
+    await queueBarcode(barcode, "HID");
   }
 
   async function preparePayment(): Promise<void> {
@@ -1538,17 +2338,21 @@ function PosScreen({
           terminalId: shift.terminalId,
           shiftId: shift.id,
           discountMinor: minorFromInput(discount),
-          lines: cart.map((line) => ({
-            productId: line.product.id,
-            qtyMilli: line.qtyMilli,
-          })),
+          lines: cart.map((line) => line.manualItem
+            ? { manualNameAr: line.product.nameAr, manualPriceMinor: line.product.priceMinor, qtyMilli: 1000, saleUnit: "UNIT" as const }
+            : {
+              productId: line.product.id,
+              qtyMilli: line.qtyMilli,
+              saleUnit: cartLineSaleUnit(line),
+              ...(line.weightedLabelBarcode ? { weightedLabelBarcode: line.weightedLabelBarcode } : {}),
+              ...(line.enteredTotalMinor !== undefined ? { enteredTotalMinor: line.enteredTotalMinor } : {}),
+            }),
         },
       });
-      const changed = quote.lines.some(
-        (line) =>
-          cart.find((cartLine) => cartLine.product.id === line.productId)
-            ?.product.priceMinor !== line.unitPriceMinor,
-      );
+      const changed = quote.lines.some((line) => {
+        const cartLine = line.manualItem ? undefined : cart.find((item) => !item.manualItem && !item.weightedLabelBarcode && item.product.id === line.productId && cartLineSaleUnit(item) === line.saleUnit);
+        return cartLine ? cartLineUnitPriceMinor(cartLine) !== line.unitPriceMinor : false;
+      });
       if (
         changed &&
         !window.confirm(
@@ -1557,6 +2361,8 @@ function PosScreen({
       )
         return;
       setCustomerId(customers[0]?.id ?? "");
+      setElectronicIntent(null);
+      setCashReceived((quote.totalMinor / 100).toFixed(2));
       setDialog({ quote, method: "CASH" });
     } catch (cause) {
       setNotice(errorMessage(cause));
@@ -1574,13 +2380,37 @@ function PosScreen({
     setSalePosting(true);
     const data = new FormData(event.currentTarget);
     try {
+      // This is intentionally a per-sale choice. A cashier can skip paper
+      // for small purchases without changing the terminal's default setting.
+      const printCustomerReceipt = data.get("printReceipt") === "on";
+      const electronicMethod = dialog.method === "KASHIER_POS_CARD" || dialog.method === "FAWRY_REFERENCE" ? dialog.method : null;
+      const shouldOpenCashDrawer = hardware.cashDrawerEnabled && (dialog.method === "CASH" || dialog.method === "MIXED");
+      if (electronicMethod && (!electronicIntent || electronicIntent.status !== "SUCCEEDED")) {
+        const started = await invoke<typeof electronicIntent & { intentId: string }>({
+          operation: "payments.intents.create",
+          payload: {
+            terminalId: shift.terminalId,
+            shiftId: shift.id,
+            quoteId: dialog.quote.quoteId,
+            method: electronicMethod,
+            idempotencyKey: crypto.randomUUID(),
+            printReceipt: printCustomerReceipt,
+            ...(electronicMethod === "FAWRY_REFERENCE" ? { customerName: String(data.get("fawryCustomerName") ?? "").trim() || undefined, customerMobile: String(data.get("fawryCustomerMobile") ?? "").trim(), customerEmail: String(data.get("fawryCustomerEmail") ?? "").trim() } : {}),
+          },
+        });
+        setElectronicIntent(started);
+        setNotice(electronicMethod === "KASHIER_POS_CARD" ? "تم إرسال إجمالي الفاتورة إلى ماكينة Kashier. انتظر تأكيد العملية ثم اضغط «تحقق من حالة الدفع»." : "تم إنشاء رقم فوري المرجعي. اطلب من العميل السداد في نقطة فوري، ثم اضغط «تحقق من حالة الدفع».");
+        return;
+      }
+      if (dialog.method === "CASH" && cashReceivedMinor < dialog.quote.totalMinor) {
+        throw new Error("المبلغ المستلم أقل من إجمالي الفاتورة.");
+      }
       const payments =
         dialog.method === "CASH"
           ? [
               {
                 method: "CASH" as const,
                 amountMinor: dialog.quote.totalMinor,
-                tenderedMinor: minorFromInput(String(data.get("received"))),
               },
             ]
           : dialog.method === "CARD"
@@ -1597,7 +2427,9 @@ function PosScreen({
                     amountMinor: dialog.quote.totalMinor,
                   },
                 ]
-              : (() => {
+              : electronicMethod
+                ? [{ method: electronicMethod, amountMinor: dialog.quote.totalMinor }]
+                : (() => {
                   const cash = minorFromInput(String(data.get("cash")));
                   return [
                     {
@@ -1617,6 +2449,7 @@ function PosScreen({
         shiftId: shift.id,
         quoteId: dialog.quote.quoteId,
         payments,
+        ...(electronicMethod && electronicIntent ? { paymentIntentId: electronicIntent.intentId } : {}),
         ...(dialog.method === "CREDIT" ? { customerId } : {}),
       };
       localStorage.setItem(PENDING_KEY, JSON.stringify({ key, salePayload }));
@@ -1629,13 +2462,22 @@ function PosScreen({
       setCart([]);
       setSalesSheetOpen(false);
       setDialog(null);
-      setReceipt(sale);
+      setCashReceived("");
+      setElectronicIntent(null);
+      setReceipt(printCustomerReceipt ? sale : null);
       setDiscount("0.00");
-      if (hardware.autoPrintReceipt && hardware.receiptPrinterName) {
+      if (printCustomerReceipt && hardware.receiptPrinterName) {
         void printReceiptForSale(sale, false, hardware.receiptCopies).catch((cause) =>
           setNotice(
             `تم تسجيل الفاتورة، لكن تعذرت طباعتها: ${errorMessage(cause)}`,
           ),
+        );
+      } else if (!printCustomerReceipt) {
+        setNotice(`تم تسجيل الفاتورة ${sale.invoiceNo} بدون طباعة إيصال للعميل.`);
+      }
+      if (shouldOpenCashDrawer) {
+        void invoke<{ printerName: string }>({ operation: "hardware.drawer.open" }).catch((cause) =>
+          setNotice(`تم تسجيل الفاتورة، لكن تعذر فتح الدرج: ${errorMessage(cause)}`),
         );
       }
       await Promise.all([
@@ -1651,58 +2493,37 @@ function PosScreen({
     }
   }
 
+  async function verifyElectronicPayment(): Promise<void> {
+    if (!electronicIntent) return;
+    setSalePosting(true);
+    try {
+      const next = await invoke<typeof electronicIntent & { intentId: string }>({
+        operation: "payments.intents.verify",
+        payload: { intentId: electronicIntent.intentId },
+      });
+      setElectronicIntent(next);
+      setNotice(next.status === "SUCCEEDED" ? "تم التحقق من نجاح التحصيل. اضغط إتمام البيع لتسجيل الفاتورة." : `حالة Kashier الحالية: ${next.status}`);
+    } catch (cause) {
+      setNotice(errorMessage(cause));
+    } finally {
+      setSalePosting(false);
+    }
+  }
+
   useEffect(() => {
-    scanHandlerRef.current = handleBarcode;
+    scanHandlerRef.current = queueBarcode;
   });
 
   useEffect(() => {
-    let buffer = "";
-    let startedAt = 0;
-    let lastKeyAt = 0;
-    const terminator = hardware.scannerTerminator === "ENTER" ? "Enter" : "Tab";
-    function isEditable(target: EventTarget | null): boolean {
-      const element = target instanceof HTMLElement ? target : null;
-      return Boolean(
-        element?.closest("input, textarea, select, [contenteditable='true']"),
-      );
+    function receiveBarcode(event: Event): void {
+      const barcode = String((event as CustomEvent<string>).detail || "");
+      if (barcode) void scanHandlerRef.current(barcode, "HID");
     }
-    function handleHid(event: KeyboardEvent): void {
-      if (isEditable(event.target)) return;
-      if (event.key === terminator && buffer.length >= 4) {
-        const barcode = buffer;
-        const elapsed = Date.now() - startedAt;
-        buffer = "";
-        startedAt = 0;
-        lastKeyAt = 0;
-        if (elapsed <= 1_500) {
-          event.preventDefault();
-          void scanHandlerRef.current(barcode, "HID");
-        }
-        return;
-      }
-      if (
-        event.key.length !== 1 ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.altKey
-      )
-        return;
-      const now = Date.now();
-      if (!startedAt || now - lastKeyAt > 120) {
-        buffer = event.key;
-        startedAt = now;
-      } else buffer += event.key;
-      lastKeyAt = now;
-    }
-    const unsubscribe = window.nabta.onBarcodeScanned((scan) => {
-      void scanHandlerRef.current(scan.barcode, scan.source);
-    });
-    window.addEventListener("keydown", handleHid, true);
+    window.addEventListener("nabta:pos-barcode-scan", receiveBarcode);
     return () => {
-      unsubscribe();
-      window.removeEventListener("keydown", handleHid, true);
+      window.removeEventListener("nabta:pos-barcode-scan", receiveBarcode);
     };
-  }, [hardware.scannerTerminator]);
+  }, []);
 
   async function printReceiptForSale(sale: SaleResponse, announce = true, copies = 1): Promise<void> {
     if (receiptPrintingRef.current) {
@@ -1742,9 +2563,17 @@ function PosScreen({
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent): void {
-      if (event.key === "F2") {
+      const target = event.target as HTMLElement | null;
+      const typing = Boolean(target?.closest("input, textarea, select, [contenteditable='true']"));
+      if ((event.key === "F2" || (event.code === "KeyF" && !typing && !event.ctrlKey && !event.altKey && !event.metaKey))) {
         event.preventDefault();
         searchRef.current?.focus();
+      }
+      if (event.key === "F6" || event.code === "F6") {
+        event.preventDefault();
+        event.stopPropagation();
+        setQuickSaleProductError("");
+        setQuickSaleProductOpen(true);
       }
       if (event.key === "F4") {
         event.preventDefault();
@@ -1844,6 +2673,35 @@ function PosScreen({
         </div>
       </div>
 
+      <section className="pos-session-strip" aria-label="فواتير العملاء المفتوحة">
+        <div>
+          <b>فواتير مفتوحة</b>
+          <small>كل تبويب يحتفظ بأصنافه وخصمه وعميله بصورة مستقلة.</small>
+        </div>
+        <div className="pos-session-tabs" role="tablist" aria-label="العملاء الحاليون">
+          {posSessions.map((session) => (
+            <div key={session.id} className={`pos-session-tab ${session.id === activePosSessionId ? "active" : ""}`}>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={session.id === activePosSessionId}
+                onClick={() => activatePosSession(session)}
+                title={`فتح ${session.label}`}
+              >
+                {session.customerId ? customers.find((customer) => customer.id === session.customerId)?.name ?? session.label : session.label}
+                {session.cart.length ? ` (${session.cart.length})` : ""}
+              </button>
+              {posSessions.length > 1 && (
+                <button type="button" className="pos-session-close" aria-label={`إغلاق ${session.label}`} onClick={() => closePosSession(session.id)}>×</button>
+              )}
+            </div>
+          ))}
+          <button type="button" className="pos-session-new" onClick={openNewPosSession} title="فتح فاتورة مستقلة لعميل آخر">
+            + عميل جديد
+          </button>
+        </div>
+      </section>
+
       {/* ─── Main POS Layout (Catalog + Cart) ────────────────── */}
       <div className="pos-layout">
         <section className="catalog-area">
@@ -1885,7 +2743,21 @@ function PosScreen({
                 ref={searchRef}
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
+                onFocus={() => setSearchFocused(true)}
+                onBlur={() => window.setTimeout(() => setSearchFocused(false), 120)}
                 onKeyDown={(event) => {
+                  if (event.defaultPrevented) return;
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setQuery("");
+                    return;
+                  }
+                  if (event.key === "F3") {
+                    event.preventDefault();
+                    if (query.trim()) onEditProductByQuery(query);
+                    else setNotice("امسح باركود الصنف أو ابحث عنه أولاً، ثم اضغط F3 للتعديل.");
+                    return;
+                  }
                   if (
                     event.key ===
                     (hardware.scannerTerminator === "ENTER" ? "Enter" : "Tab")
@@ -1894,10 +2766,40 @@ function PosScreen({
                     void scan();
                   }
                 }}
-                placeholder="ابحث بالاسم أو امسح الباركود… F2"
+                placeholder="ابحث أو امسح الباركود… F أو F2 | Esc لمسح | F3 لتعديل الصنف"
                 autoFocus
               />
+              {searchFocused && searchSuggestions.length > 0 && (
+                <div className="pos-search-suggestions" role="listbox" aria-label="اقتراحات البحث">
+                  {searchSuggestions.map((product) => (
+                    <button
+                      key={product.id}
+                      type="button"
+                      role="option"
+                      aria-selected="false"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => {
+                        setQuery("");
+                        setSearchFocused(false);
+                        add(product);
+                      }}
+                    >
+                      <span><b>{product.nameAr}</b><small>{product.category} · {productQuantityLabel(product)}</small></span>
+                      <strong>{formatMoney(productDisplayPriceMinor(product))}{product.unitKind === "WEIGHT" ? ` / ${measurementUnitLabel(product.weightUnit)}` : ""}</strong>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
+
+            <button
+              type="button"
+              className="toolbar-action-btn"
+              onClick={() => { setQuickSaleProductError(""); setQuickSaleProductOpen(true); }}
+              title="إضافة صنف جديد سريعًا إلى الفاتورة (F6)"
+            >
+              + صنف سريع <kbd>F6</kbd>
+            </button>
 
             <div className="catalog-toolbar-actions">
               <button
@@ -1978,7 +2880,7 @@ function PosScreen({
                   <span className="stock-tag out-of-stock">نفد المخزون</span>
                 ) : (
                   <span className="stock-tag">
-                    {formatQty(product.availableQtyMilli, product.unitKind)}
+                    {productQuantityLabel(product)}
                   </span>
                 )}
 
@@ -1988,9 +2890,9 @@ function PosScreen({
 
                 <div className="product-card-footer">
                   <span className="product-price-tag">
-                    {formatMoney(product.priceMinor)}
+                    {formatMoney(productDisplayPriceMinor(product))}
                     <small className="product-price-currency">
-                      {product.unitKind === "WEIGHT" ? " / كجم" : ""}
+                      {product.unitKind === "WEIGHT" ? ` / ${productUnitLabel(product)}` : ""}
                     </small>
                   </span>
 
@@ -2053,7 +2955,7 @@ function PosScreen({
         {/* ─── Cart Panel ───────────────────────────────────────── */}
         <aside className="cart">
           <div className="cart-header-top">
-            <h2>فاتورة جديدة</h2>
+            <h2>{posSessions.find((session) => session.id === activePosSessionId)?.label ?? "فاتورة جديدة"}</h2>
             <button
               type="button"
               className="cart-clear-icon-btn"
@@ -2127,14 +3029,14 @@ function PosScreen({
                   <span>المنتج</span>
                 </div>
                 {cart.map((line) => (
-                  <div className="cart-line cart-table-row" key={line.product.id}>
+                  <div className="cart-line cart-table-row" key={line.weightedLabelBarcode ?? `${line.product.id}:${cartLineSaleUnit(line)}`}>
                     <button
                       type="button"
                       className="cart-row-delete"
                       aria-label="حذف الصنف"
                       onClick={() =>
                         setCart((items) =>
-                          items.filter((item) => item.product.id !== line.product.id)
+                          items.filter((item) => line.weightedLabelBarcode ? item.weightedLabelBarcode !== line.weightedLabelBarcode : item.product.id !== line.product.id || cartLineSaleUnit(item) !== cartLineSaleUnit(line))
                         )
                       }
                     >
@@ -2145,30 +3047,48 @@ function PosScreen({
                     </button>
 
                     <span className="cart-row-total">
-                      {formatMoney(
-                        Math.round((line.product.priceMinor * line.qtyMilli) / 1000)
-                      )}
+                      {formatMoney(cartLineTotalMinor(line))}
                     </span>
 
                     <span className="cart-row-price">
-                      {formatMoney(line.product.priceMinor)}
+                      {formatMoney(cartLineUnitPriceMinor(line))}
                     </span>
 
                     <div className="cart-stepper">
                       <button
                         type="button"
                         aria-label="تقليل الكمية"
-                        onClick={() => changeCartQty(line.product, -1)}
+                        disabled={Boolean(line.weightedLabelBarcode)}
+                        onClick={() => changeCartQty(line, -1)}
                       >
                         −
                       </button>
-                      <span>
-                        {formatQty(line.qtyMilli, line.product.unitKind)}
-                      </span>
+                      {line.weightedLabelBarcode ? (
+                        <span>{productQuantityLabel(line.product, line.qtyMilli)}</span>
+                      ) : (
+                        <label className="cart-quantity-input-wrap">
+                          <input
+                            aria-label={`الكمية المباعة من ${line.product.nameAr}`}
+                            value={cartQuantityDrafts[cartLineKey(line)] ?? cartLineQuantityText(line)}
+                            inputMode={line.product.unitKind === "WEIGHT" && !isSmallMeasuredUnit(line.product.weightUnit) ? "decimal" : "numeric"}
+                            dir="ltr"
+                            onChange={(event) => setCartQuantityDrafts((current) => ({ ...current, [cartLineKey(line)]: event.target.value }))}
+                            onBlur={(event) => commitManualCartQuantity(line, event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                event.currentTarget.blur();
+                              }
+                            }}
+                          />
+                          <small>{cartLineQuantityUnit(line)}</small>
+                        </label>
+                      )}
                       <button
                         type="button"
                         aria-label="زيادة الكمية"
-                        onClick={() => changeCartQty(line.product, 1)}
+                        disabled={Boolean(line.weightedLabelBarcode)}
+                        onClick={() => changeCartQty(line, 1)}
                       >
                         +
                       </button>
@@ -2185,7 +3105,7 @@ function PosScreen({
                           }}
                         />
                       ) : null}
-                      <b>{line.product.nameAr}</b>
+                      <b>{line.product.nameAr}{cartLineSaleUnit(line) === "PACKAGE" ? " — عبوة كاملة" : cartLineSaleUnit(line) === "CARTON" ? " — كرتونة كاملة" : ""}</b>
                     </div>
                   </div>
                 ))}
@@ -2364,7 +3284,13 @@ function PosScreen({
                 onClick={() => {
                   const barcode = pendingScan;
                   setPendingScan("");
-                  onPurchaseScan(barcode);
+                  if (products.some((product) => product.barcodes.includes(barcode))) {
+                    onPurchaseScan(barcode);
+                  } else if (/^\d+$/.test(barcode)) {
+                    setNewProductBarcode(barcode);
+                  } else {
+                    setNewProductName(barcode);
+                  }
                 }}
               >
                 إدخال / استلام سلع
@@ -2398,7 +3324,7 @@ function PosScreen({
               <button
                 className="primary"
                 onClick={() => {
-                  onUnregisteredBarcode(unknownBarcode);
+                  setNewProductBarcode(unknownBarcode);
                   setUnknownBarcode("");
                 }}
               >
@@ -2408,31 +3334,88 @@ function PosScreen({
           </section>
         </div>
       )}
+      {(newProductBarcode || newProductName) && (
+        <ProductCreateModal
+          barcode={newProductBarcode || undefined}
+          initialName={newProductName}
+          products={products}
+          refresh={refreshProducts}
+          canViewCost={canViewCost}
+          title="إضافة صنف جديد داخل نقطة البيع"
+          description={newProductBarcode
+            ? <>الباركود <b dir="ltr">{newProductBarcode}</b> غير مسجل. أتمم نفس بطاقة إضافة الصنف هنا، ثم سيُضاف الصنف مباشرةً إلى سلة البيع دون مغادرة نقطة البيع.</>
+            : <>أكمل بيانات الصنف «{newProductName}» هنا، ثم سيُضاف إلى مسار البيع الحالي دون مغادرة نقطة البيع.</>}
+          onClose={() => { setNewProductBarcode(""); setNewProductName(""); }}
+          onCreated={async ({ product }) => {
+            setNewProductBarcode("");
+            setNewProductName("");
+            setNotice(`تم حفظ «${product.nameAr}» وإضافته إلى مسار البيع الحالي.`);
+            add(product);
+          }}
+        />
+      )}
+      {quickSaleProductOpen && (
+        <div className="modal-backdrop">
+          <form className="modal quick-sale-product-modal" onSubmit={createQuickSaleProduct}>
+            <h2>⚡ صنف سريع داخل الفاتورة</h2>
+            <p className="hint">اكتب الاسم والسعر فقط. هذا بند مؤقت للفاتورة الحالية ولن يُحفظ في الأصناف أو المخزون.</p>
+            {quickSaleProductError && <p className="notice warning">{quickSaleProductError}</p>}
+            <Field label="اسم الصنف"><input name="nameAr" autoFocus required placeholder="مثال: جبنة رومي" /></Field>
+            <Field label="سعر البيع بالجنيه"><input name="price" required min="0.01" inputMode="decimal" dir="ltr" placeholder="مثال: 50" /></Field>
+            <p className="hint">يُسجل كبند واحد بسعره النهائي؛ لا يخصم من المخزون ولا ينشئ باركوداً أو صنفاً جديداً.</p>
+            <div className="modal-actions">
+              <button type="button" disabled={quickSaleProductSaving} onClick={() => setQuickSaleProductOpen(false)}>إلغاء</button>
+              <button className="primary" disabled={quickSaleProductSaving}>{quickSaleProductSaving ? "جارٍ الإضافة…" : "إضافة للفاتورة"}</button>
+            </div>
+          </form>
+        </div>
+      )}
       {weightTarget && (
         <div className="modal-backdrop">
-          <form className="modal" onSubmit={confirmWeight}>
-            <h2>كمية موزونة</h2>
+          <form className="modal weight-sale-modal" onSubmit={confirmWeight}>
+            <h2>⚖️ بيع منتج بالوزن</h2>
             <p className="hint">
-              {weightTarget.nameAr} — أدخل الكمية بالكيلو حتى 0.001.
+              <b>{weightTarget.nameAr}</b> — اكتب المبلغ النهائي الذي استلمته من العميل؛ يُسجّل في الفاتورة كما هو بالضبط ويُستخرج الوزن تلقائيًا لخصم المخزون.
             </p>
-            <Field label="الكمية بالكيلو">
+            <Field label="السعر النهائي بالجنيه">
               <input
-                aria-label="كمية بالكيلو"
-                value={weightInput}
-                onChange={(event) => setWeightInput(event.target.value)}
+                aria-label="إجمالي سعر المنتج الموزون"
+                value={weightTotalInput}
+                onChange={(event) => setWeightTotalInput(event.target.value)}
                 inputMode="decimal"
                 dir="ltr"
+                placeholder="مثال: 50"
                 autoFocus
                 required
               />
             </Field>
+            <section className={`weight-sale-preview${weightPreview && !weightPreview.enoughStock ? " insufficient" : ""}`} aria-live="polite">
+              {weightPreview ? <>
+                <span>السعر الذي سيُسجل في الفاتورة</span><b>{formatMoney(weightPreview.totalMinor)}</b>
+                <small>{weightPreview.enoughStock
+                  ? `سيُخصم تقديريًا ${productQuantityLabel(weightTarget, weightPreview.qtyMilli)} من المخزون. بعد اعتماد الفاتورة سيبقى ${productQuantityLabel(weightTarget, weightPreview.remainingQtyMilli)}.`
+                  : `المتاح حاليًا ${productQuantityLabel(weightTarget)} فقط؛ خفّض الوزن المطلوب.`}</small>
+              </> : <small>أدخل سعرًا صحيحًا لعرض الوزن والرصيد المتبقي.</small>}
+            </section>
             <div className="modal-actions">
               <button type="button" onClick={() => setWeightTarget(null)}>
                 إلغاء
               </button>
-              <button className="primary">إضافة للسلة</button>
+              <button className="primary" disabled={!weightPreview || !weightPreview.enoughStock}>إضافة للسلة</button>
             </div>
           </form>
+        </div>
+      )}
+      {packageTarget && (packageTarget.retailPackage || (packageTarget.cartonPriceMinor && packageTarget.purchasePackSize >= 2)) && (
+        <div className="modal-backdrop">
+          <div className="modal form-grid" role="dialog" aria-modal="true" aria-labelledby="pos-package-sale-title">
+            <h2 id="pos-package-sale-title" className="full">طريقة بيع الصنف</h2>
+            <p className="hint full">اختر ما تم بيعه من «{packageTarget.nameAr}». يظل الرصيد محسوباً بعدد الأكياس أو القطع الفعلية.</p>
+            {packageTarget.cartonPriceMinor && packageTarget.purchasePackSize >= 2 && <button type="button" className="primary full" onClick={() => choosePackageSale("CARTON")}>كرتونة كاملة ({packageTarget.purchasePackSize} {packageTarget.cartonContentsUnit === "BAG" ? "كيس" : "قطعة"}) — {formatMoney(packageTarget.cartonPriceMinor)}</button>}
+            {packageTarget.retailPackage && <button type="button" className={packageTarget.cartonPriceMinor ? "full" : "primary full"} onClick={() => choosePackageSale("PACKAGE")}>{retailPackageLabel(packageTarget)} كامل ({packageTarget.retailPackage.unitsPerPackage} {packageTarget.retailPackage.contentsUnit === "BAG" ? "كيس" : "قطعة"}) — {formatMoney(packageTarget.retailPackage.packagePriceMinor)}</button>}
+            <button type="button" className="full" onClick={() => choosePackageSale("UNIT")}>{(packageTarget.retailPackage?.contentsUnit ?? packageTarget.cartonContentsUnit) === "BAG" ? "كيس فرط" : "قطعة فرط"} — {formatMoney(packageTarget.priceMinor)}</button>
+            <div className="modal-actions full"><button type="button" onClick={closePackageSaleChoice}>إلغاء</button></div>
+          </div>
         </div>
       )}
       {dialog && (
@@ -2447,7 +3430,10 @@ function PosScreen({
                 type="button"
                 disabled={salePosting}
                 className={dialog.method === "CASH" ? "selected" : ""}
-                onClick={() => setDialog({ ...dialog, method: "CASH" })}
+                onClick={() => {
+                  setCashReceived((dialog.quote.totalMinor / 100).toFixed(2));
+                  setDialog({ ...dialog, method: "CASH" });
+                }}
               >
                 نقدي
               </button>
@@ -2458,6 +3444,22 @@ function PosScreen({
                 onClick={() => setDialog({ ...dialog, method: "CARD" })}
               >
                 بطاقة
+              </button>
+              <button
+                type="button"
+                disabled={salePosting}
+                className={dialog.method === "KASHIER_POS_CARD" ? "selected" : ""}
+                onClick={() => { setElectronicIntent(null); setDialog({ ...dialog, method: "KASHIER_POS_CARD" }); }}
+              >
+                Kashier POS
+              </button>
+              <button
+                type="button"
+                disabled={salePosting}
+                className={dialog.method === "FAWRY_REFERENCE" ? "selected" : ""}
+                onClick={() => { setElectronicIntent(null); setDialog({ ...dialog, method: "FAWRY_REFERENCE" }); }}
+              >
+                فوري
               </button>
               <button
                 type="button"
@@ -2477,15 +3479,37 @@ function PosScreen({
               </button>
             </div>
             {dialog.method === "CASH" && (
-              <Field label="المبلغ المستلم">
-                <input
-                  name="received"
-                  defaultValue={(dialog.quote.totalMinor / 100).toFixed(2)}
-                  inputMode="decimal"
-                  dir="ltr"
-                  required
-                />
-              </Field>
+              <>
+                <Field label="المبلغ المستلم">
+                  <input
+                    name="received"
+                    value={cashReceived}
+                    onChange={(event) => setCashReceived(event.target.value)}
+                    inputMode="decimal"
+                    dir="ltr"
+                    aria-describedby="cash-change-helper"
+                    required
+                  />
+                </Field>
+                <div
+                  id="cash-change-helper"
+                  className={`cash-change-helper ${cashChangeMinor !== null && cashChangeMinor < 0 ? "cash-change-short" : ""}`}
+                  role="status"
+                >
+                  {cashChangeMinor !== null && cashChangeMinor >= 0 ? (
+                    <>
+                      <span>الباقي للعميل</span>
+                      <b>{formatMoney(cashChangeMinor)}</b>
+                    </>
+                  ) : (
+                    <>
+                      <span>المتبقي على العميل</span>
+                      <b>{formatMoney(Math.abs(cashChangeMinor ?? 0))}</b>
+                    </>
+                  )}
+                  <small>مساعدة للحساب فقط؛ لا يُضاف كبند أو قيمة إلى الفاتورة.</small>
+                </div>
+              </>
             )}
             {dialog.method === "MIXED" && (
               <Field label="الجزء النقدي">
@@ -2513,11 +3537,47 @@ function PosScreen({
                 />
               </Field>
             )}
+            {dialog.method === "FAWRY_REFERENCE" && (
+              <div className="payment-provider-status">
+                <b>دفع فوري برقم مرجعي</b>
+                <p>ينشئ البرنامج رقمًا مرجعيًا من فوري؛ لا تُسجل الفاتورة قبل أن يتحقق البرنامج من السداد.</p>
+                {!electronicIntent && <div className="two-columns">
+                  <Field label="اسم العميل (اختياري)"><input name="fawryCustomerName" autoComplete="name" /></Field>
+                  <Field label="هاتف العميل"><input name="fawryCustomerMobile" inputMode="numeric" pattern="01[0-9]{9}" placeholder="01xxxxxxxxx" required /></Field>
+                  <Field label="بريد العميل"><input name="fawryCustomerEmail" type="email" placeholder="name@example.com" required /></Field>
+                </div>}
+                {electronicIntent && <p dir="ltr">{electronicIntent.merchantOrderId} — {electronicIntent.status}{electronicIntent.deviceSerialNo ? ` — ${electronicIntent.deviceSerialNo}` : ""}</p>}
+                {electronicIntent && electronicIntent.status !== "SUCCEEDED" && (
+                  <button type="button" onClick={() => void verifyElectronicPayment()} disabled={salePosting}>تحقق من حالة الدفع</button>
+                )}
+              </div>
+            )}
+            {dialog.method === "KASHIER_POS_CARD" && (
+              <div className="payment-provider-status">
+                <b>دفع بالبطاقة أو NFC عبر ماكينة Kashier</b>
+                <p>سيُرسل إجمالي الفاتورة إلى الماكينة المربوطة بهذه النقطة. لا تُسجل الفاتورة قبل وصول التأكيد الموثوق من Kashier.</p>
+                {electronicIntent && <p dir="ltr">{electronicIntent.merchantOrderId} — {electronicIntent.status}{electronicIntent.deviceSerialNo ? ` — ${electronicIntent.deviceSerialNo}` : ""}</p>}
+                {electronicIntent && electronicIntent.status !== "SUCCEEDED" && <button type="button" onClick={() => void verifyElectronicPayment()} disabled={salePosting}>تحقق من حالة الدفع</button>}
+              </div>
+            )}
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                name="printReceipt"
+                defaultChecked={hardware.autoPrintReceipt && Boolean(hardware.receiptPrinterName)}
+                disabled={salePosting || !hardware.receiptPrinterName}
+              />
+              <span>
+                طباعة إيصال للعميل بعد إتمام البيع
+                {!hardware.receiptPrinterName && " — اختر طابعة إيصالات أولًا"}
+              </span>
+            </label>
+            <p className="hint">يمكن إنهاء هذه الفاتورة بدون ورق؛ تظل مسجلة ويمكن طباعتها لاحقًا من الفواتير.</p>
             <p className="hint">
               البطاقة هنا تسجيل محاسبي فقط؛ والآجل يخضع لحد ائتمان العميل.
             </p>
             <div className="modal-actions">
-              <button type="button" disabled={salePosting} onClick={() => setDialog(null)}>
+              <button type="button" disabled={salePosting} onClick={() => { setCashReceived(""); setDialog(null); }}>
                 إلغاء
               </button>
               <button className="primary" disabled={salePosting}>
@@ -2556,6 +3616,129 @@ function PosScreen({
   );
 }
 
+function WeightLabelsScreen({
+  products,
+}: {
+  products: CatalogProduct[];
+}): ReactNode {
+  const [weightedProducts, setWeightedProducts] = useState<CatalogProduct[]>(() =>
+    products.filter((product) => product.unitKind === "WEIGHT"),
+  );
+  const [loadingProducts, setLoadingProducts] = useState(true);
+  const [productId, setProductId] = useState("");
+  const [mode, setMode] = useState<"AMOUNT" | "QUANTITY">("AMOUNT");
+  const [value, setValue] = useState("");
+  const [labels, setLabels] = useState<WeightedLabelResult[]>([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const product = weightedProducts.find((item) => item.id === productId);
+
+  const loadWeightedProducts = useCallback(async () => {
+    try {
+      setLoadingProducts(true);
+      const all: CatalogProduct[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await invoke<CatalogPage>({
+          operation: "catalog.list",
+          payload: { unitKind: "WEIGHT", limit: 200, ...(cursor ? { cursor } : {}) },
+        });
+        all.push(...page.products);
+        cursor = page.nextCursor;
+      } while (cursor);
+      setWeightedProducts(all);
+    } catch (cause) {
+      setWeightedProducts(products.filter((item) => item.unitKind === "WEIGHT"));
+      setMessage(errorMessage(cause));
+    } finally {
+      setLoadingProducts(false);
+    }
+  }, [products]);
+
+  useEffect(() => {
+    void loadWeightedProducts();
+  }, [loadWeightedProducts]);
+
+  const loadLabels = useCallback(async (nextProductId?: string) => {
+    try {
+      const result = await invoke<{ labels: WeightedLabelResult[] }>({ operation: "weighted-labels.list", payload: nextProductId ? { productId: nextProductId } : {} });
+      setLabels(result.labels);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }, []);
+
+  useEffect(() => { void loadLabels(productId || undefined); }, [loadLabels, productId]);
+
+  async function createLabel(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!product) { setMessage("اختر صنفًا موزونًا أولاً."); return; }
+    try {
+      setBusy(true);
+      const payload = mode === "AMOUNT"
+        ? { productId: product.id, mode, amountMinor: minorFromInput(value) }
+        : { productId: product.id, mode, qtyMilli: isSmallMeasuredUnit(product.weightUnit) ? Number(value) : qtyFromInput(value) };
+      if (mode === "QUANTITY" && (!Number.isSafeInteger(payload.qtyMilli!) || payload.qtyMilli! < 1)) throw new Error(isSmallMeasuredUnit(product.weightUnit) ? `أدخل عدد ${measurementUnitLabel(product.weightUnit)} كعدد صحيح.` : "أدخل كمية صحيحة.");
+      const result = await invoke<{ label: WeightedLabelResult }>({ operation: "weighted-labels.create", payload });
+      setLabels((items) => [result.label, ...items]);
+      setValue("");
+      setMessage(`تم حفظ ملصق ${result.label.barcode}. لا يُخصم المخزون إلا عند إتمام البيع.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function printLabel(label: WeightedLabelResult): Promise<void> {
+    try {
+      setBusy(true);
+      const weightText = isSmallMeasuredUnit(label.weightUnit) ? `${label.qtyMilli} ${measurementUnitLabel(label.weightUnit)}` : `${(label.qtyMilli / 1000).toFixed(3)} ${measurementUnitLabel(label.weightUnit)}`;
+      await printProductLabel(`${label.nameAr} — ${weightText}`, label.barcode, label.totalMinor);
+      await invoke({ operation: "weighted-labels.mark-printed", payload: { barcode: label.barcode } });
+      await loadLabels(productId || undefined);
+      setMessage(`أُرسل ملصق «${label.nameAr}» للطباعة. سيظل متاحًا للطباعة مرة أخرى من هذا السجل.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <PageHead title="حاسبة الوزن والملصقات" subtitle="أنشئ ملصقًا للسائل أو العطارة أو الحلويات بحسب مبلغ العميل أو الوزن. الطباعة لا تخصم من المخزون؛ الخصم يتم عند مسح الملصق وإتمام البيع." />
+      {message && <div className="notice">{message}</div>}
+      <section className="settings-section">
+        <form className="form-grid" onSubmit={(event) => void createLabel(event)}>
+          <Field label="الصنف الموزون">
+            <SearchableSelect value={productId} onChange={setProductId} options={weightedProducts.map((item) => ({ value: item.id, label: `${item.nameAr} — ${formatMoney(productDisplayPriceMinor(item))} / ${productUnitLabel(item)}`, searchText: `${item.category} ${item.barcodes.join(" ")}` }))} placeholder={loadingProducts ? "جارٍ تحميل أصناف الكيلو والجرام واللتر والملليلتر…" : "ابحث باسم الصنف أو التصنيف أو الباركود"} required />
+          </Field>
+          <Field label="طريقة الحساب">
+            <select value={mode} onChange={(event) => setMode(event.target.value as "AMOUNT" | "QUANTITY")}>
+              <option value="AMOUNT">العميل يريد بمبلغ</option>
+              <option value="QUANTITY">أدخل الوزن مباشرة</option>
+            </select>
+          </Field>
+          <Field label={mode === "AMOUNT" ? "مبلغ العميل بالجنيه" : `الكمية بـ${product ? measurementUnitLabel(product.weightUnit) : "الوحدة"}`}>
+            <input value={value} onChange={(event) => setValue(event.target.value)} required autoFocus inputMode={mode === "AMOUNT" || !product || !isSmallMeasuredUnit(product.weightUnit) ? "decimal" : "numeric"} dir="ltr" placeholder={mode === "AMOUNT" ? "مثال: 100.00" : product && isSmallMeasuredUnit(product.weightUnit) ? "مثال: 250" : "مثال: 0.250"} />
+          </Field>
+          <div className="field full hint">{loadingProducts ? "يتم تحميل الأصناف الموزونة والسائلة من الخادم مباشرةً؛ لن يقتصر البحث على أول 60 صنفًا." : product ? `السعر الحالي: ${formatMoney(productDisplayPriceMinor(product))} لكل ${productUnitLabel(product)}. الرصيد: ${productQuantityLabel(product)}.` : weightedProducts.length ? "اكتب في البحث أو اختر صنفًا بالوزن أو السائل لتظهر طريقة الحساب والرصيد." : "لا توجد أصناف مسجلة للبيع بالكيلو أو الجرام أو اللتر أو الملليلتر بعد."}</div>
+          <div className="modal-actions full"><button className="primary" disabled={busy || !product}>حفظ ملصق وزن جديد</button></div>
+        </form>
+      </section>
+      <section className="settings-section">
+        <h2>الملصقات المحفوظة</h2>
+        <p className="hint">يمكنك إعادة الطباعة في أي وقت. الملصق الذي تم بيعه يظهر كمسجل ولا يمكن بيعه مرتين.</p>
+        <div className="table-wrap"><table><thead><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الباركود</th><th>الحالة</th><th></th></tr></thead><tbody>
+          {labels.map((label) => <tr key={label.barcode}><td>{label.nameAr}</td><td>{isSmallMeasuredUnit(label.weightUnit) ? `${label.qtyMilli} ${measurementUnitLabel(label.weightUnit)}` : `${(label.qtyMilli / 1000).toFixed(3)} ${measurementUnitLabel(label.weightUnit)}`}</td><td>{formatMoney(label.totalMinor)}</td><td className="ltr">{label.barcode}</td><td>{label.usedAt ? "تم البيع" : `جاهز للطباعة — ${label.printCount} مرة`}</td><td><button type="button" disabled={busy} onClick={() => void printLabel(label)}>طباعة</button></td></tr>)}
+          {labels.length === 0 && <tr><td colSpan={6}>لا توجد ملصقات محفوظة لهذا الصنف.</td></tr>}
+        </tbody></table></div>
+      </section>
+    </>
+  );
+}
+
 function ProductsScreen({
   products,
   refresh,
@@ -2563,6 +3746,11 @@ function ProductsScreen({
   clearSuggestedBarcode = () => undefined,
   canViewCost = false,
   canExport = false,
+  editProductQuery = "",
+  clearEditProductQuery = () => undefined,
+  scannedProductQuery = "",
+  clearScannedProductQuery = () => undefined,
+  onEditProductByQuery = () => undefined,
   onProductCreated = (barcode: string) =>
     window.dispatchEvent(
       new CustomEvent("nabta:receipt-product-created", { detail: barcode }),
@@ -2574,18 +3762,37 @@ function ProductsScreen({
   clearSuggestedBarcode?: () => void;
   canViewCost?: boolean;
   canExport?: boolean;
+  editProductQuery?: string;
+  clearEditProductQuery?: () => void;
+  scannedProductQuery?: string;
+  clearScannedProductQuery?: () => void;
+  onEditProductByQuery?: (query: string) => void;
   onProductCreated?: (barcode: string) => void;
 }): ReactNode {
   const [show, setShow] = useState(false);
+  const [newProductMode, setNewProductMode] = useState<ProductCreationMode>("PIECE");
   const [message, setMessage] = useState("");
   const [barcode, setBarcode] = useState("");
   const [productQuery, setProductQuery] = useState("");
   const [searchResults, setSearchResults] = useState<CatalogProduct[]>(products);
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  const [availabilityFilter, setAvailabilityFilter] = useState<"ALL" | "IN_STOCK" | "LOW_STOCK" | "OUT_OF_STOCK">("ALL");
+  const [unitFilter, setUnitFilter] = useState<"ALL" | "PIECE" | "WEIGHT">("ALL");
+  const [categoryFilter, setCategoryFilter] = useState("ALL");
+  const [minimumStock, setMinimumStock] = useState("");
+  const [maximumPrice, setMaximumPrice] = useState("");
+  const [reviewQueue, setReviewQueue] = useState<CatalogProduct[] | null>(null);
+  const [reviewIndex, setReviewIndex] = useState(0);
+  const [reviewLoading, setReviewLoading] = useState(false);
   const [resultsPage, setResultsPage] = useState(0);
   const [isSearching, setIsSearching] = useState(false);
   const [quickRestockProduct, setQuickRestockProduct] =
     useState<CatalogProduct | null>(null);
+  const [quickUpdateProduct, setQuickUpdateProduct] = useState<CatalogProduct | null>(null);
+  const [quickSaleUnit, setQuickSaleUnit] = useState<"PIECE" | "PACK" | "BAG" | "KILOGRAM">("PIECE");
   const [editingProduct, setEditingProduct] = useState<CatalogProduct | null>(null);
+  const [cartonConversionProduct, setCartonConversionProduct] = useState<CatalogProduct | null>(null);
+  const [editingMode, setEditingMode] = useState<ProductCreationMode>("PIECE");
   const [labelPrintProduct, setLabelPrintProduct] = useState<CatalogProduct | null>(null);
   const [productMenu, setProductMenu] = useState<{
     product: CatalogProduct;
@@ -2593,6 +3800,10 @@ function ProductsScreen({
     y: number;
   } | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
+  const productSearchRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (editingProduct) setEditingMode(productEditorMode(editingProduct));
+  }, [editingProduct]);
   useEffect(() => {
     if (!productMenu) return;
     const close = () => setProductMenu(null);
@@ -2603,6 +3814,45 @@ function ProductsScreen({
       window.removeEventListener("blur", close);
     };
   }, [productMenu]);
+  useEffect(() => {
+    function shortcut(event: KeyboardEvent): void {
+      if (event.key === "F2") {
+        event.preventDefault();
+        productSearchRef.current?.focus();
+      } else if ((event.key === "F7" || event.code === "F7") && !editingProduct && !quickUpdateProduct) {
+        const target = event.target as HTMLElement | null;
+        if (target?.tagName === "INPUT" && target !== productSearchRef.current) return;
+        event.preventDefault();
+        openQuickProductUpdate();
+      }
+    }
+    window.addEventListener("keydown", shortcut, true);
+    return () => window.removeEventListener("keydown", shortcut, true);
+  }, [editingProduct, quickUpdateProduct, productQuery, searchResults]);
+  useEffect(() => {
+    const barcode = scannedProductQuery.trim();
+    if (!barcode) return;
+    setProductQuery(barcode);
+    window.setTimeout(() => productSearchRef.current?.focus(), 0);
+    clearScannedProductQuery();
+  }, [clearScannedProductQuery, scannedProductQuery]);
+  useEffect(() => {
+    const query = editProductQuery.trim();
+    if (!query) return;
+    setProductQuery(query);
+    void invoke<{ products: CatalogProduct[] }>({
+      operation: "catalog.list",
+      payload: { query, limit: 10 },
+    })
+      .then((result) => {
+        const exact = result.products.find((product) => product.barcodes.includes(query));
+        const candidate = exact ?? (result.products.length === 1 ? result.products[0] : undefined);
+        if (candidate) setEditingProduct(candidate);
+        else setMessage("لم نتمكن من تحديد صنف واحد للتعديل. امسح الباركود كاملاً ثم اضغط F3.");
+      })
+      .catch((cause) => setMessage(errorMessage(cause)))
+      .finally(clearEditProductQuery);
+  }, [clearEditProductQuery, editProductQuery]);
   useEffect(() => {
     const query = productQuery.trim();
     if (!query) {
@@ -2632,25 +3882,143 @@ function ProductsScreen({
       window.clearTimeout(timer);
     };
   }, [productQuery, products]);
-  useEffect(() => setResultsPage(0), [productQuery, products]);
+  useEffect(() => setResultsPage(0), [availabilityFilter, categoryFilter, maximumPrice, minimumStock, productQuery, products, unitFilter]);
+  const productCategories = useMemo(
+    () => [...new Set([...products, ...searchResults].map((product) => product.category))].sort((a, b) => a.localeCompare(b, "ar")),
+    [products, searchResults],
+  );
+  const filteredSearchResults = useMemo(() => {
+    const minStockMilli = minimumStock.trim() ? qtyFromInput(minimumStock) : null;
+    const maxPriceMinor = maximumPrice.trim() ? minorFromInput(maximumPrice) : null;
+    return searchResults.filter((product) => {
+      if (categoryFilter !== "ALL" && product.category !== categoryFilter) return false;
+      if (unitFilter !== "ALL" && product.unitKind !== unitFilter) return false;
+      if (availabilityFilter === "IN_STOCK" && product.availableQtyMilli <= 0) return false;
+      if (availabilityFilter === "OUT_OF_STOCK" && product.availableQtyMilli > 0) return false;
+      if (availabilityFilter === "LOW_STOCK" && !(product.reorderLevelMilli > 0 && product.availableQtyMilli > 0 && product.availableQtyMilli <= product.reorderLevelMilli)) return false;
+      if (minStockMilli !== null && product.availableQtyMilli < minStockMilli) return false;
+      if (maxPriceMinor !== null && productDisplayPriceMinor(product) > maxPriceMinor) return false;
+      return true;
+    }).sort((left, right) => {
+      const stockOrder = Number(right.availableQtyMilli > 0) - Number(left.availableQtyMilli > 0);
+      if (stockOrder !== 0) return stockOrder;
+      return left.nameAr.localeCompare(right.nameAr, "ar-EG");
+    });
+  }, [availabilityFilter, categoryFilter, maximumPrice, minimumStock, searchResults, unitFilter]);
   const searchResultsPageCount = Math.max(
     1,
-    Math.ceil(searchResults.length / PRODUCTS_TABLE_PAGE_SIZE),
+    Math.ceil(filteredSearchResults.length / PRODUCTS_TABLE_PAGE_SIZE),
   );
   const activeResultsPage = Math.min(resultsPage, searchResultsPageCount - 1);
-  const displayedSearchResults = searchResults.slice(
+  const displayedSearchResults = filteredSearchResults.slice(
     activeResultsPage * PRODUCTS_TABLE_PAGE_SIZE,
     (activeResultsPage + 1) * PRODUCTS_TABLE_PAGE_SIZE,
   );
+  const productsNeedingNumericBarcode = useMemo(
+    () => filteredSearchResults.filter((product) => !hasScannerNumericBarcode(product.barcodes)),
+    [filteredSearchResults],
+  );
+
+  function resetAdvancedFilters(): void {
+    setAvailabilityFilter("ALL");
+    setUnitFilter("ALL");
+    setCategoryFilter("ALL");
+    setMinimumStock("");
+    setMaximumPrice("");
+  }
+
+  async function startAvailableReview(): Promise<void> {
+    try {
+      setReviewLoading(true);
+      const all: CatalogProduct[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await invoke<CatalogPage>({ operation: "catalog.list", payload: { limit: 200, ...(cursor ? { cursor } : {}) } });
+        all.push(...page.products);
+        cursor = page.nextCursor;
+      } while (cursor);
+      const available = all.filter((product) => product.availableQtyMilli > 0);
+      if (available.length === 0) {
+        setMessage("لا توجد أصناف متوفرة لمراجعتها الآن.");
+        return;
+      }
+      setReviewQueue(available);
+      setReviewIndex(0);
+      setEditingProduct(available[0]!);
+      setMessage(`بدأت مراجعة ${available.length} صنف متوفر. بعد الحفظ ينتقل النموذج تلقائيًا للصنف التالي.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setReviewLoading(false);
+    }
+  }
+
+  function openQuickProductUpdate(explicitProduct?: CatalogProduct): void {
+    const query = productQuery.trim();
+    const exact = searchResults.find((product) => product.barcodes.includes(query));
+    const product = explicitProduct ?? exact ?? (searchResults.length === 1 ? searchResults[0] : undefined);
+    if (!product) {
+      setMessage("ابحث بباركود كامل أو بنتيجة واحدة، ثم اضغط F7 للتعديل السريع.");
+      return;
+    }
+    setQuickSaleUnit(product.unitKind === "WEIGHT" ? "KILOGRAM" : "PIECE");
+    setQuickUpdateProduct(product);
+  }
+
+  async function quickUpdateProductStock(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!quickUpdateProduct) return;
+    const data = new FormData(event.currentTarget);
+    try {
+      const quantityText = String(data.get("quantity") ?? "").trim();
+      const qtyMilli = quickUpdateProduct.unitKind === "WEIGHT"
+        ? qtyFromInput(quantityText)
+        : Number(quantityText) * 1000;
+      if (!Number.isSafeInteger(qtyMilli) || qtyMilli < 0 ||
+        (quickUpdateProduct.unitKind === "PIECE" && !Number.isInteger(Number(quantityText)))) {
+        throw new Error(quickUpdateProduct.unitKind === "WEIGHT" ? "أدخل كمية بالكيلو صحيحة." : "أدخل عددًا صحيحًا من الوحدات.");
+      }
+      const totalWholesaleMinor = minorFromInput(String(data.get("totalWholesale") ?? ""));
+      const priceMinor = minorFromInput(String(data.get("retailPrice") ?? ""));
+      if (qtyMilli <= 0 || totalWholesaleMinor <= 0 || priceMinor <= 0)
+        throw new Error("أدخل إجمالي الجملة والكمية وسعر البيع بقيم أكبر من صفر.");
+      const unitWholesaleMinor = Math.floor((totalWholesaleMinor * 1000) / qtyMilli);
+      await invoke({
+        operation: "products.update",
+        payload: {
+          productId: quickUpdateProduct.id,
+          nameAr: quickUpdateProduct.nameAr,
+          category: quickUpdateProduct.category,
+          description: quickUpdateProduct.description,
+          priceMinor,
+          wholesalePriceMinor: unitWholesaleMinor,
+          purchasePackSize: quickUpdateProduct.purchasePackSize,
+          mergeLegacyProducts: false,
+          availableQtyMilli: qtyMilli,
+          expectedStockVersion: quickUpdateProduct.version,
+        },
+      });
+      await refresh();
+      setMessage(`تم تحديث «${quickUpdateProduct.nameAr}» بسعر بيع ${formatMoney(priceMinor)} والكمية المتاحة.`);
+      setQuickUpdateProduct(null);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
 
   async function quickRestock(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!quickRestockProduct) return;
     const data = new FormData(event.currentTarget);
     try {
-      const qtyMilli = qtyFromInput(String(data.get("quantity")));
+      const isGramProduct = quickRestockProduct.unitKind === "WEIGHT" && quickRestockProduct.weightUnit === "GRAM";
+      const qtyMilli = isGramProduct
+        ? Number(String(data.get("quantity")).trim())
+        : qtyFromInput(String(data.get("quantity")));
       if (qtyMilli <= 0)
         throw new Error("أدخل كمية أكبر من صفر");
+      if (isGramProduct && (!Number.isSafeInteger(qtyMilli) || qtyMilli <= 0))
+        throw new Error("أدخل عدد الجرامات كعدد صحيح.");
       if (
         quickRestockProduct.unitKind === "PIECE" &&
         qtyMilli % 1000 !== 0
@@ -2668,9 +4036,11 @@ function ProductsScreen({
               {
                 productId: quickRestockProduct.id,
                 qtyMilli,
-                unitCostMinor: minorFromInput(String(data.get("cost"))),
-                retailPriceMinor: minorFromInput(String(data.get("retailPrice"))),
-                ...(canViewCost ? { wholesalePriceMinor: minorFromInput(String(data.get("wholesalePrice"))) } : {}),
+                unitCostMinor: minorFromInput(String(data.get("cost"))) * (isGramProduct ? 1000 : 1),
+                entryUnit: quickRestockProduct.unitKind === "WEIGHT" ? "WEIGHT" : "PIECE",
+                costBasis: "UNIT",
+                retailPriceMinor: minorFromInput(String(data.get("retailPrice"))) * (isGramProduct ? 1000 : 1),
+                ...(canViewCost ? { wholesalePriceMinor: minorFromInput(String(data.get("wholesalePrice"))) * (isGramProduct ? 1000 : 1) } : {}),
                 lotCode: String(data.get("lot") || "").trim() || undefined,
                 expiresOn: String(data.get("expires") || "") || undefined,
               },
@@ -2685,15 +4055,76 @@ function ProductsScreen({
       setMessage(errorMessage(cause));
     }
   }
-  async function generateBarcode(): Promise<void> {
+  async function generateNumericBarcode(product: CatalogProduct): Promise<void> {
     try {
-      const result = await invoke<{
-        barcode: string;
-        symbology: string;
-        scope: string;
-      }>({ operation: "products.barcode.generate" });
-      setBarcode(result.barcode);
-      setMessage("تم توليد باركود داخلي فريد. يمكنك طباعته بعد حفظ الصنف.");
+      const generated = await invoke<{ barcode: string; symbology: string }>({
+        operation: "products.barcode.generate",
+      });
+      await invoke({
+        operation: "products.barcode.attach",
+        payload: { productId: product.id, barcode: generated.barcode },
+      });
+      await refresh();
+      setMessage(`تمت إضافة باركود رقمي EAN-13 للصنف «${product.nameAr}»: ${generated.barcode}`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+  async function configurePackaging(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!cartonConversionProduct) return;
+    const data = new FormData(event.currentTarget);
+    try {
+      const cartonCapacityText = String(data.get("cartonCapacity") || "").trim();
+      const packageCapacityText = String(data.get("packageCapacity") || "").trim();
+      const cartonPriceText = String(data.get("cartonPrice") || "").trim();
+      const packagePriceText = String(data.get("packagePrice") || "").trim();
+      const cartonEnabled = Boolean(cartonCapacityText || cartonPriceText || String(data.get("cartonBarcode") || "").trim());
+      const packageEnabled = Boolean(packageCapacityText || packagePriceText || String(data.get("packageBarcode") || "").trim());
+      const cartonCapacity = cartonEnabled ? Number(cartonCapacityText) : 1;
+      const packageCapacity = packageEnabled ? Number(packageCapacityText) : 1;
+      const cartonPriceMinor = cartonEnabled ? minorFromInput(cartonPriceText || "0") : null;
+      const packagePriceMinor = packageEnabled ? minorFromInput(packagePriceText || "0") : 0;
+      const cartonBarcode = String(data.get("cartonBarcode") || "").trim();
+      const packageBarcode = String(data.get("packageBarcode") || "").trim();
+      const unitBarcode = String(data.get("unitBarcode") || "").trim();
+      if (cartonEnabled && (!Number.isInteger(cartonCapacity) || cartonCapacity < 2)) throw new Error("سعة الكرتونة يجب أن تكون عددًا صحيحًا لا يقل عن قطعتين.");
+      if (cartonEnabled && !cartonPriceMinor) throw new Error("أدخل سعر بيع الكرتونة الكاملة أو اترك بياناتها كلها فارغة.");
+      if (packageEnabled && (!Number.isInteger(packageCapacity) || packageCapacity < 2)) throw new Error("سعة العبوة/الكيس يجب أن تكون عددًا صحيحًا لا يقل عن قطعتين.");
+      if (packageEnabled && packagePriceMinor <= 0) throw new Error("أدخل سعر بيع العبوة/الكيس أو اترك بياناتها كلها فارغة.");
+      if (cartonEnabled && packageEnabled && packageCapacity > cartonCapacity) throw new Error("سعة الكيس لا يمكن أن تكون أكبر من سعة الكرتونة.");
+      const barcodeMappings = [
+        ...(unitBarcode ? [{ barcode: unitBarcode, saleUnit: "UNIT" as const }] : []),
+        ...(packageEnabled && packageBarcode ? [{ barcode: packageBarcode, saleUnit: "PACKAGE" as const }] : []),
+        ...(cartonEnabled && cartonBarcode ? [{ barcode: cartonBarcode, saleUnit: "CARTON" as const }] : []),
+      ];
+      await invoke({
+        operation: "products.update",
+        payload: {
+          productId: cartonConversionProduct.id,
+          nameAr: cartonConversionProduct.nameAr,
+          category: cartonConversionProduct.category,
+          description: cartonConversionProduct.description,
+          priceMinor: cartonConversionProduct.priceMinor,
+          ...(canViewCost ? { wholesalePriceMinor: cartonConversionProduct.wholesalePriceMinor ?? 0 } : {}),
+          purchasePackSize: cartonEnabled ? cartonCapacity : packageEnabled ? packageCapacity : 1,
+          cartonPriceMinor,
+          cartonContentsUnit: cartonEnabled ? String(data.get("cartonContentsUnit")) as "PIECE" | "BAG" : null,
+          retailPackage: packageEnabled ? {
+            unitsPerPackage: packageCapacity,
+            packagePriceMinor,
+            contentsUnit: String(data.get("packageContentsUnit")) as "PIECE" | "BAG",
+            label: "PACKAGE" as const,
+          } : null,
+          barcodeMappings,
+          mergeLegacyProducts: true,
+          availableQtyMilli: cartonConversionProduct.availableQtyMilli,
+          expectedStockVersion: cartonConversionProduct.version,
+        },
+      });
+      await refresh();
+      setCartonConversionProduct(null);
+      setMessage(`تم حفظ تغليف «${cartonConversionProduct.nameAr}». لم يتغير رصيد المخزون؛ أصبح البيع بالقطعة والكيس والكرتونة من نفس الرصيد.`);
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -2769,54 +4200,83 @@ function ProductsScreen({
   useEffect(() => {
     if (suggestedBarcode) {
       setBarcode(suggestedBarcode);
+      setNewProductMode("PIECE");
       setShow(true);
       void fillReference(suggestedBarcode);
     }
   }, [suggestedBarcode]);
-  useEffect(() => {
-    function scanBarcodeInForm(event: KeyboardEvent): void {
-      const target = event.target as HTMLInputElement | null;
-      if (show && event.key === "Enter" && target?.name === "barcode") {
-        event.preventDefault();
-        void fillReference(target.value);
-      }
-    }
-    document.addEventListener("keydown", scanBarcodeInForm);
-    return () => document.removeEventListener("keydown", scanBarcodeInForm);
-  }, [show]);
-  useEffect(() => {
-    if (!show) return;
-    const timer = window.setTimeout(() => {
-      const field = document
-        .querySelector<HTMLElement>(".modal input[name=barcode]")
-        ?.closest(".field");
-      if (!field || field.querySelector(".barcode-generate")) return;
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "barcode-generate";
-      button.textContent = "توليد باركود داخلي فريد";
-      const click = () => {
-        void generateBarcode();
-      };
-      button.addEventListener("click", click);
-      field.append(button);
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [show]);
   async function create(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     try {
-      const unitKind = String(data.get("unitKind")) as "PIECE" | "WEIGHT";
-      const qtyMilli = qtyFromInput(String(data.get("openingQty")));
-      const openingUnitCostMinor = minorFromInput(
-        String(data.get("openingCost")),
-      );
-      const createdBarcode = String(data.get("barcode"));
-      const priceMinor = minorFromInput(String(data.get("price")));
-      const wholesalePriceMinor = canViewCost
-        ? minorFromInput(String(data.get("wholesalePrice")))
-        : openingUnitCostMinor;
+      const isWeightedMode = newProductMode === "KILOGRAM" || newProductMode === "GRAM" || newProductMode === "LITER" || newProductMode === "MILLILITER";
+      const weightUnit = newProductMode === "GRAM" ? "GRAM" : newProductMode === "LITER" ? "LITER" : newProductMode === "MILLILITER" ? "MILLILITER" : "KILOGRAM";
+      const unitKind = isWeightedMode ? "WEIGHT" : "PIECE";
+      const cartonCount = Number(data.get("openingCartons") || 0);
+      const supportsLooseContainerStock = newProductMode === "CARTON" || newProductMode === "PLATE_CARTON";
+      const looseUnits = supportsLooseContainerStock ? Number(data.get("openingLooseUnits") || 0) : 0;
+      const looseStacks = newProductMode === "PLATE_CARTON" ? Number(data.get("openingLooseStacks") || 0) : 0;
+      const stackSize = newProductMode === "PLATE_CARTON" ? Number(data.get("stackSize") || 0) : 0;
+      const stacksPerCarton = newProductMode === "PLATE_CARTON" ? Number(data.get("stacksPerCarton") || 0) : 0;
+      const purchasePackSize = newProductMode === "CARTON" || newProductMode === "PACKAGE" || newProductMode === "PLATE_CARTON"
+        ? newProductMode === "PLATE_CARTON" ? stacksPerCarton * stackSize : Number(data.get("purchasePackSize") || 0)
+        : 1;
+      const totalContainerUnits = newProductMode === "PLATE_CARTON"
+        ? cartonCount * purchasePackSize + looseStacks * stackSize + looseUnits
+        : cartonCount * purchasePackSize + looseUnits;
+      if (newProductMode !== "PLATE_CARTON" && (newProductMode === "CARTON" || newProductMode === "PACKAGE") &&
+        (!Number.isInteger(purchasePackSize) || purchasePackSize < 1 ||
+          (supportsLooseContainerStock
+            ? (!Number.isFinite(cartonCount) || cartonCount < 0 || !Number.isInteger(cartonCount * 2) || !Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= purchasePackSize || !Number.isInteger(totalContainerUnits) || totalContainerUnits < 1)
+            : (!Number.isInteger(cartonCount) || cartonCount < 1))))
+        throw new Error("أدخل عدد الكراتين والفرط بصورة صحيحة؛ يسمح بنصف كرتونة فقط إذا كان الناتج عدد أكياس/عبوات صحيحًا، والفرط أقل من السعة.");
+      if (newProductMode === "PLATE_CARTON") {
+        const stackPriceMinor = minorFromInput(String(data.get("stackPrice") || "0"));
+        if (!Number.isInteger(cartonCount) || cartonCount < 0 || !Number.isInteger(stacksPerCarton) || stacksPerCarton < 1 || !Number.isInteger(stackSize) || stackSize < 2 || !Number.isInteger(looseStacks) || looseStacks < 0 || looseStacks >= stacksPerCarton || !Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= stackSize || !Number.isSafeInteger(totalContainerUnits) || totalContainerUnits < 1 || stackPriceMinor <= 0) {
+          throw new Error("أدخل الكراتين والأعمدة والأكواب/الأطباق الفرط بصورة صحيحة. الكرتونة = عدد الأعمدة × سعة العمود.");
+        }
+      }
+      const rawWeightQty = Number(data.get("openingQty") || 0);
+      if ((newProductMode === "GRAM" || newProductMode === "MILLILITER") &&
+        (!Number.isSafeInteger(rawWeightQty) || rawWeightQty < 0))
+        throw new Error("أدخل عدد الجرامات كعدد صحيح.");
+      const qtyMilli = newProductMode === "CARTON" || newProductMode === "PACKAGE" || newProductMode === "PLATE_CARTON"
+        ? totalContainerUnits * 1000
+        : newProductMode === "GRAM" || newProductMode === "MILLILITER"
+          ? rawWeightQty
+        : qtyFromInput(String(data.get("openingQty") || "0"));
+      const cartonTotalCostMinor = newProductMode === "CARTON" || newProductMode === "PACKAGE" || newProductMode === "PLATE_CARTON"
+        ? minorFromInput(String(data.get("cartonTotalWholesale") || "0"))
+        : undefined;
+      const enteredWholesaleMinor = canViewCost
+        ? minorFromInput(String(data.get("wholesalePrice") || "0"))
+        : 0;
+      const wholesalePriceMinor = newProductMode === "CARTON" || newProductMode === "PACKAGE" || newProductMode === "PLATE_CARTON"
+        ? Math.floor((cartonTotalCostMinor! * 1000) / qtyMilli)
+        : newProductMode === "GRAM" || newProductMode === "MILLILITER"
+          ? enteredWholesaleMinor * 1000
+          : enteredWholesaleMinor;
+      if (qtyMilli > 0 && wholesalePriceMinor <= 0)
+        throw new Error("أدخل سعر الجملة أولاً لحفظ كمية متاحة بقيمة صحيحة.");
+      const requestedBarcode = String(data.get("unitBarcode") ?? barcode).trim();
+      const generatedBarcode = requestedBarcode
+        ? undefined
+        : await invoke<{ barcode: string; symbology: string }>({ operation: "products.barcode.generate" });
+      const createdBarcode = requestedBarcode || generatedBarcode!.barcode;
+      const packageBarcode = String(data.get("packageBarcode") ?? "").trim();
+      const cartonBarcode = String(data.get("cartonBarcode") ?? "").trim();
+      const cartonPriceMinor = newProductMode === "CARTON" || newProductMode === "PLATE_CARTON"
+        ? (() => { const value = minorFromInput(String(data.get("cartonPrice") || "0")); return value > 0 ? value : undefined; })()
+        : undefined;
+      const barcodeMappings = [
+        ...(createdBarcode !== packageBarcode && (createdBarcode !== cartonBarcode || !cartonPriceMinor) ? [{ barcode: createdBarcode, saleUnit: "UNIT" as const }] : []),
+        ...(packageBarcode ? [{ barcode: packageBarcode, saleUnit: "PACKAGE" as const }] : []),
+        ...(cartonBarcode && cartonPriceMinor ? [{ barcode: cartonBarcode, saleUnit: "CARTON" as const }] : []),
+      ];
+      const enteredPriceMinor = minorFromInput(String(data.get(newProductMode === "CARTON" || newProductMode === "PLATE_CARTON" ? "piecePrice" : newProductMode === "PACKAGE" ? "unitPrice" : "price")));
+      const priceMinor = newProductMode === "GRAM" || newProductMode === "MILLILITER"
+        ? enteredPriceMinor * 1000
+        : enteredPriceMinor;
       const nameAr = String(data.get("nameAr"));
       await invoke({
         operation: "products.create",
@@ -2824,29 +4284,29 @@ function ProductsScreen({
           nameAr,
           category: String(data.get("category")),
           unitKind,
+          weightUnit,
           priceMinor,
           wholesalePriceMinor,
-          reorderLevelMilli: qtyFromInput(String(data.get("reorder"))),
-          barcodes: [createdBarcode],
+          purchasePackSize,
+          ...(newProductMode === "PACKAGE" ? { retailPackage: { unitsPerPackage: purchasePackSize, packagePriceMinor: minorFromInput(String(data.get("packagePrice") || "")), contentsUnit: String(data.get("packageContentsUnit")) as "PIECE" | "BAG", label: String(data.get("packageLabel")) as "PACKAGE" | "PACKET" } } : {}),
+          ...(newProductMode === "PLATE_CARTON" ? { retailPackage: { unitsPerPackage: stackSize, packagePriceMinor: minorFromInput(String(data.get("stackPrice") || "0")), contentsUnit: "PIECE" as const, label: "STACK" as const } } : {}),
+          ...(cartonPriceMinor !== undefined ? { cartonPriceMinor } : {}),
+          ...(newProductMode === "CARTON" || newProductMode === "PLATE_CARTON" ? { cartonContentsUnit: newProductMode === "PLATE_CARTON" ? "PIECE" as const : String(data.get("cartonContentsUnit")) as "PIECE" | "BAG" } : {}),
+          reorderLevelMilli: 0,
+          barcodes: barcodeMappings.map((item) => item.barcode),
+          barcodeMappings,
           openingQtyMilli: qtyMilli,
-          openingUnitCostMinor,
+          openingUnitCostMinor: qtyMilli > 0 ? wholesalePriceMinor : 0,
+          ...(cartonTotalCostMinor !== undefined ? { openingTotalCostMinor: cartonTotalCostMinor } : {}),
         },
       });
       setShow(false);
+      setNewProductMode("PIECE");
       setBarcode("");
       clearSuggestedBarcode();
       await refresh();
-      setMessage("تم حفظ الصنف والرصيد الافتتاحي في دفتر المخزون.");
+      setMessage("تم حفظ الصنف والكمية المتاحة، وبقيت في نفس مسار العمل.");
       if (suggestedBarcode) onProductCreated(createdBarcode);
-      if (
-        createdBarcode.startsWith("NABTA-") &&
-        window.confirm(
-          "تم حفظ الباركود الداخلي. هل تريد طباعة ملصق الصنف الآن؟",
-        )
-      )
-        void printProductLabel(nameAr, createdBarcode, priceMinor).catch((cause) =>
-          setMessage(errorMessage(cause)),
-        );
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -2856,7 +4316,7 @@ function ProductsScreen({
       const query = productQuery.trim();
       const result = await invoke<{ cancelled: boolean; path?: string; itemCount: number }>({
         operation: "products.export",
-        payload: { mode, ...(query ? { query } : {}) },
+        payload: { mode, availableOnly: false, ...(query ? { query } : {}) },
       });
       setMessage(result.cancelled
         ? "تم إلغاء حفظ ملف Excel."
@@ -2865,7 +4325,25 @@ function ProductsScreen({
       setMessage(errorMessage(cause));
     }
   }
-  async function printSearchedProductLabel(product: CatalogProduct, barcodeToPrint?: string, copies = 1): Promise<void> {
+  async function exportProductSyncWorkbook(): Promise<void> {
+    try {
+      const result = await invoke<{ cancelled: boolean; path?: string; itemCount: number }>({
+        operation: "products.sync-workbook.export",
+        payload: { mode: "INTERNAL", availableOnly: false },
+      });
+      setMessage(result.cancelled
+        ? "تم إلغاء حفظ قالب التعديل."
+        : `تم حفظ قالب تعديل الأصناف (${result.itemCount} صنف). عدّل الملف ثم استورده من هنا: ${result.path}`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+  async function printSearchedProductLabel(
+    product: CatalogProduct,
+    barcodeToPrint?: string,
+    copies = 1,
+    hidePrice = shouldHidePriceOnProductLabel(product),
+  ): Promise<void> {
     const barcode = (barcodeToPrint || product.barcodes[0] || "").trim();
     if (!barcode) {
       setMessage("لا يوجد باركود لهذا الصنف لطباعة الملصق.");
@@ -2881,7 +4359,7 @@ function ProductsScreen({
         setMessage("طابعة الباركود وطابعة الإيصالات متطابقتان. اختر طابعتين مختلفتين من الإعدادات.");
         return;
       }
-      const result = await printProductLabel(product.nameAr, barcode, product.priceMinor, copies);
+      const result = await printProductLabel(product.nameAr, barcode, product.priceMinor, copies, hidePrice);
       setMessage(`أُرسل ${copies} ملصق لصنف «${product.nameAr}» بالباركود [${barcode}] إلى ${result.printerName}.`);
     } catch (cause) {
       const failure = cause as Partial<ApiFailure>;
@@ -2897,25 +4375,113 @@ function ProductsScreen({
     if (!editingProduct) return;
     const data = new FormData(event.currentTarget);
     try {
-      const availableQtyMilli = qtyFromInput(String(data.get("availableQuantity")));
+      const isPieceMode = editingProduct.unitKind === "PIECE";
+      const stackSize = editingMode === "PLATE_CARTON" ? Number(data.get("stackSize")) : 0;
+      const stacksPerCarton = editingMode === "PLATE_CARTON" ? Number(data.get("stacksPerCarton")) : 0;
+      const purchasePackSize = isPieceMode && editingMode !== "PIECE"
+        ? editingMode === "PLATE_CARTON" ? stacksPerCarton * stackSize : Number(data.get("purchasePackSize"))
+        : 1;
+      if (!Number.isInteger(purchasePackSize) || purchasePackSize < 1) {
+        throw new Error("أدخل سعة صحيحة للعبوة أو الكرتونة.");
+      }
+      const usesContainerStock = isPieceMode && editingMode !== "PIECE";
+      const availableQtyMilli = usesContainerStock
+        ? (() => {
+          const containers = Number(data.get("availableCartons"));
+          const looseUnits = Number(data.get("availableLooseUnits"));
+          const looseStacks = editingMode === "PLATE_CARTON" ? Number(data.get("availableLooseStacks")) : 0;
+          const totalUnits = editingMode === "PLATE_CARTON"
+            ? containers * purchasePackSize + looseStacks * stackSize + looseUnits
+            : containers * purchasePackSize + looseUnits;
+          const invalidFoamStock = editingMode === "PLATE_CARTON" && (!Number.isInteger(containers) || !Number.isInteger(stacksPerCarton) || stacksPerCarton < 1 || !Number.isInteger(stackSize) || stackSize < 2 || !Number.isInteger(looseStacks) || looseStacks < 0 || looseStacks >= stacksPerCarton || !Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= stackSize);
+          if (!Number.isFinite(containers) || containers < 0 || invalidFoamStock || (editingMode !== "PLATE_CARTON" && (!Number.isInteger(looseUnits) || looseUnits < 0 || looseUnits >= purchasePackSize)) || !Number.isInteger(totalUnits)) {
+            throw new Error("أدخل عدد الكراتين والفرط بصورة صحيحة؛ يسمح بنصف كرتونة فقط إذا كان الناتج عدد أكياس/عبوات صحيحًا، والفرط أقل من السعة.");
+          }
+          return totalUnits * 1000;
+        })()
+        : editingProduct.unitKind === "WEIGHT" && isSmallMeasuredUnit(editingProduct.weightUnit)
+          ? Number(String(data.get("availableQuantity")))
+          : qtyFromInput(String(data.get("availableQuantity")));
+      if (!Number.isSafeInteger(availableQtyMilli) || availableQtyMilli < 0) {
+        throw new Error(isSmallMeasuredUnit(editingProduct.weightUnit) ? `أدخل عدد ${measurementUnitLabel(editingProduct.weightUnit)} كعدد صحيح.` : "أدخل كمية صحيحة.");
+      }
       if (editingProduct.unitKind === "PIECE" && availableQtyMilli % 1000 !== 0) {
         throw new Error("كمية صنف القطعة يجب أن تكون عدداً صحيحاً");
       }
+      const usesCarton = editingMode === "CARTON" || editingMode === "PLATE_CARTON";
+      const enteredCartonPriceMinor = minorFromInput(String(data.get("cartonPrice") || "0"));
+      const cartonPriceMinor = isPieceMode ? (usesCarton ? (enteredCartonPriceMinor > 0 ? enteredCartonPriceMinor : null) : null) : undefined;
+      const cartonContentsUnit = isPieceMode ? (usesCarton ? (editingMode === "PLATE_CARTON" ? "PIECE" : String(data.get("cartonContentsUnit")) as "PIECE" | "BAG") : null) : undefined;
+      if (usesCarton && purchasePackSize < 2) {
+        throw new Error("أدخل سعة كرتونة لا تقل عن 2.");
+      }
+      const retailPackage = editingMode === "PACKAGE"
+        ? {
+          unitsPerPackage: purchasePackSize,
+          packagePriceMinor: minorFromInput(String(data.get("packagePrice"))),
+          contentsUnit: String(data.get("packageContentsUnit")) as "PIECE" | "BAG",
+          // Older package records did not have a label selector in the edit
+          // form.  Keep them editable by falling back to their stored label
+          // (and then to the normal package label) instead of sending
+          // `"null"` to the API schema.
+          label: (String(data.get("packageLabel") ?? "") || editingProduct.retailPackage?.label || "PACKAGE") as "PACKAGE" | "PACKET",
+        }
+        : editingMode === "PLATE_CARTON"
+          ? {
+            unitsPerPackage: stackSize,
+            packagePriceMinor: minorFromInput(String(data.get("stackPrice"))),
+            contentsUnit: "PIECE" as const,
+            label: "STACK" as const,
+          }
+          : null;
+      if (retailPackage && (!Number.isInteger(retailPackage.unitsPerPackage) || retailPackage.unitsPerPackage < 2 || retailPackage.unitsPerPackage > purchasePackSize || (editingMode === "PLATE_CARTON" && purchasePackSize % retailPackage.unitsPerPackage !== 0) || retailPackage.packagePriceMinor <= 0)) {
+        throw new Error("أدخل محتوى العبوة أو العمود وسعر بيعه بصورة صحيحة.");
+      }
+      const salePriceField = editingMode === "PACKAGE" ? "unitPrice" : editingMode === "CARTON" || editingMode === "PLATE_CARTON" ? "piecePrice" : "price";
+      const enteredPriceMinor = minorFromInput(String(data.get(salePriceField)));
+      const packageBarcode = String(data.get("packageBarcode") ?? "").trim();
+      const cartonBarcode = String(data.get("cartonBarcode") ?? "").trim();
+      const barcodeMappings = isPieceMode && editingMode !== "PIECE" ? [
+        ...(packageBarcode ? [{ barcode: packageBarcode, saleUnit: "PACKAGE" as const }] : []),
+        ...(cartonBarcode && cartonPriceMinor ? [{ barcode: cartonBarcode, saleUnit: "CARTON" as const }] : []),
+      ] : undefined;
       await invoke({
         operation: "products.update",
         payload: {
           productId: editingProduct.id,
           nameAr: String(data.get("nameAr")).trim(),
+          category: String(data.get("category")).trim(),
           description: String(data.get("description")).trim(),
-          priceMinor: minorFromInput(String(data.get("price"))),
-          ...(canViewCost ? { wholesalePriceMinor: minorFromInput(String(data.get("wholesalePrice"))) } : {}),
+          priceMinor: enteredPriceMinor * (isSmallMeasuredUnit(editingProduct.weightUnit) ? 1000 : 1),
+          ...(canViewCost ? { wholesalePriceMinor: minorFromInput(String(data.get("wholesalePrice"))) * (isSmallMeasuredUnit(editingProduct.weightUnit) ? 1000 : 1) } : {}),
+          purchasePackSize,
+          ...(cartonPriceMinor !== undefined ? { cartonPriceMinor } : {}),
+          ...(cartonContentsUnit !== undefined ? { cartonContentsUnit } : {}),
+          retailPackage,
+          ...(barcodeMappings ? { barcodeMappings } : {}),
+          mergeLegacyProducts: true,
           availableQtyMilli,
           expectedStockVersion: editingProduct.version,
         },
       });
       await refresh();
-      setEditingProduct(null);
-      setMessage(`تم حفظ بيانات «${editingProduct.nameAr}» وتوثيق أي تعديل في الكمية بحركة جرد.`);
+      const nextIndex = reviewQueue && reviewQueue[reviewIndex]?.id === editingProduct.id
+        ? reviewIndex + 1
+        : -1;
+      if (reviewQueue && nextIndex >= 0 && nextIndex < reviewQueue.length) {
+        setReviewIndex(nextIndex);
+        setEditingProduct(reviewQueue[nextIndex]!);
+        setMessage(`تم حفظ «${editingProduct.nameAr}». التالي: ${reviewQueue[nextIndex]!.nameAr} (${nextIndex + 1} من ${reviewQueue.length}).`);
+      } else {
+        setEditingProduct(null);
+        if (reviewQueue) {
+          setReviewQueue(null);
+          setReviewIndex(0);
+          setMessage(`اكتملت مراجعة ${reviewQueue.length} صنف متوفر وتم تأكيد التعديلات.`);
+        } else {
+          setMessage(`تم حفظ بيانات «${editingProduct.nameAr}» وتوثيق أي تعديل في الكمية بحركة جرد.`);
+        }
+      }
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -2926,12 +4492,14 @@ function ProductsScreen({
     );
     if (!confirmed) return;
     try {
-      await invoke({
+      const result = await invoke<{ purged?: boolean }>({
         operation: "products.archive",
         payload: { productId: product.id },
       });
       await refresh();
-      setMessage(`تم حذف «${product.nameAr}» من قائمة الأصناف مع الاحتفاظ بسجل الحركات السابق.`);
+      setMessage(result.purged
+        ? `تم حذف «${product.nameAr}» نهائياً من قاعدة البيانات لأنه لم يكن له أي حركة أو فاتورة.`
+        : `تم إخفاء «${product.nameAr}» مع الاحتفاظ بسجل الحركات السابق. إدخال الباركود نفسه مرة أخرى سيعيد تفعيله ويحدّثه تلقائياً.`);
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -2943,6 +4511,35 @@ function ProductsScreen({
     event.target.value = "";
     if (!file) return;
     try {
+      if (file.name.toLowerCase().endsWith(".xlsx")) {
+        const workbookBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(reader.error ?? new Error("تعذر قراءة ملف Excel."));
+          reader.onload = () => {
+            const result = typeof reader.result === "string" ? reader.result : "";
+            const comma = result.indexOf(",");
+            if (comma < 0) reject(new Error("تعذر قراءة ملف Excel."));
+            else resolve(result.slice(comma + 1));
+          };
+          reader.readAsDataURL(file);
+        });
+        const preview = await invoke<{ rowCount: number; errors: string[] }>({
+          operation: "products.import-workbook",
+          payload: { idempotencyKey: crypto.randomUUID(), workbookBase64, preview: true },
+        });
+        if (preview.errors.length) {
+          setMessage("رفضت المعاينة: " + preview.errors.join(" | "));
+          return;
+        }
+        if (!window.confirm(`تمت معاينة ${preview.rowCount} صفاً من ملف Excel. سيُحدَّث الصنف عند وجود الباركود أو يُنشأ عند كونه جديداً. هل تريد الاستيراد؟`)) return;
+        const result = await invoke<{ importedCount: number; createdCount: number; updatedCount: number }>({
+          operation: "products.import-workbook",
+          payload: { idempotencyKey: crypto.randomUUID(), workbookBase64, preview: false },
+        });
+        await refresh();
+        setMessage(`تم استيراد ${result.importedCount} صفاً: ${result.createdCount} صنف جديد و${result.updatedCount} صنف تم تحديثه بالباركود.`);
+        return;
+      }
       const csv = await file.text();
       const preview = await invoke<{ rowCount: number; errors: string[] }>({
         operation: "products.import",
@@ -2961,7 +4558,7 @@ function ProductsScreen({
         )
       )
         return;
-      const result = await invoke<{ importedCount: number }>({
+      const result = await invoke<{ importedCount: number; createdCount?: number; updatedCount?: number }>({
         operation: "products.import",
         payload: {
           idempotencyKey: crypto.randomUUID(),
@@ -2969,7 +4566,9 @@ function ProductsScreen({
         },
       });
       await refresh();
-      setMessage("تم استيراد " + result.importedCount + " صنفاً بعد التحقق.");
+      setMessage(result.createdCount === undefined
+        ? "تم استيراد " + result.importedCount + " صنفاً بعد التحقق."
+        : `تم استيراد ${result.importedCount} صفاً: ${result.createdCount} جديد و${result.updatedCount} تم تحديثه بالباركود.`);
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -2983,10 +4582,11 @@ function ProductsScreen({
     dialog.className = "label-editor";
     const barcode = product.barcodes[0] ?? "";
     const wholesaleInput = canViewCost ? `<label>سعر الجملة الداخلي بالجنيه<input name="wholesalePrice" inputmode="decimal" dir="ltr" required></label>` : "";
-    dialog.innerHTML = `<form method="dialog"><header><div><h2></h2><p>يتغير سعر البيع للمبيعات الجديدة فقط؛ الفواتير السابقة لا تتغير.</p></div><button type="button" class="label-editor-close" aria-label="إغلاق">×</button></header><label>سعر البيع بالجنيه<input name="price" inputmode="decimal" dir="ltr" required></label>${wholesaleInput}<p class="label-editor-code" dir="ltr"></p><footer><button type="button" class="label-editor-save">حفظ السعر</button><button type="button" class="primary label-editor-print">حفظ وطباعة ملصق</button></footer><p class="label-editor-status" role="alert"></p></form>`;
+    dialog.innerHTML = `<form method="dialog"><header><div><h2></h2><p>يتغير سعر البيع للمبيعات الجديدة فقط؛ الفواتير السابقة لا تتغير.</p></div><button type="button" class="label-editor-close" aria-label="إغلاق">×</button></header><label>سعر البيع بالجنيه<input name="price" inputmode="decimal" dir="ltr" required></label>${wholesaleInput}<label class="label-editor-price-visibility"><input name="showPrice" type="checkbox" ${shouldHidePriceOnProductLabel(product) ? "" : "checked"}> إظهار سعر البيع على الملصق</label><p class="label-editor-code" dir="ltr"></p><footer><button type="button" class="label-editor-save">حفظ السعر</button><button type="button" class="primary label-editor-print">حفظ وطباعة ملصق</button></footer><p class="label-editor-status" role="alert"></p></form>`;
     dialog.querySelector("h2")!.textContent = product.nameAr;
     const price = dialog.querySelector<HTMLInputElement>("input[name=price]")!;
     price.value = (product.priceMinor / 100).toFixed(2);
+    const showPrice = dialog.querySelector<HTMLInputElement>("input[name=showPrice]")!;
     const wholesalePrice = dialog.querySelector<HTMLInputElement>("input[name=wholesalePrice]");
     if (wholesalePrice) wholesalePrice.value = ((product.wholesalePriceMinor ?? 0) / 100).toFixed(2);
     dialog.querySelector(".label-editor-code")!.textContent = barcode
@@ -3012,7 +4612,7 @@ function ProductsScreen({
         if (shouldPrint) {
           if (!barcode)
             throw new Error("لا يوجد باركود لهذا الصنف لطباعة الملصق");
-          await printProductLabel(product.nameAr, barcode, priceMinor);
+          await printProductLabel(product.nameAr, barcode, priceMinor, 1, !showPrice.checked);
         }
         close();
       } catch (cause) {
@@ -3047,13 +4647,17 @@ function ProductsScreen({
           <div className="actions">
             {canExport && <button onClick={() => void exportProducts("PUBLIC")}>تصدير أسعار Excel</button>}
             {canExport && canViewCost && <button onClick={() => void exportProducts("INTERNAL")}>تصدير جملة Excel</button>}
+            {canExport && canViewCost && <button type="button" className="primary" onClick={() => void exportProductSyncWorkbook()}>تصدير قالب جميع المنتجات Excel</button>}
             <button onClick={() => importRef.current?.click()}>
-              استيراد CSV
+              استيراد Excel / CSV
+            </button>
+            <button type="button" onClick={() => void startAvailableReview()} disabled={reviewLoading}>
+              {reviewLoading ? "جارٍ تجهيز المراجعة…" : "مراجعة المتوفر"}
             </button>
             <input
               ref={importRef}
               type="file"
-              accept=".csv,text/csv"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.csv,text/csv"
               hidden
               onChange={(event) => void importProducts(event)}
             />
@@ -3061,6 +4665,7 @@ function ProductsScreen({
               className="primary"
               onClick={() => {
                 setBarcode("");
+                setNewProductMode("PIECE");
                 clearSuggestedBarcode();
                 setShow(true);
               }}
@@ -3071,15 +4676,34 @@ function ProductsScreen({
         }
       />
       {message && <div className="notice">{message}</div>}
+      {productsNeedingNumericBarcode.length > 0 && (
+        <div className="notice warning" role="status">
+          يوجد {productsNeedingNumericBarcode.length} صنف ظاهر لا يملك باركودًا رقميًا مناسبًا للسكانر. استخدم زر «توليد باركود رقمي» بجانب الصنف؛ لن يُحذف الباركود القديم.
+        </div>
+      )}
       <section className="panel table-wrap">
         <div className="product-search-toolbar">
           <label className="product-search-field">
             <span>بحث سريع في الأصناف</span>
             <input
+              ref={productSearchRef}
               aria-label="ابحث عن صنف بالاسم أو الباركود"
               value={productQuery}
               onChange={(event) => setProductQuery(event.target.value)}
-              placeholder="اكتب اسم الصنف أو امسح الباركود…"
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setProductQuery("");
+                } else if (event.key === "F3") {
+                  event.preventDefault();
+                  if (productQuery.trim()) onEditProductByQuery(productQuery);
+                  else setMessage("ابحث بالباركود أولاً، ثم اضغط F3 لتعديل الصنف.");
+                } else if (event.key === "F7" || event.code === "F7") {
+                  event.preventDefault();
+                  openQuickProductUpdate();
+                }
+              }}
+              placeholder="اكتب اسم الصنف أو امسح الباركود… Esc لمسح | F3 تعديل | F7 سريع"
               autoComplete="off"
             />
           </label>
@@ -3087,10 +4711,24 @@ function ProductsScreen({
             {isSearching
               ? "جارٍ البحث…"
               : productQuery.trim()
-                ? `${searchResults.length} نتيجة`
+                ? `${filteredSearchResults.length} نتيجة`
                 : "ابحث لمعرفة الكمية المتاحة أو إضافة توريد سريع."}
           </p>
         </div>
+        <div className="advanced-product-filter-toggle">
+          <button type="button" onClick={() => setShowAdvancedFilters((value) => !value)} aria-expanded={showAdvancedFilters}>
+            {showAdvancedFilters ? "إخفاء الفلتر المتقدم" : "فلتر متقدم"}
+          </button>
+          {(availabilityFilter !== "ALL" || unitFilter !== "ALL" || categoryFilter !== "ALL" || minimumStock || maximumPrice) && <button type="button" onClick={resetAdvancedFilters}>مسح الفلاتر</button>}
+          <small>{filteredSearchResults.length} نتيجة بعد الفلترة</small>
+        </div>
+        {showAdvancedFilters && <div className="advanced-product-filters">
+          <Field label="الحالة"><select value={availabilityFilter} onChange={(event) => setAvailabilityFilter(event.target.value as "ALL" | "IN_STOCK" | "LOW_STOCK" | "OUT_OF_STOCK")}><option value="ALL">كل الحالات</option><option value="IN_STOCK">متوفر الآن</option><option value="LOW_STOCK">مخزون منخفض</option><option value="OUT_OF_STOCK">غير متوفر</option></select></Field>
+          <Field label="نوع الوحدة"><select value={unitFilter} onChange={(event) => setUnitFilter(event.target.value as "ALL" | "PIECE" | "WEIGHT")}><option value="ALL">كل الوحدات</option><option value="PIECE">قطع / باكيت / كرتونة</option><option value="WEIGHT">وزن أو سائل</option></select></Field>
+          <Field label="التصنيف"><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="ALL">كل التصنيفات</option>{productCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select></Field>
+          <Field label="أقل كمية متاحة"><input value={minimumStock} onChange={(event) => setMinimumStock(event.target.value)} inputMode="decimal" dir="ltr" placeholder="مثال: 10" /></Field>
+          <Field label="أقصى سعر بيع"><input value={maximumPrice} onChange={(event) => setMaximumPrice(event.target.value)} inputMode="decimal" dir="ltr" placeholder="مثال: 50.00" /></Field>
+        </div>}
         <table className={`products-table ${canViewCost ? "with-cost" : "without-cost"}`}>
           <colgroup>
             <col className="product-name-column" />
@@ -3116,6 +4754,7 @@ function ProductsScreen({
           </thead>
           <tbody>
             {displayedSearchResults.map((product) => {
+              const needsNumericBarcode = !hasScannerNumericBarcode(product.barcodes);
               const availability =
                 product.availableQtyMilli <= 0
                   ? { label: "غير متوفر", tone: "empty" }
@@ -3140,11 +4779,16 @@ function ProductsScreen({
                   <small>{product.category}</small>
                 </td>
                 <td className="barcode-cell ltr">{product.barcodes.join("، ")}</td>
-                <td>{product.unitKind === "PIECE" ? "قطعة" : "كيلو"}</td>
-                <td>{formatMoney(product.priceMinor)}</td>
+                <td>{productUnitLabel(product)}</td>
+                <td>
+                  {formatMoney(productDisplayPriceMinor(product))}
+                  {product.cartonPriceMinor && <small className="carton-price-note">كرتونة: {formatMoney(product.cartonPriceMinor)}</small>}
+                  {product.retailPackage && <small className="carton-price-note">{retailPackageLabel(product)} ({product.retailPackage.unitsPerPackage} {product.retailPackage.contentsUnit === "BAG" ? "أكياس" : "قطع"}): {formatMoney(product.retailPackage.packagePriceMinor)}</small>}
+                </td>
                 {canViewCost && <td>{formatMoney(product.wholesalePriceMinor ?? 0)}</td>}
                 <td>
-                  {formatQty(product.availableQtyMilli, product.unitKind)}
+                  {productQuantityLabel(product)}
+                  {product.unitKind === "PIECE" && product.cartonPriceMinor && product.purchasePackSize >= 2 && <small className="carton-price-note">{Math.floor(product.availableQtyMilli / (product.purchasePackSize * 1000))} كرتونة + {(product.availableQtyMilli / 1000) % product.purchasePackSize} {product.cartonContentsUnit === "BAG" ? "كيس" : "قطعة"}</small>}
                 </td>
                 <td>
                   <span className={`availability ${availability.tone}`}>
@@ -3153,6 +4797,26 @@ function ProductsScreen({
                 </td>
                 <td>
                   <div className="product-row-actions">
+                    {product.unitKind === "PIECE" && !product.cartonPriceMinor && (
+                      <button
+                        type="button"
+                        className="label-action carton-convert-action"
+                        title="اجعل الصنف يباع كرتونة كاملة أو قطع فرط مع الحفاظ على الرصيد"
+                        onClick={() => setCartonConversionProduct(product)}
+                      >
+                        تحويل لكرتونة
+                      </button>
+                    )}
+                    {needsNumericBarcode && (
+                      <button
+                        type="button"
+                        className="label-action"
+                        title="إضافة باركود EAN-13 رقمي قابل للقراءة بالسكانر"
+                        onClick={() => void generateNumericBarcode(product)}
+                      >
+                        توليد باركود رقمي
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="quick-restock-button"
@@ -3161,6 +4825,14 @@ function ProductsScreen({
                       onClick={() => setQuickRestockProduct(product)}
                     >
                       +
+                    </button>
+                    <button
+                      type="button"
+                      className="label-action"
+                      title="تعديل سريع للسعر والكمية — F7"
+                      onClick={() => openQuickProductUpdate(product)}
+                    >
+                      سريع F7
                     </button>
                     <button
                       type="button"
@@ -3188,7 +4860,7 @@ function ProductsScreen({
               </tr>
               );
             })}
-            {!isSearching && searchResults.length === 0 && (
+            {!isSearching && filteredSearchResults.length === 0 && (
               <tr>
                 <td colSpan={canViewCost ? 8 : 7} className="table-empty">
                   لا توجد أصناف مطابقة. جرّب الاسم أو الباركود كاملاً.
@@ -3197,7 +4869,7 @@ function ProductsScreen({
             )}
           </tbody>
         </table>
-        {searchResults.length > PRODUCTS_TABLE_PAGE_SIZE && (
+          {filteredSearchResults.length > PRODUCTS_TABLE_PAGE_SIZE && (
           <nav className="catalog-pagination table-pagination" aria-label="تصفح جدول الأصناف">
             <span>
               عرض {activeResultsPage * PRODUCTS_TABLE_PAGE_SIZE + 1}
@@ -3228,40 +4900,158 @@ function ProductsScreen({
         >
           <strong>{productMenu.product.nameAr}</strong>
           <button type="button" role="menuitem" onClick={() => { setEditingProduct(productMenu.product); setProductMenu(null); }}>تعديل بيانات الصنف</button>
+          {productMenu.product.unitKind === "PIECE" && <button type="button" role="menuitem" onClick={() => { setCartonConversionProduct(productMenu.product); setProductMenu(null); }}>دمج كرتونة / كيس والباركودات</button>}
           <button type="button" role="menuitem" onClick={() => { setQuickRestockProduct(productMenu.product); setProductMenu(null); }}>+ {"\u0625\u0636\u0627\u0641\u0629 \u0643\u0645\u064a\u0629"}</button>
           <button type="button" role="menuitem" onClick={() => { openLabelEditor(productMenu.product); setProductMenu(null); }}>{"\u0633\u0639\u0631 / \u0637\u0628\u0627\u0639\u0629"}</button>
           <button type="button" role="menuitem" onClick={() => { setLabelPrintProduct(productMenu.product); setProductMenu(null); }}>{"\u0637\u0628\u0627\u0639\u0629 \u0628\u0627\u0631\u0643\u0648\u062f"}</button>
           <button type="button" role="menuitem" className="danger" onClick={() => { void archiveProduct(productMenu.product); setProductMenu(null); }}>{"\u062d\u0630\u0641 \u0627\u0644\u0635\u0646\u0641"}</button>
         </div>
       )}
+      {cartonConversionProduct && (
+        <div className="modal-backdrop">
+          <form className="modal form-grid carton-conversion-modal" onSubmit={(event) => void configurePackaging(event)}>
+            <h2 className="full">دمج تغليف «{cartonConversionProduct.nameAr}»</h2>
+            <p className="hint full">أدخل فقط مستويات البيع المتاحة لديك. كل الباركودات اختيارية وقابلة للتعديل لاحقًا؛ يظل المخزون رصيدًا واحدًا ولا يُضاف أو يُخصم عند تغيير التغليف.</p>
+            <Field label="باركود القطعة / الكيس الفردي (اختياري)"><input name="unitBarcode" inputMode="numeric" dir="ltr" defaultValue={cartonConversionProduct.barcodeMappings?.find((item) => item.saleUnit === "UNIT")?.barcode ?? cartonConversionProduct.barcodes[0] ?? ""} placeholder="اتركه كما هو أو صححه" /></Field>
+            <div className="full packaging-section-title">تغليف الكيس أو العبوة — اختياري</div>
+            <Field label="محتوى الكيس / العبوة"><select name="packageContentsUnit" defaultValue={cartonConversionProduct.retailPackage?.contentsUnit ?? "PIECE"}><option value="PIECE">قطع</option><option value="BAG">أكياس</option></select></Field>
+            <Field label="عدد القطع داخل الكيس / العبوة"><input name="packageCapacity" min="2" step="1" inputMode="numeric" dir="ltr" defaultValue={cartonConversionProduct.retailPackage?.unitsPerPackage ?? ""} placeholder="مثال: 6" /></Field>
+            <Field label="سعر البيع العام للكيس / العبوة"><input name="packagePrice" min="0.01" inputMode="decimal" dir="ltr" defaultValue={cartonConversionProduct.retailPackage ? (cartonConversionProduct.retailPackage.packagePriceMinor / 100).toFixed(2) : ""} placeholder="اختياري" /></Field>
+            <Field label="باركود الكيس / العبوة"><input name="packageBarcode" inputMode="numeric" dir="ltr" defaultValue={cartonConversionProduct.barcodeMappings?.find((item) => item.saleUnit === "PACKAGE")?.barcode ?? ""} placeholder="اختياري" /></Field>
+            <div className="full packaging-section-title">تغليف الكرتونة — اختياري</div>
+            <Field label="محتوى الكرتونة"><select name="cartonContentsUnit" defaultValue={cartonConversionProduct.cartonContentsUnit ?? "PIECE"}><option value="PIECE">قطع</option><option value="BAG">أكياس</option></select></Field>
+            <Field label="عدد القطع / الأكياس داخل الكرتونة"><input name="cartonCapacity" min="2" step="1" inputMode="numeric" dir="ltr" defaultValue={cartonConversionProduct.cartonPriceMinor ? cartonConversionProduct.purchasePackSize : ""} placeholder="مثال: 24" /></Field>
+            <Field label="سعر البيع العام للكرتونة"><input name="cartonPrice" min="0.01" inputMode="decimal" dir="ltr" defaultValue={cartonConversionProduct.cartonPriceMinor ? (cartonConversionProduct.cartonPriceMinor / 100).toFixed(2) : ""} placeholder="اختياري" /></Field>
+            <Field label="باركود الكرتونة"><input name="cartonBarcode" inputMode="numeric" dir="ltr" defaultValue={cartonConversionProduct.barcodeMappings?.find((item) => item.saleUnit === "CARTON")?.barcode ?? ""} placeholder="اختياري" /></Field>
+            <div className="carton-conversion-preview full">
+              الرصيد الحالي: <b>{cartonConversionProduct.availableQtyMilli / 1000}</b> قطعة. عند بيع كيس أو كرتونة سيُخصم محتواها تلقائيًا من هذا الرصيد نفسه.
+            </div>
+            <div className="modal-actions full"><button type="button" onClick={() => setCartonConversionProduct(null)}>إلغاء</button><button className="primary">حفظ التغليف والباركودات</button></div>
+          </form>
+        </div>
+      )}
       {editingProduct && (
         <div className="modal-backdrop">
           <form className="modal form-grid" onSubmit={(event) => void updateProduct(event)}>
-            <h2 className="full">تعديل بيانات الصنف</h2>
+            <h2 className="full">{reviewQueue ? `مراجعة الأصناف المتوفرة — ${reviewIndex + 1} من ${reviewQueue.length}` : "تعديل بيانات الصنف"}</h2>
+            {reviewQueue && <p className="hint full">احفظ التعديل للانتقال إلى الصنف التالي. يمكنك إنهاء المراجعة في أي وقت دون تغيير بقية الأصناف.</p>}
             <Field label="اسم الصنف">
               <input name="nameAr" required autoFocus defaultValue={editingProduct.nameAr} />
+            </Field>
+            <Field label="التصنيف">
+              <input name="category" required list="nabta-edit-product-category-options" defaultValue={editingProduct.category} />
+            </Field>
+            <Field label="طريقة البيع والاستلام">
+              <select value={editingMode} onChange={(event) => setEditingMode(event.target.value as ProductCreationMode)} disabled={editingProduct.unitKind === "WEIGHT"}>
+                {editingProduct.unitKind === "WEIGHT" ? <>
+                  <option value="KILOGRAM">كيلو</option><option value="GRAM">جرام</option><option value="LITER">لتر (منتج سائل)</option><option value="MILLILITER">ملليلتر (منتج سائل)</option>
+                </> : <>
+            <option value="PIECE">قطعة منفردة</option><option value="PACKAGE">عبوة (تباع عبوة أو فرط)</option><option value="CARTON">كرتونة/علبة (تباع فرط أو كرتونة)</option><option value="PLATE_CARTON">أطباق وفوم (طبق / عمود / كرتونة)</option>
+                </>}
+              </select>
             </Field>
             <Field label="الباركود">
               <input value={editingProduct.barcodes.join("، ")} dir="ltr" disabled />
             </Field>
-            <Field label="سعر البيع المعلن">
-              <input name="price" required inputMode="decimal" dir="ltr" defaultValue={(editingProduct.priceMinor / 100).toFixed(2)} />
-            </Field>
-            {canViewCost && (
-              <Field label="سعر الجملة الداخلي">
-                <input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={((editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} />
+            {editingProduct.unitKind === "PIECE" && editingMode !== "PIECE" ? <>
+              <Field label={editingMode === "PACKAGE" ? "عدد العبوات الكاملة المتاحة" : editingMode === "PLATE_CARTON" ? "عدد الكراتين المتاحة" : "عدد الكراتين المتاحة (يسمح بـ 0.5)"}>
+                <input name="availableCartons" required min="0" step={editingMode === "PACKAGE" || editingMode === "PLATE_CARTON" ? "1" : "0.5"} inputMode="decimal" dir="ltr" defaultValue={Math.floor(editingProduct.availableQtyMilli / (editingProduct.purchasePackSize * 1000)).toString()} />
               </Field>
-            )}
-            <Field label={`الكمية المتاحة (${editingProduct.unitKind === "PIECE" ? "قطعة" : "كيلو"})`}>
-              <input name="availableQuantity" required inputMode="decimal" dir="ltr" defaultValue={(editingProduct.availableQtyMilli / 1000).toString()} />
-            </Field>
+              {editingMode === "PLATE_CARTON" && <>
+                <Field label="عدد الأعمدة الفرط خارج الكراتين"><input name="availableLooseStacks" required min="0" step="1" inputMode="numeric" dir="ltr" defaultValue={Math.floor(((editingProduct.availableQtyMilli / 1000) % editingProduct.purchasePackSize) / (editingProduct.retailPackage?.unitsPerPackage ?? 1)).toString()} /></Field>
+              </>}
+              <Field label={editingMode === "PLATE_CARTON" ? "عدد الأكواب أو الأطباق الفرط خارج الأعمدة" : `عدد ${editingMode === "PACKAGE" ? (editingProduct.retailPackage?.contentsUnit === "BAG" ? "الأكياس" : "القطع") : (editingProduct.cartonContentsUnit === "BAG" ? "الأكياس" : "القطع")} الفرط خارج ${editingMode === "PACKAGE" ? "العبوات" : "الكراتين"}`}>
+                <input name="availableLooseUnits" required min="0" step="1" inputMode="numeric" dir="ltr" defaultValue={(editingMode === "PLATE_CARTON" ? ((editingProduct.availableQtyMilli / 1000) % (editingProduct.retailPackage?.unitsPerPackage ?? 1)) : ((editingProduct.availableQtyMilli / 1000) % editingProduct.purchasePackSize)).toString()} />
+              </Field>
+              <p className="hint full">الإجمالي يحسب تلقائيًا: عدد الكراتين × سعة الكرتونة + الفرط. مثال: كرتونة سعتها 12 ومعك كرتونة ونصف و3 أكياس: اكتب 1.5 كرتونة و3 فرط. لا تكتب إجمالي القطع في هذه الخانات.</p>
+            </> : <Field label={`الكمية المتاحة (${productUnitLabel(editingProduct)})`}>
+              <input name="availableQuantity" required inputMode={isSmallMeasuredUnit(editingProduct.weightUnit) ? "numeric" : "decimal"} dir="ltr" defaultValue={(editingProduct.unitKind === "WEIGHT" && isSmallMeasuredUnit(editingProduct.weightUnit) ? editingProduct.availableQtyMilli : editingProduct.availableQtyMilli / 1000).toString()} />
+            </Field>}
+            {editingProduct.unitKind === "WEIGHT" && <>
+              <Field label={`سعر البيع لكل ${productUnitLabel(editingProduct)}`}><input name="price" required inputMode="decimal" dir="ltr" defaultValue={(productDisplayPriceMinor(editingProduct) / 100).toFixed(2)} /></Field>
+              {canViewCost && <Field label={`سعر الجملة لكل ${productUnitLabel(editingProduct)}`}><input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={(productDisplayPriceMinor(editingProduct, editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} /></Field>}
+              <p className="hint full">وحدة الصنف الموزون ثابتة بعد الحفظ لحماية سجل المخزون والمبيعات.</p>
+            </>}
+            {editingProduct.unitKind === "PIECE" && editingMode === "PIECE" && <>
+              <Field label="سعر البيع للقطعة"><input name="price" required inputMode="decimal" dir="ltr" defaultValue={(editingProduct.priceMinor / 100).toFixed(2)} /></Field>
+              {canViewCost && <Field label="سعر الجملة للقطعة"><input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={((editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} /></Field>}
+            </>}
+            {editingProduct.unitKind === "PIECE" && editingMode === "PACKAGE" && <>
+              <Field label="محتوى العبوة"><select name="packageContentsUnit" defaultValue={editingProduct.retailPackage?.contentsUnit ?? "PIECE"}><option value="PIECE">قطع</option><option value="BAG">أكياس</option></select></Field>
+              <Field label="شكل البيع الكامل"><select name="packageLabel" defaultValue={editingProduct.retailPackage?.label === "PACKET" ? "PACKET" : "PACKAGE"}><option value="PACKAGE">عبوة</option><option value="PACKET">باكيت (كانز أو زجاجات)</option></select></Field>
+              <Field label="عدد القطع / الأكياس داخل العبوة"><input name="purchasePackSize" required min="2" step="1" inputMode="numeric" dir="ltr" defaultValue={editingProduct.retailPackage?.unitsPerPackage ?? editingProduct.purchasePackSize} /></Field>
+              <Field label="سعر بيع العبوة"><input name="packagePrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={editingProduct.retailPackage ? (editingProduct.retailPackage.packagePriceMinor / 100).toFixed(2) : ""} /></Field>
+              <Field label="سعر بيع الكيس أو القطعة (فرط)"><input name="unitPrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={(editingProduct.priceMinor / 100).toFixed(2)} /></Field>
+              <Field label="باركود العبوة الكامل (اختياري)"><input name="packageBarcode" inputMode="numeric" dir="ltr" defaultValue={editingProduct.barcodeMappings?.find((item) => item.saleUnit === "PACKAGE")?.barcode ?? ""} /></Field>
+              <p className="hint full">إذا كان باركود العبوة مسجلاً بالفعل لنفس البضاعة، يُدمج تلقائياً مع الصنف الحالي ويحفظ الرصيد مرة واحدة.</p>
+              {canViewCost && <Field label="سعر الجملة للكيس أو القطعة"><input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={((editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} /></Field>}
+            </>}
+            {editingProduct.unitKind === "PIECE" && editingMode === "CARTON" && <>
+              <Field label="محتوى الكرتونة"><select name="cartonContentsUnit" defaultValue={editingProduct.cartonContentsUnit ?? "BAG"}><option value="BAG">أكياس</option><option value="PIECE">قطع</option></select></Field>
+              <Field label="سعة الكرتونة"><input name="purchasePackSize" required min="2" step="1" inputMode="numeric" dir="ltr" defaultValue={editingProduct.purchasePackSize} /></Field>
+              <Field label="سعر بيع الكرتونة إن كانت تُباع كاملة (اختياري)"><input name="cartonPrice" min="0" inputMode="decimal" dir="ltr" defaultValue={editingProduct.cartonPriceMinor ? (editingProduct.cartonPriceMinor / 100).toFixed(2) : ""} /></Field>
+              <Field label="سعر بيع الكيس أو القطعة (فرط)"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={(editingProduct.priceMinor / 100).toFixed(2)} /></Field>
+              <Field label="باركود الكرتونة الكامل (اختياري)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" defaultValue={editingProduct.barcodeMappings?.find((item) => item.saleUnit === "CARTON")?.barcode ?? ""} /></Field>
+              <p className="hint full">إذا كان باركود الكرتونة مسجلاً بالفعل لنفس البضاعة، يُدمج تلقائياً مع الصنف الحالي ويحفظ الرصيد مرة واحدة.</p>
+              {canViewCost && <Field label="سعر الجملة للكيس أو القطعة"><input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={((editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} /></Field>}
+            </>}
+            {editingProduct.unitKind === "PIECE" && editingMode === "PLATE_CARTON" && <>
+              <Field label="عدد الأعمدة داخل الكرتونة"><input name="stacksPerCarton" required min="1" step="1" inputMode="numeric" dir="ltr" defaultValue={(editingProduct.purchasePackSize / (editingProduct.retailPackage?.unitsPerPackage ?? 1)).toString()} /></Field>
+              <Field label="سعة العمود (عدد الأكواب أو الأطباق)"><input name="stackSize" required min="2" step="1" inputMode="numeric" dir="ltr" defaultValue={editingProduct.retailPackage?.unitsPerPackage ?? 2} /></Field>
+              <Field label="سعر بيع الكوب أو الطبق"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={(editingProduct.priceMinor / 100).toFixed(2)} /></Field>
+              <Field label="سعر بيع العمود"><input name="stackPrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={editingProduct.retailPackage ? (editingProduct.retailPackage.packagePriceMinor / 100).toFixed(2) : ""} /></Field>
+              <Field label="باركود الكرتونة الكامل (اختياري)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" defaultValue={editingProduct.barcodeMappings?.find((item) => item.saleUnit === "CARTON")?.barcode ?? ""} /></Field>
+              <p className="hint full">يُدمج باركود الكرتونة المسجل مسبقاً تلقائياً مع هذا الصنف عند الحفظ، مع الحفاظ على رصيد المخزون وسجله.</p>
+              <Field label="سعر بيع الكرتونة"><input name="cartonPrice" required min="0.01" inputMode="decimal" dir="ltr" defaultValue={editingProduct.cartonPriceMinor ? (editingProduct.cartonPriceMinor / 100).toFixed(2) : ""} /></Field>
+              {canViewCost && <Field label="سعر الجملة للطبق"><input name="wholesalePrice" required inputMode="decimal" dir="ltr" defaultValue={((editingProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} /></Field>}
+            </>}
+            <datalist id="nabta-edit-product-category-options">{[...new Set(products.map((product) => product.category))].sort((a, b) => a.localeCompare(b, "ar")).map((category) => <option key={category} value={category} />)}</datalist>
             <Field label="الوصف">
               <textarea name="description" rows={4} defaultValue={editingProduct.description} />
             </Field>
             <p className="hint full">تعديل الكمية يُسجل تلقائياً كحركة جرد للمراجعة، ولا يغيّر الفواتير السابقة.</p>
             <div className="modal-actions full">
-              <button type="button" onClick={() => setEditingProduct(null)}>إلغاء</button>
-              <button className="primary">حفظ التعديلات</button>
+              <button type="button" onClick={() => { setEditingProduct(null); setReviewQueue(null); setReviewIndex(0); }}>{reviewQueue ? "إنهاء المراجعة" : "إلغاء"}</button>
+              <button className="primary">{reviewQueue ? "حفظ والانتقال للتالي" : "حفظ التعديلات"}</button>
+            </div>
+          </form>
+        </div>
+      )}
+      {quickUpdateProduct && (
+        <div className="modal-backdrop">
+          <form className="modal form-grid" onSubmit={(event) => void quickUpdateProductStock(event)}>
+            <h2 className="full">تعديل سريع — {quickUpdateProduct.nameAr}</h2>
+            <p className="hint full">F7: اكتب إجمالي ما دُفع للصنف، الكمية المتاحة وسعر البيع فقط. يحسب النظام تكلفة الوحدة تلقائيًا.</p>
+            <Field label="وحدة البيع">
+              <select
+                value={quickSaleUnit}
+                onChange={(event) => setQuickSaleUnit(event.target.value as "PIECE" | "PACK" | "BAG" | "KILOGRAM")}
+                disabled={quickUpdateProduct.unitKind === "WEIGHT"}
+              >
+                {quickUpdateProduct.unitKind === "WEIGHT" ? (
+                  <option value="KILOGRAM">كيلو</option>
+                ) : (
+                  <>
+                    <option value="PIECE">قطعة</option>
+                    <option value="PACK">عبوة</option>
+                    <option value="BAG">كيس</option>
+                  </>
+                )}
+              </select>
+            </Field>
+            <Field label="إجمالي سعر الجملة للكمية (ج.م)">
+              <input name="totalWholesale" inputMode="decimal" dir="ltr" autoFocus required />
+            </Field>
+            <Field label={`الكمية المتاحة (${quickSaleUnit === "KILOGRAM" ? "كيلو" : quickSaleUnit === "PACK" ? "عبوة" : quickSaleUnit === "BAG" ? "كيس" : "قطعة"})`}>
+              <input name="quantity" inputMode="decimal" dir="ltr" required />
+            </Field>
+            <Field label={`سعر البيع لكل ${quickSaleUnit === "KILOGRAM" ? "كيلو" : quickSaleUnit === "PACK" ? "عبوة" : quickSaleUnit === "BAG" ? "كيس" : "قطعة"} (ج.م)`}>
+              <input name="retailPrice" inputMode="decimal" dir="ltr" defaultValue={(quickUpdateProduct.priceMinor / 100).toFixed(2)} required />
+            </Field>
+            <p className="hint full">التعديل في الكمية يُوثّق كحركة جرد للمراجعة، ولا يغيّر الفواتير السابقة.</p>
+            <div className="modal-actions full">
+              <button type="button" onClick={() => setQuickUpdateProduct(null)}>إلغاء</button>
+              <button className="primary">حفظ التعديل السريع</button>
             </div>
           </form>
         </div>
@@ -3285,7 +5075,8 @@ function ProductsScreen({
               }
               const product = labelPrintProduct;
               setLabelPrintProduct(null);
-              void printSearchedProductLabel(product, barcode, copies);
+              const hidePrice = data.get("showPrice") !== "on";
+              void printSearchedProductLabel(product, barcode, copies, hidePrice);
             }}
           >
             <h2 className="full">طباعة باركود الصنف</h2>
@@ -3319,6 +5110,18 @@ function ProductsScreen({
             <Field label="عدد النسخ المطلوبة">
               <input name="copies" type="number" min="1" max="100" step="1" defaultValue="1" required dir="ltr" />
             </Field>
+            <label className="full" style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer", padding: "10px 12px", border: "1px solid var(--nabta-border, #cbd5e1)", borderRadius: "8px" }}>
+              <input
+                name="showPrice"
+                type="checkbox"
+                defaultChecked={!shouldHidePriceOnProductLabel(labelPrintProduct)}
+                style={{ width: "18px", height: "18px", accentColor: "var(--nabta-primary, #059669)" }}
+              />
+              <span>
+                إظهار سعر البيع على الملصق
+                {shouldHidePriceOnProductLabel(labelPrintProduct) && <small style={{ display: "block", color: "var(--nabta-text-muted, #64748b)", marginTop: "3px" }}>مخفى افتراضياً لأصناف الفوم، ويمكنك إظهاره لهذه الطبعة فقط.</small>}
+              </span>
+            </label>
             <div className="modal-actions full">
               <button type="button" onClick={() => setLabelPrintProduct(null)}>إلغاء</button>
               <button className="primary">طباعة الملصق</button>
@@ -3333,67 +5136,101 @@ function ProductsScreen({
             onSubmit={(event) => void create(event)}
           >
             <h2 className="full">إضافة صنف</h2>
+            <p className="hint full">
+              الباركود {barcode ? <b dir="ltr">{barcode}</b> : "سيُولَّد تلقائيًا عند الحفظ"}. الخيارات المتقدمة تُدار من بطاقة الصنف لاحقًا.
+            </p>
             <Field label="الاسم">
               <input name="nameAr" required autoFocus />
             </Field>
-            <Field label="الباركود">
-              <input
-                name="barcode"
-                required
-                dir="ltr"
-                value={barcode}
-                onChange={(event) => setBarcode(event.target.value)}
-              />
-            </Field>
             <Field label="التصنيف">
-              <input name="category" required />
+              <input name="category" required list="nabta-product-category-options" placeholder="اكتب أول حرفين لعرض التصنيفات" />
             </Field>
-            <Field label="الوحدة">
-              <select name="unitKind">
-                <option value="PIECE">قطعة</option>
-                <option value="WEIGHT">كيلو</option>
+            <Field label="باركود القطعة / الكيس الفردي">
+              <input name="unitBarcode" inputMode="numeric" dir="ltr" defaultValue={barcode} placeholder="اتركه فارغًا لتوليد باركود" />
+            </Field>
+            <Field label="طريقة البيع والاستلام">
+              <select value={newProductMode} onChange={(event) => setNewProductMode(event.target.value as ProductCreationMode)}>
+                <option value="KILOGRAM">كيلو</option>
+                <option value="GRAM">جرام</option>
+                <option value="LITER">لتر (منتج سائل)</option>
+                <option value="MILLILITER">ملليلتر (منتج سائل)</option>
+                <option value="PIECE">قطعة منفردة</option>
+                <option value="PACKAGE">عبوة (تباع عبوة أو فرط)</option>
+                <option value="CARTON">كرتونة/علبة (تباع فرط أو كرتونة)</option>
+                <option value="PLATE_CARTON">أطباق وفوم (طبق / عمود / كرتونة)</option>
               </select>
             </Field>
-            <Field label="سعر البيع">
-              <input name="price" required inputMode="decimal" dir="ltr" />
-            </Field>
-            {canViewCost && (
-              <Field label="سعر الجملة الداخلي">
-                <input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" />
-              </Field>
+            {(newProductMode === "KILOGRAM" || newProductMode === "GRAM" || newProductMode === "LITER" || newProductMode === "MILLILITER") && (
+              <>
+                <Field label={`الكمية المستلمة بـ${measurementUnitLabel(newProductMode === "KILOGRAM" ? "KILOGRAM" : newProductMode === "GRAM" ? "GRAM" : newProductMode === "LITER" ? "LITER" : "MILLILITER")}`}>
+                  <input name="openingQty" defaultValue="0" required inputMode={newProductMode === "KILOGRAM" || newProductMode === "LITER" ? "decimal" : "numeric"} dir="ltr" placeholder={newProductMode === "KILOGRAM" || newProductMode === "LITER" ? "مثال: 8 أو 0.250" : "مثال: 8000 أو 250"} />
+                </Field>
+                <Field label={`سعر البيع لكل ${measurementUnitLabel(newProductMode === "KILOGRAM" ? "KILOGRAM" : newProductMode === "GRAM" ? "GRAM" : newProductMode === "LITER" ? "LITER" : "MILLILITER")}`}>
+                  <input name="price" required inputMode="decimal" dir="ltr" />
+                </Field>
+                {canViewCost && <Field label={`سعر الجملة لكل ${measurementUnitLabel(newProductMode === "KILOGRAM" ? "KILOGRAM" : newProductMode === "GRAM" ? "GRAM" : newProductMode === "LITER" ? "LITER" : "MILLILITER")}`}><input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" /></Field>}
+                <p className="hint full">يحفظ البرنامج الوزن بالجرام والسوائل بالملليلتر للحساب الدقيق.</p>
+              </>
             )}
-            <Field label="حد الطلب">
-              <input
-                name="reorder"
-                defaultValue="0"
-                required
-                inputMode="decimal"
-                dir="ltr"
-              />
-            </Field>
-            <Field label="كمية افتتاحية">
-              <input
-                name="openingQty"
-                defaultValue="0"
-                required
-                inputMode="decimal"
-                dir="ltr"
-              />
-            </Field>
-            <Field label="تكلفة الوحدة الافتتاحية">
-              <input
-                name="openingCost"
-                defaultValue="0.00"
-                required
-                inputMode="decimal"
-                dir="ltr"
-              />
-            </Field>
+            {newProductMode === "PIECE" && (
+              <>
+                <Field label="عدد القطع المستلمة">
+                  <input name="openingQty" defaultValue="0" required inputMode="numeric" dir="ltr" />
+                </Field>
+                <Field label="سعر البيع للقطعة"><input name="price" required inputMode="decimal" dir="ltr" /></Field>
+                {canViewCost && <Field label="سعر الجملة للقطعة"><input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" /></Field>}
+              </>
+            )}
+            {newProductMode === "CARTON" && (
+              <>
+                <Field label="عدد الكراتين المتاحة الآن (يسمح بـ 0.5)"><input name="openingCartons" required min="0" step="0.5" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="محتوى الكرتونة"><select name="cartonContentsUnit" defaultValue="BAG"><option value="BAG">أكياس</option><option value="PIECE">قطع</option></select></Field>
+                <Field label="سعة الكرتونة الواحدة (عدد القطع / العبوات / الأكياس داخلها)"><input name="purchasePackSize" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="عدد الأكياس / القطع الفرط خارج الكراتين"><input name="openingLooseUnits" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="إجمالي سعر الجملة للكراتين المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="سعر بيع الكرتونة إن كانت تُباع كاملة (اختياري)"><input name="cartonPrice" min="0" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="سعر البيع للقطعة / العبوة / الكيس"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+          <Field label="باركود الكرتونة الكامل (اختياري عند بيعها كاملة)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" placeholder="أدخله فقط إذا كانت الكرتونة تباع كاملة" /></Field>
+                <p className="hint full">اكتب الكراتين الكاملة أو النصفية ثم الفرط خارجها. مثال: سعة 12، كرتونة ونصف و3 أكياس = 1.5 كرتونة و3 فرط. لا يقبل النظام جزءًا من كيس أو قطعة.</p>
+              </>
+            )}
+            {newProductMode === "PLATE_CARTON" && (
+              <>
+                <Field label="عدد الكراتين المستلمة"><input name="openingCartons" required min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="عدد الأعمدة داخل الكرتونة (مثال: 40)"><input name="stacksPerCarton" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="سعة العمود (عدد الأكواب أو الأطباق)"><input name="stackSize" required min="2" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="عدد الأعمدة الفرط خارج الكراتين"><input name="openingLooseStacks" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="عدد الأكواب أو الأطباق الفرط خارج الأعمدة"><input name="openingLooseUnits" required defaultValue="0" min="0" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="إجمالي سعر الجملة للكراتين المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="سعر بيع الكوب أو الطبق"><input name="piecePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="سعر بيع العمود"><input name="stackPrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="باركود الكرتونة الكامل (اختياري)"><input name="cartonBarcode" inputMode="numeric" dir="ltr" placeholder="يمسح ويبيع كرتونة كاملة" /></Field>
+                <Field label="سعر بيع الكرتونة إن كانت تُباع كاملة (اختياري)"><input name="cartonPrice" min="0" inputMode="decimal" dir="ltr" /></Field>
+                <p className="hint full">مثال الأكواب: كرتونة بها 40 عمودًا، وكل عمود 50 كوبًا = 2000 كوب. تبيع الكرتونة أو العمود أو كوبًا/طبقًا مفردًا، ويُخصم دائمًا من نفس رصيد القطع.</p>
+              </>
+            )}
+            {newProductMode === "PACKAGE" && (
+              <>
+                <Field label="شكل البيع الكامل"><select name="packageLabel" defaultValue="PACKAGE"><option value="PACKAGE">عبوة</option><option value="PACKET">باكيت (كانز أو زجاجات)</option></select></Field>
+                <Field label="عدد العبوات المستلمة"><input name="openingCartons" required min="1" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="محتوى العبوة"><select name="packageContentsUnit" defaultValue="PIECE"><option value="PIECE">قطع</option><option value="BAG">أكياس</option></select></Field>
+                <Field label="عدد القطع / الأكياس داخل العبوة"><input name="purchasePackSize" required min="2" step="1" inputMode="numeric" dir="ltr" /></Field>
+                <Field label="إجمالي سعر الجملة للعبوات المستلمة"><input name="cartonTotalWholesale" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="سعر بيع العبوة"><input name="packagePrice" required min="0.01" inputMode="decimal" dir="ltr" /></Field>
+                <Field label="سعر بيع الكيس أو القطعة (فرط)"><input name="unitPrice" required min="0.01" inputMode="decimal" dir="ltr" placeholder="السعر المُعلن للوحدة" /></Field>
+                <Field label="باركود العبوة الكامل (اختياري)"><input name="packageBarcode" inputMode="numeric" dir="ltr" placeholder="يمسح ويبيع عبوة كاملة" /></Field>
+                <p className="hint full">سعر العبوة الكاملة وسعر الكيس أو القطعة مستقلان؛ اكتب السعر المُعلن لكلٍ منهما. عند البيع تختار عبوة كاملة أو قطعة/كيس فرط.</p>
+              </>
+            )}
+            <datalist id="nabta-product-category-options">
+              {[...new Set(products.map((product) => product.category))].sort((a, b) => a.localeCompare(b, "ar")).map((category) => <option key={category} value={category} />)}
+            </datalist>
             <div className="modal-actions full">
               <button
                 type="button"
                 onClick={() => {
                   setShow(false);
+                  setNewProductMode("PIECE");
                   clearSuggestedBarcode();
                 }}
               >
@@ -3422,18 +5259,18 @@ function ProductsScreen({
                 autoFocus
                 inputMode="decimal"
                 dir="ltr"
-                placeholder={quickRestockProduct.unitKind === "PIECE" ? "مثال: 12" : "مثال: 1.250"}
+                placeholder={quickRestockProduct.unitKind === "PIECE" ? "مثال: 12" : quickRestockProduct.weightUnit === "GRAM" ? "مثال: 250" : "مثال: 1.250"}
               />
             </Field>
-            <Field label="تكلفة الوحدة بالجنيه">
+            <Field label={`تكلفة ${productUnitLabel(quickRestockProduct)} بالجنيه`}>
               <input name="cost" required defaultValue="0.00" inputMode="decimal" dir="ltr" />
             </Field>
-            <Field label="سعر البيع للجمهور بالجنيه">
-              <input name="retailPrice" required defaultValue={(quickRestockProduct.priceMinor / 100).toFixed(2)} inputMode="decimal" dir="ltr" />
+            <Field label={`سعر البيع لكل ${productUnitLabel(quickRestockProduct)} بالجنيه`}>
+              <input name="retailPrice" required defaultValue={(productDisplayPriceMinor(quickRestockProduct) / 100).toFixed(2)} inputMode="decimal" dir="ltr" />
             </Field>
             {canViewCost && (
-              <Field label="سعر الجملة الداخلي بالجنيه">
-                <input name="wholesalePrice" required defaultValue={((quickRestockProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} inputMode="decimal" dir="ltr" />
+              <Field label={`سعر الجملة لكل ${productUnitLabel(quickRestockProduct)} بالجنيه`}>
+                <input name="wholesalePrice" required defaultValue={(productDisplayPriceMinor(quickRestockProduct, quickRestockProduct.wholesalePriceMinor ?? 0) / 100).toFixed(2)} inputMode="decimal" dir="ltr" />
               </Field>
             )}
             <Field label="اسم المورد (اختياري)">
@@ -3512,20 +5349,24 @@ function InventoryScreen({
   products,
   shift,
   refresh,
+  storeName,
+  receiptBranding,
+  canViewCost = true,
   suggestedBarcode,
   clearSuggestedBarcode = () => undefined,
-  onUnregisteredReceiptBarcode = (barcode: string) =>
-    window.dispatchEvent(
-      new CustomEvent("nabta:receipt-unknown-barcode", { detail: barcode }),
-    ),
+  onEditProductByQuery = () => undefined,
 }: {
   products: CatalogProduct[];
   shift: Shift | null;
   refresh: () => Promise<CatalogProduct[]>;
+  storeName?: string;
+  receiptBranding?: ReceiptBranding | undefined;
+  canViewCost?: boolean;
   suggestedBarcode?: string;
   clearSuggestedBarcode?: () => void;
-  onUnregisteredReceiptBarcode?: (barcode: string) => void;
+  onEditProductByQuery?: (query: string) => void;
 }): ReactNode {
+  const [initialReceiptDraft] = useState(loadPurchaseReceiptDraft);
   const [productId, setProductId] = useState(products[0]?.id ?? "");
   const [message, setMessage] = useState("");
   const [sale, setSale] = useState<SaleLookup | null>(null);
@@ -3534,15 +5375,91 @@ function InventoryScreen({
   const [section, setSection] = useState<
     "receive" | "count" | "returns" | "expiry"
   >("receive");
-  const [receiptLines, setReceiptLines] = useState<ReceiptLineDraft[]>([
-    { productId: "", qty: "", cost: "", lot: "", expires: "" },
-  ]);
+  const [receiptLines, setReceiptLines] = useState<ReceiptLineDraft[]>(initialReceiptDraft.lines);
   const [receiptBarcode, setReceiptBarcode] = useState("");
-  const [unknownReceiptBarcode, setUnknownReceiptBarcode] = useState("");
+  const [receiptSupplier, setReceiptSupplier] = useState(initialReceiptDraft.supplier);
+  const [receiptInvoiceNo, setReceiptInvoiceNo] = useState(initialReceiptDraft.invoiceNo);
+  const [receiptExpenses, setReceiptExpenses] = useState(initialReceiptDraft.expenses);
+  const [receiptIssuedAt, setReceiptIssuedAt] = useState(initialReceiptDraft.issuedAt);
+  const [receiptSearchQuery, setReceiptSearchQuery] = useState("");
+  const [receiptSearchResults, setReceiptSearchResults] = useState<CatalogProduct[]>([]);
+  const [receiptSearchOpen, setReceiptSearchOpen] = useState(false);
+  const [receiptSearchBusy, setReceiptSearchBusy] = useState(false);
+  const [postingReceipt, setPostingReceipt] = useState(false);
+  const [lastReceiptId, setLastReceiptId] = useState("");
+  const [priceAlert, setPriceAlert] = useState<PurchasePriceAlert | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [historyFrom, setHistoryFrom] = useState("");
+  const [historyTo, setHistoryTo] = useState("");
+  const [purchaseHistory, setPurchaseHistory] = useState<InvoiceSummaryItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyDetail, setHistoryDetail] = useState<InvoiceDetailResponse | null>(null);
+  const [invoiceProducts, setInvoiceProducts] = useState<CatalogProduct[]>([]);
+  const [manualReceiptProductName, setManualReceiptProductName] = useState("");
+  const [pendingReceiptProduct, setPendingReceiptProduct] = useState<{
+    barcode: string;
+    lineIndex: number;
+    initialName?: string;
+  } | null>(null);
   const [auditPeriod, setAuditPeriod] = useState<InventoryReportPeriod>("MONTHLY");
   const [auditReferenceDate, setAuditReferenceDate] = useState(cairoDateForInput);
   const [exportingAudit, setExportingAudit] = useState(false);
   const product = products.find((item) => item.id === productId) ?? products[0];
+  const receiptProducts = useMemo(
+    () => [
+      ...products,
+      ...invoiceProducts.filter(
+        (invoiceProduct) =>
+          !products.some((productItem) => productItem.id === invoiceProduct.id),
+      ),
+    ],
+    [invoiceProducts, products],
+  );
+  const receiptGoodsMinor = useMemo(
+    () => receiptLines.reduce((sum, line) => sum + Math.max(0, minorFromInput(line.cost || "0")), 0),
+    [receiptLines],
+  );
+  const receiptExpensesMinor = useMemo(
+    () => Math.max(0, minorFromInput(receiptExpenses || "0")),
+    [receiptExpenses],
+  );
+  const receiptTotalMinor = receiptGoodsMinor + receiptExpensesMinor;
+  const receiptIssuedAtLabel = useMemo(
+    () => new Date(receiptIssuedAt).toLocaleString("ar-EG", { timeZone: "Africa/Cairo", dateStyle: "medium", timeStyle: "short" }),
+    [receiptIssuedAt],
+  );
+  useEffect(() => {
+    if (!priceAlert) return;
+    const timer = window.setTimeout(() => setPriceAlert(null), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [priceAlert]);
+  useEffect(() => {
+    localStorage.setItem(PURCHASE_RECEIPT_DRAFT_KEY, JSON.stringify({
+      lines: receiptLines,
+      supplier: receiptSupplier,
+      invoiceNo: receiptInvoiceNo,
+      expenses: receiptExpenses,
+      issuedAt: receiptIssuedAt,
+    } satisfies PurchaseReceiptDraft));
+  }, [receiptExpenses, receiptInvoiceNo, receiptIssuedAt, receiptLines, receiptSupplier]);
+  useEffect(() => {
+    const query = receiptSearchQuery.trim();
+    if (query.length < 2) { setReceiptSearchResults([]); setReceiptSearchBusy(false); return; }
+    let cancelled = false;
+    setReceiptSearchBusy(true);
+    const timer = window.setTimeout(() => {
+      void invoke<{ products: CatalogProduct[] }>({ operation: "catalog.list", payload: { query, limit: 12 } })
+        .then((result) => {
+          if (cancelled) return;
+          setReceiptSearchResults(result.products);
+          setInvoiceProducts((items) => [...items, ...result.products.filter((product) => !items.some((existing) => existing.id === product.id))]);
+        })
+        .catch((cause) => { if (!cancelled) { setReceiptSearchResults([]); setMessage(errorMessage(cause)); } })
+        .finally(() => { if (!cancelled) setReceiptSearchBusy(false); });
+    }, 150);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [receiptSearchQuery]);
   useEffect(() => {
     if (!productId && products[0]) setProductId(products[0].id);
   }, [productId, products]);
@@ -3556,80 +5473,391 @@ function InventoryScreen({
   }, [products]);
 
   function addReceiptProduct(productIdToAdd: string): void {
+    const selectedProduct = receiptProducts.find((item) => item.id === productIdToAdd);
+    const packSize = selectedProduct?.purchasePackSize ?? 1;
+    const packaging = {
+      entryUnit: selectedProduct?.unitKind === "WEIGHT"
+        ? "WEIGHT" as const
+        : packSize > 1 ? "CARTON" as const : "PIECE" as const,
+      costBasis: selectedProduct?.unitKind === "WEIGHT"
+        ? "LINE_TOTAL" as const
+        : "LINE_TOTAL" as const,
+      unitsPerPackage: String(packSize),
+      retail: selectedProduct
+        ? (selectedProduct.unitKind === "WEIGHT" && selectedProduct.weightUnit === "GRAM"
+          ? (selectedProduct.priceMinor / 100_000).toString()
+          : (selectedProduct.priceMinor / 100).toFixed(2))
+        : "",
+    };
     setReceiptLines((items) => {
-      const emptyIndex = items.findIndex((item) => !item.productId);
+      const emptyIndex = items.findIndex(
+        (item) => !item.productId && !item.pendingBarcode,
+      );
       if (emptyIndex >= 0)
         return items.map((item, index) =>
-          index === emptyIndex ? { ...item, productId: productIdToAdd } : item,
+          index === emptyIndex ? { ...item, productId: productIdToAdd, ...packaging } : item,
         );
       return [
         ...items,
-        { productId: productIdToAdd, qty: "", cost: "", lot: "", expires: "" },
+        { productId: productIdToAdd, ...packaging, qty: "", cost: "", lot: "", expires: "" },
       ];
     });
   }
 
-  function scanReceiptBarcode(value: string): void {
+  async function scanReceiptBarcode(value: string): Promise<void> {
     const barcode = value.trim();
     if (!barcode) return;
-    const exact = products.find((item) => item.barcodes.includes(barcode));
+    let exact = receiptProducts.find((item) => item.barcodes.includes(barcode));
+    if (!exact) {
+      try {
+        const result = await invoke<{ products: CatalogProduct[] }>({
+          operation: "catalog.list",
+          payload: { query: barcode, limit: 10 },
+        });
+        exact = result.products.find((item) => item.barcodes.includes(barcode));
+        if (exact)
+          setInvoiceProducts((items) =>
+            items.some((item) => item.id === exact!.id) ? items : [...items, exact!],
+          );
+      } catch (cause) {
+        setMessage(errorMessage(cause));
+        return;
+      }
+    }
     if (exact) {
       addReceiptProduct(exact.id);
       setReceiptBarcode("");
       return;
     }
-    setUnknownReceiptBarcode(barcode);
+    setReceiptLines((items) => {
+      const emptyIndex = items.findIndex((item) => !item.productId && !item.pendingBarcode);
+      if (emptyIndex >= 0)
+        return items.map((item, index) =>
+          index === emptyIndex ? { ...item, pendingBarcode: barcode } : item,
+        );
+      return [...items, { productId: "", pendingBarcode: barcode, entryUnit: "PIECE", costBasis: "LINE_TOTAL", unitsPerPackage: "1", qty: "", cost: "", retail: "", lot: "", expires: "" }];
+    });
+    setReceiptBarcode("");
+    setMessage(`الباركود ${barcode} غير مسجل؛ أكمل بياناته من الزر الأصفر داخل الفاتورة.`);
   }
+
+  function chooseReceiptSearchProduct(product: CatalogProduct): void {
+    setInvoiceProducts((items) => items.some((item) => item.id === product.id) ? items : [...items, product]);
+    addReceiptProduct(product.id);
+    setReceiptSearchQuery("");
+    setReceiptSearchResults([]);
+    setReceiptSearchOpen(false);
+  }
+
+  async function addReceiptProductWithoutBarcode(): Promise<void> {
+    const name = (receiptSearchQuery.trim() || manualReceiptProductName.trim());
+    if (name.length < 2) {
+      setMessage("اكتب اسم الصنف أولاً.");
+      return;
+    }
+    try {
+      const generated = await invoke<{ barcode: string }>({ operation: "products.barcode.generate" });
+      let lineIndex = 0;
+      setReceiptLines((items) => {
+        const emptyIndex = items.findIndex((item) => !item.productId && !item.pendingBarcode);
+        lineIndex = emptyIndex >= 0 ? emptyIndex : items.length;
+        const draft = { productId: "", pendingBarcode: generated.barcode, entryUnit: "PIECE" as const, costBasis: "LINE_TOTAL" as const, unitsPerPackage: "1", qty: "", cost: "", retail: "", lot: "", expires: "" };
+        return emptyIndex >= 0 ? items.map((item, index) => index === emptyIndex ? { ...item, pendingBarcode: generated.barcode } : item) : [...items, draft];
+      });
+      setPendingReceiptProduct({ barcode: generated.barcode, lineIndex, initialName: name });
+      setManualReceiptProductName("");
+      setReceiptSearchQuery("");
+      setReceiptSearchResults([]);
+      setReceiptSearchOpen(false);
+      setMessage("سيُنشأ باركود داخلي تلقائي للصنف عند حفظ بياناته ثم يضاف إلى فاتورة المورد.");
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+
+  async function completeReceiptProduct(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!pendingReceiptProduct) return;
+    const data = new FormData(event.currentTarget);
+    try {
+      const retailPriceMinor = minorFromInput(String(data.get("price")));
+      const wholesalePriceMinor = minorFromInput(String(data.get("wholesalePrice") || "0"));
+      const invoiceQty = String(data.get("invoiceQty") || "").trim();
+      const selectedEntryUnit = String(data.get("invoiceEntryUnit")) as "PIECE" | "CARTON" | "WEIGHT";
+      const unitKind = selectedEntryUnit === "WEIGHT" ? "WEIGHT" : "PIECE";
+      const invoiceEntryUnit = selectedEntryUnit;
+      const purchasePackSize = unitKind === "WEIGHT" ? 1 : Number(data.get("purchasePackSize") || 1);
+      const qtyMilli = invoiceEntryUnit === "CARTON"
+        ? Number(invoiceQty) * purchasePackSize * 1000
+        : qtyFromInput(invoiceQty);
+      const invoiceCost = String(data.get("invoiceCost") || "").trim();
+      if (qtyMilli <= 0 || (unitKind === "PIECE" && qtyMilli % 1000 !== 0) || !Number.isSafeInteger(qtyMilli) ||
+        !Number.isInteger(purchasePackSize) || purchasePackSize < 1 ||
+        (invoiceEntryUnit === "CARTON" && (!Number.isInteger(Number(invoiceQty)) || Number(invoiceQty) < 1)))
+        throw new Error("أدخل كمية صحيحة للصنف الجديد داخل فاتورة المورد.");
+      if (minorFromInput(invoiceCost) < 0)
+        throw new Error("تكلفة الوحدة لا يمكن أن تكون سالبة.");
+      const created = await invoke<{ id: string }>({
+        operation: "products.create",
+        payload: {
+          nameAr: String(data.get("nameAr")).trim(),
+          category: String(data.get("category")).trim(),
+          unitKind,
+          weightUnit: "KILOGRAM",
+          priceMinor: retailPriceMinor,
+          wholesalePriceMinor,
+          purchasePackSize,
+          reorderLevelMilli: 0,
+          barcodes: [pendingReceiptProduct.barcode],
+          openingQtyMilli: 0,
+          openingUnitCostMinor: 0,
+        },
+      });
+      const catalog = await invoke<{ products: CatalogProduct[] }>({
+        operation: "catalog.list",
+        payload: { query: pendingReceiptProduct.barcode, limit: 10 },
+      });
+      const createdProduct = catalog.products.find(
+        (item) => item.id === created.id,
+      );
+      if (!createdProduct)
+        throw new Error("تم إنشاء الصنف لكن تعذر تحميله إلى سطر الفاتورة. أعد المحاولة.");
+      setInvoiceProducts((items) =>
+        items.some((item) => item.id === createdProduct.id)
+          ? items
+          : [...items, createdProduct],
+      );
+      await refresh();
+      setReceiptLines((items) =>
+        items.map((item, index) =>
+          index === pendingReceiptProduct.lineIndex
+            ? (() => {
+              const { pendingBarcode: _pendingBarcode, ...completed } = item;
+              return {
+                ...completed,
+                productId: created.id,
+                entryUnit: invoiceEntryUnit,
+                costBasis: "LINE_TOTAL",
+                unitsPerPackage: String(purchasePackSize),
+                qty: invoiceQty,
+                cost: invoiceCost,
+                retail: String(data.get("price") ?? ""),
+              };
+            })()
+            : item,
+        ),
+      );
+      setMessage("تمت إضافة الصنف وكمية الفاتورة في السطر نفسه. أضف بقية الأصناف ثم رحّل الفاتورة للمورد.");
+      setPendingReceiptProduct(null);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+
+  useEffect(() => {
+    function receiveBarcode(event: Event): void {
+      const barcode = String((event as CustomEvent<string>).detail || "");
+      if (!barcode) return;
+      setSection("receive");
+      void scanReceiptBarcode(barcode);
+    }
+    window.addEventListener("nabta:inventory-barcode-scan", receiveBarcode);
+    return () =>
+      window.removeEventListener("nabta:inventory-barcode-scan", receiveBarcode);
+  }, [invoiceProducts, products]);
 
   useEffect(() => {
     const barcode =
       suggestedBarcode || localStorage.getItem(PENDING_RECEIPT_SCAN_KEY) || "";
     if (!barcode) return;
     setSection("receive");
-    scanReceiptBarcode(barcode);
+    void scanReceiptBarcode(barcode);
     clearSuggestedBarcode();
     localStorage.removeItem(PENDING_RECEIPT_SCAN_KEY);
   }, [suggestedBarcode]);
 
+  async function checkPurchasePrice(line: ReceiptLineDraft): Promise<void> {
+    const item = receiptProducts.find((candidate) => candidate.id === line.productId);
+    if (!item || !line.cost.trim() || !line.qty.trim()) return;
+    const packageCount = Number(line.qty);
+    const unitsPerPackage = Number(line.unitsPerPackage);
+    const qtyMilli = line.entryUnit === "CARTON"
+      ? packageCount * unitsPerPackage * 1000
+      : qtyFromInput(line.qty);
+    const goodsMinor = minorFromInput(line.cost);
+    if (!Number.isSafeInteger(qtyMilli) || qtyMilli <= 0 || goodsMinor <= 0) return;
+
+    try {
+      const matches = await invoke<{ items: InvoiceSummaryItem[] }>({
+        operation: "invoices.list",
+        payload: { kind: "PURCHASE", query: item.nameAr, limit: 80 },
+      });
+      const details = await Promise.all(matches.items.slice(0, 40).map((invoice) =>
+        invoke<InvoiceDetailResponse>({ operation: "invoices.get", payload: { kind: "PURCHASE", id: invoice.id } }),
+      ));
+      const historic = details.flatMap((invoice) => invoice.lines
+        .filter((historicLine) => historicLine.productId === item.id)
+        .map((historicLine) => ({
+          unitCostMinor: historicLine.unitPriceMinor,
+          supplierName: invoice.partyName,
+          postedAt: invoice.postedAt,
+        })));
+      const cheapest = historic.reduce<typeof historic[number] | null>(
+        (lowest, candidate) => !lowest || candidate.unitCostMinor < lowest.unitCostMinor ? candidate : lowest,
+        null,
+      );
+      const currentUnitCostMinor = Math.floor((goodsMinor * 1000) / qtyMilli);
+      if (cheapest && cheapest.unitCostMinor < currentUnitCostMinor) {
+        setPriceAlert({
+          productName: item.nameAr,
+          currentUnitCostMinor,
+          cheaperUnitCostMinor: cheapest.unitCostMinor,
+          supplierName: cheapest.supplierName,
+          postedAt: cheapest.postedAt,
+        });
+      }
+    } catch {
+      // Price comparison is advisory. A temporary history lookup error must never block receiving stock.
+    }
+  }
+
+  async function loadPurchaseHistory(event?: FormEvent<HTMLFormElement>): Promise<void> {
+    event?.preventDefault();
+    try {
+      setHistoryLoading(true);
+      const result = await invoke<{ items: InvoiceSummaryItem[] }>({
+        operation: "invoices.list",
+        payload: {
+          kind: "PURCHASE",
+          ...(historyQuery.trim() ? { query: historyQuery.trim() } : {}),
+          ...(historyFrom ? { from: historyFrom } : {}),
+          ...(historyTo ? { to: historyTo } : {}),
+          limit: 300,
+        },
+      });
+      setPurchaseHistory(result.items);
+      setHistoryDetail(null);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function openHistoricPurchase(invoice: InvoiceSummaryItem): Promise<void> {
+    try {
+      const detail = await invoke<InvoiceDetailResponse>({ operation: "invoices.get", payload: { kind: "PURCHASE", id: invoice.id } });
+      setHistoryDetail(detail);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+
+  async function printPurchaseReceipt(detail: InvoiceDetailResponse): Promise<void> {
+    await invoke({
+      operation: "hardware.purchase-receipt.print",
+      payload: {
+        storeName: storeName || "نبتة",
+        branding: receiptBranding,
+        receipt: {
+          id: detail.id,
+          invoiceNo: detail.invoiceNo,
+          supplierName: detail.partyName,
+          supplierPhone: detail.partyPhone,
+          postedAt: detail.postedAt,
+          goodsMinor: detail.subtotalMinor ?? detail.totalMinor,
+          supplyExpensesMinor: detail.supplyExpensesMinor,
+          totalMinor: detail.totalMinor,
+          receiverName: detail.cashierOrReceiverName,
+          lines: detail.lines.map((line) => ({
+            productId: line.productId,
+            nameAr: line.nameAr,
+            unitKind: line.unitKind,
+            qtyMilli: line.qtyMilli,
+            unitCostMinor: line.unitPriceMinor,
+            goodsMinor: line.totalMinor,
+            lotCode: line.lotCode,
+            expiresOn: line.expiresOn,
+          })),
+        },
+      },
+    });
+  }
+
   async function receive(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
+    if (postingReceipt) return;
     try {
+      setPostingReceipt(true);
       const lines = receiptLines.map((line) => {
-        const item = products.find(
+        if (line.pendingBarcode)
+          throw new Error(`أكمل بيانات الصنف الجديد ذو الباركود ${line.pendingBarcode} أولاً.`);
+        const item = receiptProducts.find(
           (candidate) => candidate.id === line.productId,
         );
-        const qtyMilli = qtyFromInput(line.qty);
+        const packageCount = Number(line.qty);
+        const unitsPerPackage = Number(line.unitsPerPackage);
+        const qtyMilli = line.entryUnit === "CARTON"
+          ? packageCount * unitsPerPackage * 1000
+          : qtyFromInput(line.qty);
         if (
           !item ||
           qtyMilli <= 0 ||
+          !Number.isSafeInteger(qtyMilli) ||
+          (line.entryUnit === "CARTON" &&
+            (!Number.isInteger(packageCount) || packageCount < 1 ||
+              !Number.isInteger(unitsPerPackage) || unitsPerPackage < 1)) ||
           (item.unitKind === "PIECE" && qtyMilli % 1000 !== 0)
         )
           throw new Error("راجع الصنف والكمية في سطور الاستلام");
+        const lineTotalMinor = minorFromInput(line.cost);
+        const retailPriceMinor = minorFromInput(line.retail) *
+          (item.unitKind === "WEIGHT" && item.weightUnit === "GRAM" ? 1000 : 1);
+        if (lineTotalMinor <= 0 || retailPriceMinor <= 0)
+          throw new Error("أدخل إجمالي سعر الشراء وسعر بيع الوحدة لكل صنف.");
+        const unitCostMinor = Math.floor((lineTotalMinor * 1000) / qtyMilli);
+        const wholesalePriceMinor = unitCostMinor *
+          (item.unitKind === "WEIGHT" && item.weightUnit === "GRAM" ? 1000 : 1);
+        if (!Number.isSafeInteger(wholesalePriceMinor))
+          throw new Error("سعر الجملة المحسوب كبير جدًا.");
         return {
           product: item,
           qtyMilli,
-          unitCostMinor: minorFromInput(line.cost),
+          unitCostMinor,
+          wholesalePriceMinor,
+          entryUnit: line.entryUnit,
+          costBasis: "LINE_TOTAL" as const,
+          packageCount: line.entryUnit === "CARTON" ? packageCount : undefined,
+          unitsPerPackage: line.entryUnit === "CARTON" ? unitsPerPackage : undefined,
+          lineTotalMinor,
+          retailPriceMinor,
           lotCode: line.lot.trim() || undefined,
           expiresOn: line.expires || undefined,
         };
       });
       if (!lines.length) throw new Error("أضف صنفًا واحدًا على الأقل");
-      await invoke({
+      const posted = await invoke<{ receiptId: string; postedAt?: string }>({
         operation: "purchases.receive",
         payload: {
           idempotencyKey: crypto.randomUUID(),
           receipt: {
             warehouseId: lines[0]!.product.warehouseId,
-            supplierName: String(data.get("supplier")),
-            supplierInvoiceNo: String(data.get("invoice") ?? "") || undefined,
-            supplyExpensesMinor: minorFromInput(
-              String(data.get("expense") || "0"),
-            ),
+            supplierName: receiptSupplier.trim(),
+            supplierInvoiceNo: receiptInvoiceNo.trim() || undefined,
+            supplyExpensesMinor: receiptExpensesMinor,
             lines: lines.map((line) => ({
               productId: line.product.id,
               qtyMilli: line.qtyMilli,
               unitCostMinor: line.unitCostMinor,
+              entryUnit: line.entryUnit,
+              costBasis: line.costBasis,
+              ...(line.entryUnit === "CARTON" ? {
+                packageCount: line.packageCount,
+                unitsPerPackage: line.unitsPerPackage,
+              } : {}),
+              lineTotalMinor: line.lineTotalMinor,
+              wholesalePriceMinor: line.wholesalePriceMinor,
+              retailPriceMinor: line.retailPriceMinor,
               lotCode: line.lotCode,
               expiresOn: line.expiresOn,
             })),
@@ -3637,11 +5865,51 @@ function InventoryScreen({
         },
       });
       await refresh();
-      setReceiptLines([
-        { productId: "", qty: "", cost: "", lot: "", expires: "" },
-      ]);
-      setMessage("تم استلام البضاعة وتحديث التكلفة والدفتر.");
-      event.currentTarget.reset();
+      setLastReceiptId(posted.receiptId);
+      setReceiptIssuedAt(posted.postedAt ?? new Date().toISOString());
+      let printStatus = "";
+      try {
+        const detail = await invoke<InvoiceDetailResponse>({ operation: "invoices.get", payload: { kind: "PURCHASE", id: posted.receiptId } });
+        await printPurchaseReceipt(detail);
+        printStatus = " وتم إرسال إذن الاستلام إلى طابعة الإيصالات.";
+      } catch (printCause) {
+        // Posting the receipt is already final and must never be rolled back
+        // merely because the printer is off or not configured.
+        printStatus = ` لم تُطبع تلقائيًا: ${errorMessage(printCause)} ويمكنك إعادة طباعتها من زر «طباعة إذن الاستلام».`;
+      }
+      setReceiptLines([EMPTY_RECEIPT_LINE()]);
+      setReceiptSupplier("");
+      setReceiptInvoiceNo("");
+      setReceiptExpenses("0.00");
+      localStorage.removeItem(PURCHASE_RECEIPT_DRAFT_KEY);
+      setMessage(`تم استلام البضاعة وتحديث سعر الجملة وسعر البيع والدفتر.${printStatus}`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setPostingReceipt(false);
+    }
+  }
+
+  function resetReceiptDraft(): void {
+    setReceiptSupplier("");
+    setReceiptInvoiceNo("");
+    setReceiptExpenses("0.00");
+    setReceiptIssuedAt(new Date().toISOString());
+    setReceiptBarcode("");
+    setLastReceiptId("");
+    setReceiptLines([EMPTY_RECEIPT_LINE()]);
+    setReceiptSearchQuery("");
+    setReceiptSearchResults([]);
+    localStorage.removeItem(PURCHASE_RECEIPT_DRAFT_KEY);
+    setMessage("مسودة فاتورة توريد جديدة جاهزة.");
+  }
+
+  async function printLastReceipt(): Promise<void> {
+    if (!lastReceiptId) return;
+    try {
+      const detail = await invoke<InvoiceDetailResponse>({ operation: "invoices.get", payload: { kind: "PURCHASE", id: lastReceiptId } });
+      await printPurchaseReceipt(detail);
+      setMessage(`تم إرسال إذن استلام ${detail.invoiceNo} إلى الطابعة.`);
     } catch (cause) {
       setMessage(errorMessage(cause));
     }
@@ -3746,6 +6014,20 @@ function InventoryScreen({
     }
   }
 
+  async function exportExpiryAlerts(): Promise<void> {
+    try {
+      const result = await invoke<{ cancelled: boolean; path?: string; itemCount: number }>({
+        operation: "stock.expiry.export-xlsx",
+        payload: { days: 30 },
+      });
+      setMessage(result.cancelled
+        ? "تم إلغاء حفظ ملف تنبيه الصلاحية."
+        : `تم تصدير ${result.itemCount} تشغيلة قريبة من الانتهاء إلى Excel: ${result.path}`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    }
+  }
+
   async function exportPeriodicInventory(): Promise<void> {
     if (exportingAudit) return;
     setExportingAudit(true);
@@ -3826,14 +6108,38 @@ function InventoryScreen({
               value={receiptBarcode}
               onChange={(event) => setReceiptBarcode(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") {
+                if (event.defaultPrevented) return;
+                if (event.key === "Escape") {
                   event.preventDefault();
-                  scanReceiptBarcode(receiptBarcode);
+                  setReceiptBarcode("");
+                } else if (event.key === "F3") {
+                  event.preventDefault();
+                  if (receiptBarcode.trim()) onEditProductByQuery(receiptBarcode);
+                  else setMessage("امسح باركود الصنف أولاً، ثم اضغط F3 لتعديل بياناته.");
+                } else if (event.key === "Enter") {
+                  event.preventDefault();
+                  void scanReceiptBarcode(receiptBarcode);
                 }
               }}
-              placeholder="امسح الباركود ثم Enter"
+              placeholder="امسح الباركود ثم Enter — Esc لمسح | F3 لتعديل"
               autoFocus
             />
+          </Field>
+          <Field label="صنف جديد بلا باركود">
+            <div className="inline-field-action">
+              <input
+                value={manualReceiptProductName}
+                onChange={(event) => setManualReceiptProductName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void addReceiptProductWithoutBarcode();
+                  }
+                }}
+                placeholder="اكتب اسم الصنف ثم أضِفه للفاتورة"
+              />
+              <button type="button" onClick={() => void addReceiptProductWithoutBarcode()}>إضافة وتوليد باركود</button>
+            </div>
           </Field>
         </div>
       )}
@@ -3854,59 +6160,168 @@ function InventoryScreen({
         </div>
       )}
       {section === "receive" && (
-        <section className="panel operation-panel receipt-panel">
-          <h2>استلام مشتريات</h2>
+        <section className="panel operation-panel receipt-panel supplier-invoice-shell">
+          <h2>إدخال فاتورة مورد</h2>
           <p className="panel-help">
             أدخل المورد ومصاريف التوريد مرة واحدة، ثم أضف كل الأصناف في الفاتورة
-            نفسها.
+            نفسها. تظل كل السطور تحت المورد الحالي إلى أن ترحّل الفاتورة.
+            للكرتونة: اختر هل محتواها قطع أو عبوات أو أكياس، اكتب سعة الكرتونة وإجمالي الكراتين؛ تُحسب تكلفة الوحدة تلقائيًا بدقة.
           </p>
+          <div className="supplier-invoice-heading">
+            <div>
+              <span className="supplier-invoice-eyebrow">المخزن / استلام مشتريات / فاتورة جديدة</span>
+              <h2>فاتورة توريد جديدة</h2>
+              <p>استلم البضاعة، حدّث أسعارها، وسجّلها في المخزن في معاملة واحدة قابلة للطباعة.</p>
+            </div>
+            <div className="supplier-invoice-heading-actions">
+              <button type="button" className="supplier-invoice-history-toggle" onClick={() => { setHistoryOpen((open) => !open); if (!historyOpen) void loadPurchaseHistory(); }}>سجل الفواتير</button>
+              <button type="button" className="supplier-invoice-reset" onClick={resetReceiptDraft}>فاتورة جديدة</button>
+            </div>
+          </div>
           <form onSubmit={(event) => void receive(event)}>
+            <div className="supplier-invoice-workspace">
+            <div className="supplier-invoice-main">
+            <section className="supplier-invoice-meta">
+              <div className="supplier-invoice-panel-head"><h3>بيانات المورد والفاتورة</h3><span>الحقول الأساسية فقط</span></div>
             <div className="form-grid receipt-meta">
               <Field label="المورد">
-                <input name="supplier" required />
+                <input name="supplier" value={receiptSupplier} onChange={(event) => setReceiptSupplier(event.target.value)} required placeholder="اسم الشركة أو المورد" />
               </Field>
               <Field label="رقم فاتورة المورد">
-                <input name="invoice" />
+                <input name="invoice" value={receiptInvoiceNo} onChange={(event) => setReceiptInvoiceNo(event.target.value)} placeholder="مثال: 1620" />
+              </Field>
+              <Field label="تاريخ ووقت الإدخال">
+                <input value={receiptIssuedAtLabel} readOnly aria-label="تاريخ ووقت إدخال الفاتورة تلقائياً" />
               </Field>
               <Field label="مصروفات التوريد">
                 <input
                   name="expense"
-                  defaultValue="0.00"
+                  value={receiptExpenses}
+                  onChange={(event) => setReceiptExpenses(event.target.value)}
                   inputMode="decimal"
                   dir="ltr"
                 />
               </Field>
             </div>
+            <p className="supplier-invoice-note">تُراجع صلاحية المخزن والمورد والأسعار داخل خادم نبتة عند ترحيل الفاتورة.</p>
+            </section>
+            <section className="supplier-invoice-entry">
+              <div className="supplier-invoice-entry-head"><div><h3>إضافة الأصناف بسرعة</h3><p>ابحث بالاسم أو بالباركود؛ الصنف المختار يضاف إلى أول سطر فارغ، ويمكنك مواصلة الفاتورة مباشرةً.</p></div><span>لا يلزم باركود للبحث بالاسم</span></div>
+              <div className="receipt-product-search">
+                <input
+                  value={receiptSearchQuery}
+                  onFocus={() => setReceiptSearchOpen(true)}
+                  onBlur={() => window.setTimeout(() => setReceiptSearchOpen(false), 140)}
+                  onChange={(event) => { setReceiptSearchQuery(event.target.value); setReceiptSearchOpen(true); }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      if (receiptSearchResults[0]) chooseReceiptSearchProduct(receiptSearchResults[0]);
+                      else if (receiptSearchQuery.trim().length >= 2) void addReceiptProductWithoutBarcode();
+                    }
+                  }}
+                  placeholder="اكتب اسم الصنف أو الباركود — مثال: جبنة رومي"
+                  aria-label="بحث وإضافة صنف إلى فاتورة المورد"
+                />
+                <button type="button" onClick={() => void addReceiptProductWithoutBarcode()} disabled={receiptSearchQuery.trim().length < 2}>+ صنف جديد</button>
+                {receiptSearchOpen && receiptSearchQuery.trim().length >= 2 && (
+                  <div className="receipt-product-search-results" role="listbox" aria-label="نتائج أصناف فاتورة المورد">
+                    {receiptSearchBusy ? <p>جارٍ البحث…</p> : receiptSearchResults.length ? receiptSearchResults.map((product) => (
+                      <button key={product.id} type="button" role="option" onMouseDown={(event) => event.preventDefault()} onClick={() => chooseReceiptSearchProduct(product)}>
+                        <span><b>{product.nameAr}</b><small>{product.category} · {productQuantityLabel(product)}</small></span>
+                        <strong>{product.unitKind === "WEIGHT" ? "⚖️ وزن" : product.purchasePackSize > 1 ? "📦 قطعة / كرتونة" : "◻️ قطعة"}</strong>
+                      </button>
+                    )) : <p>لا يوجد صنف مطابق. اضغط «صنف جديد» لإضافته داخل الفاتورة.</p>}
+                  </div>
+                )}
+              </div>
+              <div className="supplier-invoice-barcode">{receiptBarcode || "استخدم قارئ الباركود أو الحقل العلوي لإضافة صنف"}</div>
+            </section>
             <div className="receipt-sheet">
               <div className="receipt-sheet-head">
                 <span>الصنف</span>
+                <span>وحدة الاستلام</span>
                 <span>الكمية</span>
-                <span>تكلفة الوحدة</span>
+                <span>محتوى الكرتونة</span>
+                <span>سعة الكرتونة</span>
+                <span>إجمالي سعر الشراء</span>
+                <span>سعر بيع الوحدة</span>
                 <span>التشغيلة</span>
                 <span>الصلاحية</span>
                 <span></span>
               </div>
               {receiptLines.map((line, index) => (
                 <div className="receipt-sheet-row" key={index}>
-                  <SearchableSelect
-                    value={line.productId}
-                    onChange={(productId) =>
+                  {line.pendingBarcode ? (
+                    <div className="receipt-pending-product" role="status">
+                      <span>صنف جديد: <b dir="ltr">{line.pendingBarcode}</b></span>
+                      <button type="button" onClick={() => setPendingReceiptProduct({ barcode: line.pendingBarcode!, lineIndex: index })}>
+                        استكمال بيانات الصنف
+                      </button>
+                    </div>
+                  ) : (
+                    <SearchableSelect
+                      value={line.productId}
+                      onChange={(productId) =>
+                        setReceiptLines((items) =>
+                          items.map((item, itemIndex) =>
+                            itemIndex === index
+                              ? (() => {
+                                const product = receiptProducts.find((candidate) => candidate.id === productId);
+                                const packSize = product?.purchasePackSize ?? 1;
+                                const { pendingBarcode: _pendingBarcode, ...selected } = item;
+                                return {
+                                  ...selected,
+                                  productId,
+                                  entryUnit: product?.unitKind === "WEIGHT" ? "WEIGHT" : packSize > 1 ? "CARTON" : "PIECE",
+                                  costBasis: "LINE_TOTAL",
+                                  unitsPerPackage: String(packSize),
+                                  retail: product
+                                    ? (product.unitKind === "WEIGHT" && product.weightUnit === "GRAM"
+                                      ? (product.priceMinor / 100_000).toString()
+                                      : (product.priceMinor / 100).toFixed(2))
+                                    : item.retail,
+                                };
+                              })()
+                              : item,
+                          ),
+                        )
+                      }
+                      required
+                      options={receiptProducts.map((item) => ({
+                        value: item.id,
+                        label: item.nameAr,
+                        searchText: item.barcodes.join(" "),
+                      }))}
+                    placeholder="ابحث عن صنف"
+                  />
+                )}
+                  <select
+                    value={line.entryUnit}
+                    onChange={(event) =>
                       setReceiptLines((items) =>
                         items.map((item, itemIndex) =>
                           itemIndex === index
-                            ? { ...item, productId }
+                            ? {
+                              ...item,
+                              entryUnit: event.target.value as "PIECE" | "CARTON" | "WEIGHT",
+                              costBasis: "LINE_TOTAL",
+                            }
                             : item,
                         ),
                       )
                     }
-                    required
-                    options={products.map((item) => ({
-                      value: item.id,
-                      label: item.nameAr,
-                      searchText: item.barcodes.join(" "),
-                    }))}
-                    placeholder="ابحث عن صنف"
-                  />
+                    aria-label="وحدة استلام الصنف"
+                  >
+                    {receiptProducts.find((product) => product.id === line.productId)?.unitKind === "WEIGHT" ? (
+                      <option value="WEIGHT">كيلو / جرام</option>
+                    ) : (
+                      <>
+                        <option value="PIECE">قطعة</option>
+                        <option value="CARTON">كرتونة</option>
+                      </>
+                    )}
+                  </select>
                   <input
                     value={line.qty}
                     onChange={(event) =>
@@ -3919,7 +6334,45 @@ function InventoryScreen({
                       )
                     }
                     inputMode="decimal"
-                    placeholder="الكمية"
+                    placeholder={line.entryUnit === "CARTON" ? "عدد الكراتين" : line.entryUnit === "WEIGHT" ? "كيلو (مثال 8 أو 0.250)" : "عدد القطع"}
+                    required
+                  />
+                  {line.entryUnit === "CARTON" ? (
+                    <select
+                      value={line.cartonContent ?? "PIECE"}
+                      onChange={(event) =>
+                        setReceiptLines((items) =>
+                          items.map((item, itemIndex) =>
+                            itemIndex === index
+                              ? { ...item, cartonContent: event.target.value as "PIECE" | "PACK" | "BAG" }
+                              : item,
+                          ),
+                        )
+                      }
+                      aria-label="نوع محتوى الكرتونة"
+                    >
+                      <option value="PIECE">قطع</option>
+                      <option value="PACK">عبوات</option>
+                      <option value="BAG">أكياس</option>
+                    </select>
+                  ) : (
+                    <span className="receipt-static-cell">{line.entryUnit === "WEIGHT" ? "كيلو / جرام" : "قطعة"}</span>
+                  )}
+                  <input
+                    value={line.unitsPerPackage}
+                    onChange={(event) =>
+                      setReceiptLines((items) =>
+                        items.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, unitsPerPackage: event.target.value }
+                            : item,
+                        ),
+                      )
+                    }
+                    disabled={line.entryUnit !== "CARTON"}
+                    inputMode="numeric"
+                    placeholder={line.entryUnit === "CARTON" ? `عدد ${cartonContentLabel(line.cartonContent)} داخل الكرتونة` : "—"}
+                    aria-label="سعة الكرتونة"
                     required
                   />
                   <input
@@ -3934,7 +6387,29 @@ function InventoryScreen({
                       )
                     }
                     inputMode="decimal"
-                    placeholder="التكلفة"
+                    placeholder="إجمالي ما دُفع للكمية"
+                    aria-label="إجمالي سعر شراء الكمية"
+                    onBlur={() => void checkPurchasePrice(line)}
+                    required
+                  />
+                  <input
+                    value={line.retail}
+                    onChange={(event) =>
+                      setReceiptLines((items) =>
+                        items.map((item, itemIndex) =>
+                          itemIndex === index
+                            ? { ...item, retail: event.target.value }
+                            : item,
+                        ),
+                      )
+                    }
+                    inputMode="decimal"
+                    placeholder={line.entryUnit === "CARTON"
+                      ? `سعر بيع ${cartonContentLabel(line.cartonContent)}`
+                      : line.entryUnit === "WEIGHT"
+                        ? (receiptProducts.find((product) => product.id === line.productId)?.weightUnit === "GRAM" ? "سعر بيع الجرام" : "سعر بيع الكيلو")
+                        : "سعر بيع القطعة"}
+                    aria-label="سعر بيع الوحدة"
                     required
                   />
                   <input
@@ -3962,6 +6437,7 @@ function InventoryScreen({
                       )
                     }
                     type="date"
+                    aria-label="تاريخ الصلاحية الاختياري"
                   />
                   <button
                     type="button"
@@ -3984,15 +6460,67 @@ function InventoryScreen({
                 onClick={() =>
                   setReceiptLines((items) => [
                     ...items,
-                    { productId: "", qty: "", cost: "", lot: "", expires: "" },
+                    EMPTY_RECEIPT_LINE(),
                   ])
                 }
               >
                 + إضافة صنف
               </button>
-              <button className="primary">ترحيل الاستلام</button>
+              <button className="primary" disabled={postingReceipt}>{postingReceipt ? "جارٍ تسجيل الفاتورة…" : "حفظ الفاتورة وتحديث المخزن"}</button>
             </div>
+            </div>
+            <aside className="supplier-invoice-summary" aria-label="ملخص فاتورة التوريد">
+              <header><h3>ملخص الفاتورة</h3><p>يتحدث الحساب تلقائيًا مع كل تعديل</p></header>
+              <div className="supplier-summary-line"><span>إجمالي الأصناف</span><b>{formatMoney(receiptGoodsMinor)}</b></div>
+              <div className="supplier-summary-line"><span>مصروفات التوريد</span><b>{formatMoney(receiptExpensesMinor)}</b></div>
+              <div className="supplier-summary-total"><span>إجمالي فاتورة الشراء</span><b>{formatMoney(receiptTotalMinor)}</b><small>جنيه مصري</small></div>
+              <div className="supplier-summary-count"><span>{receiptLines.filter((line) => line.productId || line.pendingBarcode).length}</span> أصناف في الفاتورة</div>
+              <div className="supplier-summary-date">وقت الإدخال: <b>{receiptIssuedAtLabel}</b></div>
+              <button type="button" className="supplier-print" disabled={!lastReceiptId} onClick={() => void printLastReceipt()}>{lastReceiptId ? "طباعة إذن الاستلام" : "احفظ الفاتورة أولًا للطباعة"}</button>
+              <p className="supplier-summary-help">تتم الطباعة من الفاتورة التي سجلها الخادم بالفعل؛ لا تُطبع مسودة غير مرحّلة.</p>
+            </aside>
+            </div>
+            {priceAlert && (
+              <aside className="purchase-price-alert" role="alert">
+                <div>
+                  <strong>تنبيه مقارنة سعر الشراء</strong>
+                  <p>الصنف <b>{priceAlert.productName}</b> سُجل سابقاً لدى <b>{priceAlert.supplierName}</b> بسعر أقل: {formatMoney(priceAlert.cheaperUnitCostMinor)} للوحدة، بينما السعر الحالي {formatMoney(priceAlert.currentUnitCostMinor)}.</p>
+                  <small>{new Date(priceAlert.postedAt).toLocaleString("ar-EG", { timeZone: "Africa/Cairo" })} · يغلق تلقائياً بعد 10 ثوانٍ</small>
+                </div>
+                <button type="button" onClick={() => setPriceAlert(null)} aria-label="إغلاق تنبيه مقارنة السعر">×</button>
+              </aside>
+            )}
           </form>
+        </section>
+      )}
+      {section === "receive" && historyOpen && (
+        <section className="panel purchase-history-panel" aria-label="البحث المتقدم في فواتير التوريد">
+          <div className="purchase-history-head">
+            <div><span>أرشيف التوريد</span><h2>استرجاع وطباعة أي فاتورة سابقة</h2><p>ابحث برقم الفاتورة أو اسم المورد أو اسم الصنف أو الباركود، ثم اعرض التفاصيل الكاملة أو اطبعها.</p></div>
+            <button type="button" onClick={() => setHistoryOpen(false)}>إغلاق السجل</button>
+          </div>
+          <form className="purchase-history-filters" onSubmit={(event) => void loadPurchaseHistory(event)}>
+            <Field label="بحث متقدم"><input value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder="مورد، رقم فاتورة، اسم صنف أو باركود" /></Field>
+            <Field label="من تاريخ"><input type="date" value={historyFrom} onChange={(event) => setHistoryFrom(event.target.value)} /></Field>
+            <Field label="إلى تاريخ"><input type="date" value={historyTo} onChange={(event) => setHistoryTo(event.target.value)} /></Field>
+            <button className="primary" disabled={historyLoading}>{historyLoading ? "جارٍ البحث…" : "بحث"}</button>
+          </form>
+          <div className="purchase-history-grid">
+            <div className="purchase-history-list">
+              {purchaseHistory.length === 0 ? <p className="empty-state">لا توجد فواتير مطابقة بعد. اضغط «بحث» لاسترجاع السجل.</p> : purchaseHistory.map((invoice) => (
+                <button type="button" key={invoice.id} className={historyDetail?.id === invoice.id ? "selected" : ""} onClick={() => void openHistoricPurchase(invoice)}>
+                  <b>{invoice.invoiceNo}</b><span>{invoice.partyName}</span><small>{new Date(invoice.postedAt).toLocaleString("ar-EG", { timeZone: "Africa/Cairo" })} · {invoice.itemCount} أصناف</small><strong>{formatMoney(invoice.totalMinor)}</strong>
+                </button>
+              ))}
+            </div>
+            <div className="purchase-history-detail">
+              {!historyDetail ? <p className="empty-state">اختر فاتورة لعرض أصنافها وتفاصيلها.</p> : <>
+                <div className="purchase-history-detail-head"><div><h3>{historyDetail.invoiceNo}</h3><p>{historyDetail.partyName} · {new Date(historyDetail.postedAt).toLocaleString("ar-EG", { timeZone: "Africa/Cairo" })}</p></div><button type="button" className="primary" onClick={() => void printPurchaseReceipt(historyDetail)}>طباعة الفاتورة</button></div>
+                <table><thead><tr><th>الصنف</th><th>الكمية</th><th>سعر الشراء</th><th>الإجمالي</th><th>الصلاحية</th></tr></thead><tbody>{historyDetail.lines.map((line) => <tr key={`${historyDetail.id}-${line.productId}`}><td>{line.nameAr}</td><td>{formatQty(line.qtyMilli, line.unitKind)}</td><td>{formatMoney(line.unitPriceMinor)}</td><td>{formatMoney(line.totalMinor)}</td><td>{line.expiresOn ?? "—"}</td></tr>)}</tbody></table>
+                <div className="purchase-history-total">إجمالي الفاتورة <b>{formatMoney(historyDetail.totalMinor)}</b></div>
+              </>}
+            </div>
+          </div>
         </section>
       )}
       {section === "count" && (
@@ -4078,7 +6606,15 @@ function InventoryScreen({
       )}
       {section === "expiry" && (
         <section className="panel table-wrap operation-panel">
-          <h2>تنبيه الصلاحية — 30 يوماً</h2>
+          <div className="section-head">
+            <div>
+              <h2>تنبيه الصلاحية — 30 يوماً</h2>
+              <p className="panel-help">تظهر تلقائيًا كل دفعة تنتهي خلال شهر، بما فيها ما انتهت صلاحيتها بالفعل.</p>
+            </div>
+            <button type="button" onClick={() => void exportExpiryAlerts()}>
+              تصدير Excel
+            </button>
+          </div>
           {expiry.length === 0 ? (
             <p className="empty-state">لا توجد تشغيلات قريبة من الانتهاء.</p>
           ) : (
@@ -4111,31 +6647,105 @@ function InventoryScreen({
           )}
         </section>
       )}
-      {unknownReceiptBarcode && (
-        <div className="modal-backdrop">
-          <section className="modal scanner-modal">
-            <span className="scanner-icon">⌁</span>
-            <h2>باركود غير مسجل</h2>
-            <p>
-              هذا الباركود غير موجود في قائمة الأصناف. أضفه أولاً ثم سيعود
-              تلقائيًا إلى إذن الاستلام.
-            </p>
+      {pendingReceiptProduct && (
+        <div className="modal-backdrop" hidden>
+          <form className="modal form-grid" onSubmit={(event) => void completeReceiptProduct(event)}>
+            <h2 className="full">استكمال صنف جديد داخل الفاتورة</h2>
+            <p className="hint full">الباركود الممسوح: <b dir="ltr">{pendingReceiptProduct.barcode}</b>. ستعود مباشرة إلى سطر الفاتورة بعد الحفظ.</p>
+            <Field label="اسم الصنف">
+              <input name="nameAr" required autoFocus />
+            </Field>
+            <Field label="التصنيف">
+              <input name="category" required list="nabta-receipt-category-options" placeholder="اكتب أول حرفين لعرض التصنيفات" />
+            </Field>
+            <Field label="سعر البيع">
+              <input name="price" required inputMode="decimal" dir="ltr" />
+            </Field>
+            <Field label="سعر الجملة">
+              <input name="wholesalePrice" required defaultValue="0.00" inputMode="decimal" dir="ltr" />
+            </Field>
+            <Field label="كمية فاتورة المورد">
+              <input
+                name="invoiceQty"
+                required
+                min="1"
+                inputMode="decimal"
+                dir="ltr"
+                placeholder="مثال: 12 أو 8 أو 0.250"
+              />
+            </Field>
+              <Field label="وحدة الاستلام">
+              <select name="invoiceEntryUnit" defaultValue="CARTON">
+                <option value="CARTON">كرتونة</option>
+                <option value="PIECE">قطعة</option>
+                <option value="WEIGHT">وزن بالكيلو أو الجرام</option>
+              </select>
+            </Field>
+            <Field label="عدد القطع في الكرتونة (يُهمل للوزن)">
+              <input
+                name="purchasePackSize"
+                type="number"
+                min="1"
+                step="1"
+                defaultValue="1"
+                required
+                dir="ltr"
+              />
+            </Field>
+            <Field label="التكلفة (للكرتونة أو للقطعة أو لكل كيلو)">
+              <input
+                name="invoiceCost"
+                required
+                min="0"
+                defaultValue="0.00"
+                inputMode="decimal"
+                dir="ltr"
+              />
+            </Field>
+            <datalist id="nabta-receipt-category-options">
+              {[...new Set(products.map((product) => product.category))].sort((a, b) => a.localeCompare(b, "ar")).map((category) => <option key={category} value={category} />)}
+            </datalist>
             <div className="modal-actions">
-              <button onClick={() => setUnknownReceiptBarcode("")}>
+              <button type="button" onClick={() => setPendingReceiptProduct(null)}>
                 إلغاء
               </button>
-              <button
-                className="primary"
-                onClick={() => {
-                  onUnregisteredReceiptBarcode(unknownReceiptBarcode);
-                  setUnknownReceiptBarcode("");
-                }}
-              >
-                إضافة صنف جديد
-              </button>
+              <button className="primary">حفظ والعودة للفاتورة</button>
             </div>
-          </section>
+          </form>
         </div>
+      )}
+      {pendingReceiptProduct && (
+        <ProductCreateModal
+          barcode={pendingReceiptProduct.barcode}
+          initialName={pendingReceiptProduct.initialName ?? ""}
+          products={receiptProducts}
+          refresh={refresh}
+          canViewCost={canViewCost}
+          stockTarget="RECEIPT"
+          title="استكمال صنف جديد داخل فاتورة المورد"
+          description={<>الباركود الممسوح: <b dir="ltr">{pendingReceiptProduct.barcode}</b>. أتمم بطاقة الصنف الكاملة، ثم ستبقى الكمية والتكلفة في نفس سطر فاتورة المورد.</>}
+          onClose={() => setPendingReceiptProduct(null)}
+          onCreated={async ({ product: createdProduct, entryUnit, quantity, totalCost, retailPrice, purchasePackSize }) => {
+            const lineIndex = pendingReceiptProduct.lineIndex;
+            setInvoiceProducts((items) => items.some((item) => item.id === createdProduct.id) ? items : [...items, createdProduct]);
+            setReceiptLines((items) => items.map((item, index) => {
+              if (index !== lineIndex) return item;
+              const { pendingBarcode: _pendingBarcode, ...completed } = item;
+              return {
+                ...completed,
+                productId: createdProduct.id,
+                entryUnit,
+                costBasis: "LINE_TOTAL",
+                unitsPerPackage: String(purchasePackSize),
+                qty: quantity,
+                cost: totalCost,
+                retail: retailPrice,
+              };
+            }));
+            setPendingReceiptProduct(null);
+            setMessage("تمت إضافة الصنف وبقي في نفس سطر الفاتورة. أضف بقية الأصناف ثم رحّل الاستلام للمورد.");
+          }}
+        />
       )}
     </>
   );
@@ -4316,7 +6926,12 @@ function ReorderListScreen({ storeName }: { storeName: string }): ReactNode {
                 </td>
                 <td className="ltr">{item.barcode ?? "—"}</td>
                 <td>{formatQty(item.availableQtyMilli, item.unitKind)}</td>
-                <td>{formatQty(item.reorderLevelMilli, item.unitKind)}</td>
+                <td>
+                  {formatQty(item.reorderLevelMilli, item.unitKind)}
+                  {item.smartReorderLevelMilli > 0 && (
+                    <small>حد ذكي: {formatQty(item.smartReorderLevelMilli, item.unitKind)} · متوسط البيع اليومي: {formatQty(item.averageDailyDemandMilli, item.unitKind)}</small>
+                  )}
+                </td>
                 <td>
                   <b>{formatQty(item.shortageQtyMilli, item.unitKind)}</b>
                 </td>
@@ -4606,11 +7221,19 @@ function InvoicesScreen({
         if (prod.unitKind === "PIECE" && qtyMilli % 1000 !== 0) {
           throw new Error(`الصنف ${prod.nameAr} يباع بالقطعة ولا يقبل كسور`);
         }
+        const lineTotalMinor = minorFromInput(l.cost);
+        const retailPriceMinor = minorFromInput(l.retail) *
+          (prod.unitKind === "WEIGHT" && prod.weightUnit === "GRAM" ? 1000 : 1);
+        if (lineTotalMinor <= 0 || retailPriceMinor <= 0)
+          throw new Error(`أدخل إجمالي الشراء وسعر البيع للصنف ${prod.nameAr}`);
         return {
           productId: l.productId,
           qtyMilli,
-          unitCostMinor: minorFromInput(l.cost),
-          retailPriceMinor: minorFromInput(l.retail),
+          unitCostMinor: Math.floor((lineTotalMinor * 1000) / qtyMilli),
+          entryUnit: prod.unitKind === "WEIGHT" ? "WEIGHT" as const : "PIECE" as const,
+          costBasis: "LINE_TOTAL" as const,
+          lineTotalMinor,
+          retailPriceMinor,
           ...(user.permissions.includes("VIEW_COST") ? { wholesalePriceMinor: minorFromInput(l.wholesale) } : {}),
           lotCode: l.lot.trim() || undefined,
           expiresOn: l.expires || undefined,
@@ -5011,7 +7634,7 @@ function InvoicesScreen({
                   {selectedInvoice.lines.map((line, idx) => (
                     <tr key={`${line.productId}-${idx}`}>
                       <td><b>{line.nameAr}</b></td>
-                      <td dir="ltr">{formatQty(line.qtyMilli, line.unitKind)}</td>
+                      <td dir="ltr">{(line.saleUnit === "PACKAGE" || line.saleUnit === "CARTON") && line.packageSize ? `${line.qtyMilli / (line.packageSize * 1000)} ${line.saleUnit === "CARTON" ? "كرتونة" : "عبوة"}` : formatQty(line.qtyMilli, line.unitKind)}</td>
                       <td dir="ltr">{formatMoney(line.unitPriceMinor)}</td>
                       <td dir="ltr"><b>{formatMoney(line.totalMinor)}</b></td>
                       {selectedInvoice.kind === "PURCHASE" && <td dir="ltr">{line.lotCode || "—"}</td>}
@@ -5209,10 +7832,10 @@ function InvoicesScreen({
                       />
                     </Field>
 
-                    <Field label="سعر التكلفة للوحدة">
+                    <Field label="إجمالي سعر الشراء للكمية">
                       <input
                         type="text"
-                        placeholder="التكلفة (ج.م)"
+                        placeholder="إجمالي ما دُفع (ج.م)"
                         value={line.cost}
                         required
                         onChange={(e) => {
@@ -6249,36 +8872,77 @@ function ExpensesScreen({
   refresh: () => Promise<void>;
 }): ReactNode {
   const [message, setMessage] = useState("");
-  const [movementType, setMovementType] = useState<
-    "EXPENSE" | "DEPOSIT" | "WITHDRAWAL"
-  >("EXPENSE");
+  const [movementType, setMovementType] = useState<"CONSUMPTION" | "EXPENSE" | "DEPOSIT" | "WITHDRAWAL">("CONSUMPTION");
+  const [month, setMonth] = useState(() => new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo", year: "numeric", month: "2-digit" }).format(new Date()));
+  const [consumptions, setConsumptions] = useState<ShopConsumption[]>([]);
+  const [consumptionBusy, setConsumptionBusy] = useState(false);
   const movementLabel =
-    movementType === "EXPENSE"
+    movementType === "CONSUMPTION"
+      ? "استهلاك المحل"
+      : movementType === "EXPENSE"
       ? "مصروف"
       : movementType === "DEPOSIT"
         ? "إيداع في الدرج"
         : "سحب من الدرج";
+
+  const consumptionPeriod = useMemo(() => {
+    const year = Number(month.slice(0, 4));
+    const monthNumber = Number(month.slice(5, 7));
+    const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+    return { from: `${month}-01`, to: `${month}-${String(lastDay).padStart(2, "0")}` };
+  }, [month]);
+
+  const loadConsumptions = useCallback(async (): Promise<void> => {
+    setConsumptionBusy(true);
+    try {
+      const result = await invoke<{ items: ShopConsumption[] }>({ operation: "shop-consumptions.list", payload: consumptionPeriod });
+      setConsumptions(result.items);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+    } finally {
+      setConsumptionBusy(false);
+    }
+  }, [consumptionPeriod]);
+
+  useEffect(() => { void loadConsumptions(); }, [loadConsumptions]);
+
   async function post(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!shift) return;
     const form = event.currentTarget;
     const data = new FormData(form);
+    const isConsumption = movementType === "CONSUMPTION";
+    const itemName = String(data.get("itemName") ?? "").trim();
     try {
       await invoke({
         operation: "shifts.cash-movement",
         payload: {
           shiftId: shift.id,
           movement: {
-            type: movementType,
+            type: isConsumption ? "EXPENSE" : movementType,
             amountMinor: minorFromInput(String(data.get("amount"))),
-            reason: String(data.get("reason")),
+            reason: isConsumption ? `استهلاك المحل: ${itemName}` : String(data.get("reason")),
+            ...(!isConsumption && movementType === "EXPENSE" ? { expenseCategory: String(data.get("expenseCategory") || "مصروفات تشغيل عامة") } : {}),
+            ...(isConsumption ? {
+              consumption: {
+                itemName,
+                category: String(data.get("category")),
+                quantityNote: String(data.get("quantityNote") ?? "").trim() || undefined,
+                supplierName: String(data.get("supplierName") ?? "").trim() || undefined,
+                consumedOn: String(data.get("consumedOn")),
+                note: String(data.get("note") ?? "").trim() || undefined,
+              },
+            } : {}),
           },
         },
       });
       form.reset();
       await refresh();
+      if (isConsumption) await loadConsumptions();
       setMessage(
-        movementType === "EXPENSE"
+        isConsumption
+          ? "تم تسجيل استهلاك المحل وخصم قيمته من الدرج. سيظهر ضمن مصروفات التقرير الشهري حسب التاريخ المختار."
+          : movementType === "EXPENSE"
           ? "تم تسجيل المصروف وخصمه من النقدية المتوقعة ومن صافي الربح."
           : `تم تسجيل ${movementLabel} وتحديث رصيد الدرج المتوقع.`,
       );
@@ -6290,12 +8954,13 @@ function ExpensesScreen({
     <>
       <PageHead
         title="المصروفات والدرج"
-        subtitle="سجل الإيجار والكهرباء والرواتب، أو صحّح النقدية بإيداع وسحب موثقين."
+        subtitle="سجل مصروفات التشغيل واستهلاك المحل من الدرج، وستظهر تلقائيًا في التقارير الشهرية."
       />
       {message && <div className="notice">{message}</div>}
       <div className="subtabs" role="tablist" aria-label="حركة الدرج">
         {(
           [
+            ["CONSUMPTION", "استهلاك المحل"],
             ["EXPENSE", "مصروف"],
             ["DEPOSIT", "إيداع"],
             ["WITHDRAWAL", "سحب"],
@@ -6322,21 +8987,45 @@ function ExpensesScreen({
               <strong>{formatMoney(shift.expectedCashMinor)}</strong>
             </p>
             <form className="form-grid" onSubmit={(event) => void post(event)}>
-              <Field label="السبب">
-                <input
-                  name="reason"
-                  placeholder={
-                    movementType === "EXPENSE"
-                      ? "مثال: إيجار شهر أكتوبر"
-                      : "سبب الحركة"
-                  }
-                  minLength={3}
-                  required
-                />
-              </Field>
-              <Field label="المبلغ بالجنيه">
-                <input name="amount" inputMode="decimal" dir="ltr" required />
-              </Field>
+              {movementType === "CONSUMPTION" ? <>
+                <Field label="ما الذي اشتراه المحل؟">
+                  <input name="itemName" placeholder="مثال: أكياس تغليف أو منظف أرضيات" minLength={2} required />
+                </Field>
+                <Field label="تصنيف الاستهلاك">
+                  <select name="category" defaultValue="مستلزمات تشغيل">
+                    <option>مستلزمات تشغيل</option><option>نظافة</option><option>تغليف وأكياس</option><option>كهرباء ومياه</option><option>صيانة</option><option>ضيافة العاملين</option><option>نقل وتوصيل</option><option>أخرى</option>
+                  </select>
+                </Field>
+                <Field label="الكمية أو الوصف">
+                  <input name="quantityNote" placeholder="مثال: 3 عبوات أو كرتونة" />
+                </Field>
+                <Field label="المورد أو مكان الشراء (اختياري)">
+                  <input name="supplierName" placeholder="مثال: مكتبة الشيماء" />
+                </Field>
+                <Field label="تاريخ الشراء للتقارير">
+                  <input name="consumedOn" type="date" defaultValue={new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date())} required />
+                </Field>
+                <Field label="المبلغ المسحوب من الدرج بالجنيه">
+                  <input name="amount" inputMode="decimal" dir="ltr" required />
+                </Field>
+                <div className="full"><Field label="ملاحظات (اختياري)">
+                  <input name="note" placeholder="رقم إيصال أو تفاصيل إضافية" />
+                </Field></div>
+                <p className="form-hint full">يسجل نبتة حركة خصم موثقة من الدرج الآن، ويستخدم تاريخ الشراء في التقارير الشهرية.</p>
+              </> : <>
+                {movementType === "EXPENSE" && <Field label="تصنيف المصروف"><select name="expenseCategory" defaultValue="مصروفات تشغيل عامة"><option>مصروفات تشغيل عامة</option><option>إيجار</option><option>كهرباء ومياه</option><option>إنترنت واتصالات</option><option>نقل وتوصيل</option><option>صيانة</option><option>تسويق</option><option>نظافة وتغليف</option><option>رسوم حكومية</option><option>أخرى</option></select></Field>}
+                <Field label="السبب">
+                  <input
+                    name="reason"
+                    placeholder={movementType === "EXPENSE" ? "مثال: إيجار شهر أكتوبر" : "سبب الحركة"}
+                    minLength={3}
+                    required
+                  />
+                </Field>
+                <Field label="المبلغ بالجنيه">
+                  <input name="amount" inputMode="decimal" dir="ltr" required />
+                </Field>
+              </>}
               <button className="primary full">تسجيل {movementLabel}</button>
             </form>
           </>
@@ -6346,6 +9035,15 @@ function ExpensesScreen({
           </div>
         )}
       </section>
+      <section className="panel table-panel">
+        <div className="section-head">
+          <div><h2>سجل استهلاك المحل</h2><p>تفاصيل المشتريات المسددة من الدرج خلال الشهر المختار.</p></div>
+          <input aria-label="شهر استهلاك المحل" type="month" value={month} onChange={(event) => setMonth(event.target.value)} />
+        </div>
+        <div className="table-scroll"><table><thead><tr><th>التاريخ</th><th>المشتريات</th><th>التصنيف</th><th>الكمية</th><th>المورد</th><th>المبلغ</th><th>سجل بواسطة</th></tr></thead>
+          <tbody>{consumptions.map((item) => <tr key={item.id}><td dir="ltr">{item.consumedOn}</td><td><b>{item.itemName}</b>{item.note ? <small>{item.note}</small> : null}</td><td>{item.category}</td><td>{item.quantityNote ?? "—"}</td><td>{item.supplierName ?? "—"}</td><td>{formatMoney(item.amountMinor)}</td><td>{item.cashierName}</td></tr>)}
+          {!consumptionBusy && consumptions.length === 0 ? <tr><td className="table-empty" colSpan={7}>لا يوجد استهلاك محل مسجل في هذا الشهر.</td></tr> : null}</tbody></table></div>
+      </section>
     </>
   );
 }
@@ -6353,6 +9051,7 @@ function ExpensesScreen({
 function SettingsScreen({
   onSettingsChange,
   onDataReset,
+  terminalId,
   taxSettings = DEFAULT_TAX_SETTINGS,
   onTaxSettingsChange,
   currentUser,
@@ -6360,12 +9059,13 @@ function SettingsScreen({
 }: {
   onSettingsChange: (settings: BranchSettings) => void;
   onDataReset: () => void;
+  terminalId?: string | undefined;
   taxSettings?: TaxSettings;
   onTaxSettingsChange?: (settings: TaxSettings) => void;
   currentUser?: User | undefined;
   onUserUpdated?: ((user: User) => void) | undefined;
 }): ReactNode {
-  type SettingsTab = "store" | "devices" | "management";
+  type SettingsTab = "store" | "devices" | "payments" | "cloudflare" | "orders" | "management";
   const [settings, setSettings] = useState<BranchSettings | null>(null);
   const [activeTab, setActiveTab] = useState<SettingsTab>("store");
   const [taxEnabled, setTaxEnabled] = useState(taxSettings.enabled);
@@ -6376,6 +9076,50 @@ function SettingsScreen({
   const [serialDevices, setSerialDevices] = useState<SerialDevice[]>([]);
   const [message, setMessage] = useState("");
   const [devicesBusy, setDevicesBusy] = useState(false);
+  const [customerOrders, setCustomerOrders] = useState<Array<{
+    id: string; customerName: string; customerPhone: string; deliveryAddress: string; notes: string | null;
+    source: "WEB" | "MESSENGER"; status: "PENDING" | "CONFIRMED" | "CANCELLED" | "FULFILLED";
+    subtotalMinor: number; deliveryFeeMinor: number; totalMinor: number; createdAt: string; statusNote: string | null;
+    lines: Array<{ productId: string; nameAr: string; unitKind: "PIECE" | "WEIGHT"; saleUnit: "UNIT" | "PACKAGE" | "CARTON"; salePackageSize: number | null; qtyMilli: number; unitPriceMinor: number; lineTotalMinor: number }>;
+  }>>([]);
+  const [ordersBusy, setOrdersBusy] = useState(false);
+  async function refreshCustomerOrders(): Promise<void> {
+    setOrdersBusy(true);
+    try { setCustomerOrders((await invoke<{ orders: typeof customerOrders }>({ operation: "commerce.orders.list" })).orders); }
+    catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setOrdersBusy(false); }
+  }
+  async function printCustomerOrder(order: typeof customerOrders[number]): Promise<void> {
+    if (!settings) throw new Error("تعذر تحديد اسم المتجر للطباعة.");
+    await invoke({ operation: "hardware.delivery-order.print", payload: {
+      storeName: settings.storeName,
+      copies: 1,
+      order: {
+        id: order.id, source: order.source, customerName: order.customerName, customerPhone: order.customerPhone,
+        deliveryAddress: order.deliveryAddress, notes: order.notes, createdAt: order.createdAt,
+        subtotalMinor: order.subtotalMinor, deliveryFeeMinor: order.deliveryFeeMinor, totalMinor: order.totalMinor,
+        lines: order.lines,
+      },
+    } });
+  }
+  async function updateCustomerOrder(orderId: string, status: "CONFIRMED" | "CANCELLED"): Promise<void> {
+    setOrdersBusy(true);
+    try { await invoke({ operation: "commerce.orders.update", payload: { orderId, status } }); await refreshCustomerOrders(); setMessage(status === "CANCELLED" ? "تم إلغاء الطلب وإتاحة الكمية المحجوزة." : "تم تأكيد الطلب. اطبع ورقة التجهيز ثم أصدر الفاتورة النهائية من نقطة البيع عند التسليم الفعلي."); }
+    catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setOrdersBusy(false); }
+  }
+  async function confirmAndPrintCustomerOrder(order: typeof customerOrders[number]): Promise<void> {
+    setOrdersBusy(true);
+    try {
+      await invoke({ operation: "commerce.orders.update", payload: { orderId: order.id, status: "CONFIRMED" } });
+      await printCustomerOrder(order);
+      await refreshCustomerOrders();
+      setMessage("تم تأكيد الطلب وطباعة ورقة التجهيز. لم تُسجل فاتورة نهائية ولم يُخصم المخزون.");
+    } catch (cause) {
+      await refreshCustomerOrders();
+      setMessage(`تم تأكيد الطلب، لكن ${errorMessage(cause)}. يمكنك إعادة طباعة ورقة التجهيز من زر الطباعة.`);
+    } finally { setOrdersBusy(false); }
+  }
   async function refreshDevices(): Promise<void> {
     try {
       const [nextHardware, nextPrinters, nextSerial] = await Promise.all([
@@ -6426,7 +9170,7 @@ function SettingsScreen({
             userId: currentUser.id,
             update: {
               displayName: ownerDisplayName,
-              role: (currentUser.role as "CASHIER" | "MANAGER" | "OWNER" | "STOCK_KEEPER") || "OWNER",
+              role: (currentUser.role as "CASHIER" | "MANAGER" | "OWNER" | "STOCK_KEEPER" | "EXPIRY_CLERK") || "OWNER",
               active: true,
               discountLimitBps: 10000,
             },
@@ -6615,6 +9359,22 @@ function SettingsScreen({
           onClick={() => setActiveTab("management")}
         >
           الإدارة والبيانات
+        </button>
+        <button
+          id="settings-tab-payments"
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "payments"}
+          aria-controls="settings-panel-payments"
+          onClick={() => setActiveTab("payments")}
+        >
+          المدفوعات والتكاملات
+        </button>
+        <button id="settings-tab-cloudflare" type="button" role="tab" aria-selected={activeTab === "cloudflare"} aria-controls="settings-panel-cloudflare" onClick={() => setActiveTab("cloudflare")}>
+          تطبيق العملاء والاتصال
+        </button>
+        <button id="settings-tab-orders" type="button" role="tab" aria-selected={activeTab === "orders"} aria-controls="settings-panel-orders" onClick={() => { setActiveTab("orders"); void refreshCustomerOrders(); }}>
+          طلبات العملاء
         </button>
       </nav>
       {activeTab === "store" && settings && (
@@ -7009,8 +9769,352 @@ function SettingsScreen({
       {activeTab === "management" && <div id="settings-panel-management" role="tabpanel" aria-labelledby="settings-tab-management">
         <ManagementPanel onDataReset={onDataReset} currentUser={currentUser} onUserUpdated={onUserUpdated} />
       </div>}
+      {activeTab === "payments" && <div id="settings-panel-payments" role="tabpanel" aria-labelledby="settings-tab-payments">
+        <PaymentIntegrationPanel currentUser={currentUser} terminalId={terminalId} />
+      </div>}
+      {activeTab === "cloudflare" && <div id="settings-panel-cloudflare" role="tabpanel" aria-labelledby="settings-tab-cloudflare">
+        <CloudflareConnectionPanel currentUser={currentUser} />
+      </div>}
+      {activeTab === "orders" && <section id="settings-panel-orders" role="tabpanel" aria-labelledby="settings-tab-orders" className="panel operation-panel">
+        <div className="panel-title-row"><div><h2>طلبات العملاء أونلاين وماسنجر</h2><p className="hint">كل طلب يُحجز أولًا فقط. بعد مكالمتك للعميل اضغط «تأكيد وطباعة التجهيز»؛ الورقة تشمل الاسم والهاتف والعنوان والأصناف ورسوم التوصيل 20 ج.م، لكنها ليست فاتورة نهائية ولا تخصم المخزون.</p></div><button type="button" onClick={() => void refreshCustomerOrders()} disabled={ordersBusy}>تحديث</button></div>
+        <div className="table-wrap"><table><thead><tr><th>المصدر والعميل</th><th>العنوان والتفاصيل</th><th>الإجمالي</th><th>الحالة</th><th>وقت الإرسال</th><th>إجراء</th></tr></thead><tbody>
+          {customerOrders.map((order) => <tr key={order.id}><td><small>{order.source === "MESSENGER" ? "ماسنجر" : "المتجر الإلكتروني"}</small><br /><b>{order.customerName}</b><br /><small dir="ltr">{order.customerPhone}</small></td><td>{order.deliveryAddress}{order.notes ? <><br /><small>{order.notes}</small></> : null}<br /><small>{order.lines.length} أصناف</small></td><td><b>{formatMoney(order.totalMinor)}</b><br /><small>أصناف {formatMoney(order.subtotalMinor)} + توصيل {formatMoney(order.deliveryFeeMinor)}</small></td><td>{order.status === "PENDING" ? "بانتظار المراجعة" : order.status === "CONFIRMED" ? "مؤكد ومحجوز" : order.status === "FULFILLED" ? "تم التسليم" : "ملغي"}</td><td>{new Date(order.createdAt).toLocaleString("ar-EG")}</td><td><div className="table-actions">{order.status === "PENDING" && <><button type="button" className="primary" onClick={() => void confirmAndPrintCustomerOrder(order)} disabled={ordersBusy}>تأكيد وطباعة التجهيز</button><button type="button" className="danger" onClick={() => void updateCustomerOrder(order.id, "CANCELLED")} disabled={ordersBusy}>إلغاء</button></>}{order.status === "CONFIRMED" && <><button type="button" onClick={() => void printCustomerOrder(order)} disabled={ordersBusy}>إعادة طباعة التجهيز</button><small>أصدر الفاتورة النهائية من نقطة البيع عند التسليم، ثم سجل التحصيل الفعلي.</small></>}</div></td></tr>)}
+          {!customerOrders.length && <tr><td colSpan={6} className="empty">لا توجد طلبات عملاء حتى الآن.</td></tr>}
+        </tbody></table></div>
+      </section>}
     </>
   );
+}
+
+interface PaymentSettingsView {
+  provider: "KASHIER" | "FAWRY";
+  canEditLive: boolean;
+  environments: Array<{
+    environment: "TEST" | "LIVE";
+    merchantId: string | null;
+    webhookUrl: string;
+    merchantRedirectUrl: string;
+    relayUrl: string;
+    receiptPrintEnabled: boolean;
+    requestTimeoutMs: number;
+    retryLimit: number;
+    enabledMethods: unknown[];
+    configured: boolean;
+  }>;
+  devices: Array<{ terminalId: string; serialNo: string; active: boolean }>;
+}
+
+const kashierEnabledMethodOptions = [
+  ["KASHIER_POS_CARD", "ماكينة Kashier POS — بطاقة وNFC"],
+  ["MOBILE_WALLET", "محفظة إلكترونية"],
+  ["INSTAPAY_QR", "InstaPay — رمز QR"],
+  ["INSTAPAY_R2P", "InstaPay — طلب دفع"],
+] as const;
+
+function hasScannerNumericBarcode(barcodes: string[]): boolean {
+  return barcodes.some((barcode) => /^\d{8,14}$/.test(barcode));
+}
+
+function cartonContentLabel(kind: ReceiptLineDraft["cartonContent"]): string {
+  if (kind === "PACK") return "عبوة";
+  if (kind === "BAG") return "كيس";
+  return "قطعة";
+}
+
+function PaymentIntegrationPanel({ currentUser, terminalId }: { currentUser?: User | undefined; terminalId?: string | undefined }): ReactNode {
+  const [settings, setSettings] = useState<PaymentSettingsView | null>(null);
+  const [provider, setProvider] = useState<"KASHIER" | "FAWRY">("KASHIER");
+  const [environment, setEnvironment] = useState<"TEST" | "LIVE">("TEST");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const selected = settings?.environments.find((item) => item.environment === environment);
+  const refresh = async (): Promise<void> => {
+    try { setSettings(await invoke<PaymentSettingsView>({ operation: "payments.settings.get", payload: { provider } })); }
+    catch (cause) { setMessage(errorMessage(cause)); }
+  };
+  useEffect(() => { void refresh(); }, [provider]);
+  const isKashier = provider === "KASHIER";
+  const providerName = isKashier ? "Kashier" : "فوري";
+  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      await invoke({ operation: "payments.settings.update", payload: {
+        provider,
+        environment,
+        activateEnvironment: true,
+        merchantId: String(data.get("merchantId") ?? "").trim(),
+        ...(String(data.get("secretKey") ?? "").trim() ? { secretKey: String(data.get("secretKey")).trim() } : {}),
+        ...(String(data.get("apiKey") ?? "").trim() ? { apiKey: String(data.get("apiKey")).trim() } : {}),
+        ...(String(data.get("paymentApiKey") ?? "").trim() ? { paymentApiKey: String(data.get("paymentApiKey")).trim() } : {}),
+        ...(String(data.get("secureHashKey") ?? "").trim() ? { secureHashKey: String(data.get("secureHashKey")).trim() } : {}),
+        ...(String(data.get("relayToken") ?? "").trim() ? { relayToken: String(data.get("relayToken")).trim() } : {}),
+        webhookUrl: String(data.get("webhookUrl") ?? "").trim(),
+        merchantRedirectUrl: String(data.get("merchantRedirectUrl") ?? "").trim(),
+        relayUrl: String(data.get("relayUrl") ?? "").trim(),
+        receiptPrintEnabled: data.get("receiptPrintEnabled") === "on",
+        requestTimeoutMs: Number(data.get("requestTimeoutMs")) || 30000,
+        retryLimit: Number(data.get("retryLimit")) || 0,
+        enabledMethods: Array.from(data.getAll("enabledMethods")).map(String) as Array<"KASHIER_POS_CARD" | "FAWRY_REFERENCE" | "ONLINE_CARD" | "MOBILE_WALLET" | "PAYMENT_LINK" | "INSTAPAY_QR" | "INSTAPAY_R2P" | "BANK_INSTALLMENTS" | "BNPL" | "MEEZA_CARD">,
+        confirmationPassword: String(data.get("confirmationPassword") ?? ""),
+      } });
+      setMessage(`تم حفظ إعدادات ${providerName} المشفرة. لا تُعرض المفاتيح المحفوظة مرة أخرى.`);
+      await refresh();
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function bindDevice(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      await invoke({ operation: "payments.devices.bind", payload: { provider, terminalId: String(data.get("terminalId") ?? "").trim(), serialNo: String(data.get("serialNo") ?? "").trim(), isDefault: true, active: data.get("active") === "on" } });
+      setMessage(`تم حفظ بيانات ماكينة ${providerName} لنقطة البيع.`);
+      await refresh();
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function testConnection(): Promise<void> {
+    setBusy(true);
+    try {
+      await invoke({ operation: "payments.methods.refresh", payload: { provider } });
+      setMessage(isKashier ? "تم الاتصال بـ Kashier واسترجاع وسائل الدفع المتاحة للحساب." : "إعداد فوري مكتمل محليًا ويمكن إنشاء رقم مرجعي عند إدخال بيانات التاجر.");
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function reconcile(): Promise<void> {
+    setBusy(true);
+    try {
+      const result = await invoke<{ candidates: number; reconciled: number }>({ operation: "payments.reconcile", payload: { provider } });
+      setMessage(`اكتملت المراجعة: ${result.reconciled} من ${result.candidates} طلب دفع.`);
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  return <section className="panel operation-panel" dir="rtl">
+    <h2>المدفوعات والتكاملات</h2>
+    <p className="hint">مفاتيح الدفع تحفظ مشفرة في الخادم المحلي ولا تُعرض بعد الحفظ. اجعل Kashier POS هو الخيار الرئيسي للبطاقة وNFC؛ فوري يبقى خيار رقم مرجعي منفصل.</p>
+    {message && <div className="notice">{message}</div>}
+    <div className="payment-tabs" role="tablist" aria-label="مزود الدفع">
+      <button type="button" role="tab" aria-selected={isKashier} className={isKashier ? "selected" : ""} onClick={() => setProvider("KASHIER")} disabled={busy}>Kashier POS — بطاقة وNFC</button>
+      <button type="button" role="tab" aria-selected={!isKashier} className={!isKashier ? "selected" : ""} onClick={() => setProvider("FAWRY")} disabled={busy}>فوري — رقم مرجعي</button>
+    </div>
+    <div className="payment-tabs" role="tablist" aria-label={`بيئة ${providerName}`}>
+      {(["TEST", "LIVE"] as const).map((value) => <button key={value} type="button" role="tab" aria-selected={environment === value} className={environment === value ? "selected" : ""} onClick={() => setEnvironment(value)} disabled={busy || (value === "LIVE" && !settings?.canEditLive)}>{value === "TEST" ? "وضع الاختبار" : "الوضع الفعلي"}</button>)}
+    </div>
+    <p className="hint">الحالة: {selected?.configured ? (isKashier ? "مُعدّ ويمكن اختبار ماكينة Kashier" : "مُعدّ ويمكن اختبار إنشـاء رقم فوري المرجعي") : (isKashier ? "يحتاج Merchant ID ومفاتيح Kashier ومفتاح تشفير الخادم" : "يحتاج Merchant Code وSecure Hash Key من فوري ومفتاح تشفير الخادم")}</p>
+    <form className="settings-form" onSubmit={(event) => void save(event)}>
+      <div className="two-columns">
+        <Field label={isKashier ? "Kashier Merchant ID" : "Fawry Merchant Code"}><input name="merchantId" required defaultValue={selected?.merchantId ?? ""} dir="ltr" /></Field>
+        <Field label="مهلة الاتصال (مللي ثانية)"><input name="requestTimeoutMs" type="number" min="3000" max="60000" defaultValue={selected?.requestTimeoutMs ?? 30000} dir="ltr" /></Field>
+        {isKashier ? <>
+          <Field label="Kashier Secret Key"><input name="secretKey" type="password" autoComplete="new-password" placeholder="اتركه فارغًا للإبقاء على القيمة الحالية" dir="ltr" /></Field>
+          <Field label="Kashier API Key"><input name="apiKey" type="password" autoComplete="new-password" placeholder="اتركه فارغًا للإبقاء على القيمة الحالية" dir="ltr" /></Field>
+          <Field label="Kashier Payment API Key"><input name="paymentApiKey" type="password" autoComplete="new-password" placeholder="اتركه فارغًا للإبقاء على القيمة الحالية" dir="ltr" /></Field>
+        </> : <Field label="Fawry Secure Hash Key"><input name="secureHashKey" type="password" autoComplete="new-password" placeholder="اتركه فارغًا للإبقاء على القيمة الحالية" dir="ltr" /></Field>}
+        <Field label="عدد المحاولات الآمنة"><input name="retryLimit" type="number" min="0" max="3" defaultValue={selected?.retryLimit ?? 0} dir="ltr" /></Field>
+        <Field label={`${providerName} Webhook URL`}><input name="webhookUrl" type="url" defaultValue={selected?.webhookUrl ?? ""} placeholder={isKashier ? "https://your-domain/v1/payments/webhooks/kashier/LIVE" : "https://your-domain/v1/payments/webhooks/fawry/LIVE"} dir="ltr" /><small className="hint">ضع رابطًا عامًا HTTPS فقط عند تجهيز Cloudflare Tunnel/Worker؛ لا يستخدمه البرنامج في وضعه المحلي دون إنترنت.</small></Field>
+        <Field label="رابط العودة للتوثيق (اختياري)"><input name="merchantRedirectUrl" type="url" defaultValue={selected?.merchantRedirectUrl ?? ""} placeholder="https://..." dir="ltr" /></Field>
+        <Field label="رابط وسيط HTTPS اختياري"><input name="relayUrl" type="url" defaultValue={selected?.relayUrl ?? ""} placeholder="https://..." dir="ltr" /></Field>
+        <Field label="رمز حماية الوسيط (إن وُجد)"><input name="relayToken" type="password" autoComplete="new-password" placeholder="اتركه فارغًا للإبقاء على القيمة الحالية" dir="ltr" /></Field>
+      </div>
+      <fieldset><legend>{isKashier ? "وسائل الدفع المفعلة في حساب Kashier" : "وسائل الدفع المفعلة للحساب"}</legend>
+        {(isKashier ? kashierEnabledMethodOptions : [['FAWRY_REFERENCE', 'فوري برقم مرجعي (Pay at Fawry)']]).map(([value, label]) => <label key={value} className="toggle-row"><input type="checkbox" name="enabledMethods" value={value} defaultChecked={selected?.enabledMethods.includes(value)} /><span>{label}</span></label>)}
+      </fieldset>
+      {isKashier && <p className="hint">فعّل المحفظة أو InstaPay هنا فقط إذا كانت ظاهرة كوسائل مفعّلة في حساب Kashier بعد «اختبار الاتصال وتحديث الوسائل». هذه العلامة تحفظ إعداد نبته ولا تمنح صلاحية غير مفعّلة من Kashier.</p>}
+      <label className="toggle-row"><input name="receiptPrintEnabled" type="checkbox" defaultChecked={selected?.receiptPrintEnabled ?? true} /><span>{isKashier ? "اطلب طباعة إيصال من ماكينة Kashier" : "اطبع إيصال نبته بعد تأكيد فوري"}</span></label>
+      <Field label="كلمة مرور المالك للتأكيد"><input name="confirmationPassword" type="password" required autoComplete="current-password" /></Field>
+      <div className="modal-actions"><button className="primary" disabled={busy || currentUser?.role !== "OWNER"}>حفظ إعدادات {providerName}</button><button type="button" disabled={busy || !selected?.configured} onClick={() => void testConnection()}>{isKashier ? "اختبار الاتصال وتحديث الوسائل" : "فحص إعداد فوري"}</button><button type="button" disabled={busy || !selected?.configured} onClick={() => void reconcile()}>مراجعة المدفوعات المعلّقة</button></div>
+    </form>
+    <hr />
+    <h3>{isKashier ? "ربط ماكينة Kashier" : "بيانات ماكينة فوري"}</h3>
+    <form className="two-columns" onSubmit={(event) => void bindDevice(event)}>
+      <Field label="معرّف نقطة البيع في نبته"><input name="terminalId" required defaultValue={terminalId ?? ""} placeholder="UUID" dir="ltr" /><small className="hint">يُنشأ ويُملأ تلقائيًا لهذا التثبيت.</small></Field>
+      <Field label={isKashier ? "Kashier POS Serial Number" : "رقم/معرّف ماكينة فوري"}><input name="serialNo" required dir="ltr" /></Field>
+      <label className="toggle-row"><input name="active" type="checkbox" defaultChecked /><span>الماكينة نشطة</span></label>
+      <div className="modal-actions"><button className="primary" disabled={busy}>حفظ الربط</button></div>
+    </form>
+    {!isKashier && <p className="hint">هذه البيانات توثيق للماكينة ونقطة البيع فقط إلى أن تزودنا فوري ببروتوكول ربط مباشر معتمد؛ لن يرسل البرنامج مبالغ للماكينة بطريقة غير موثقة.</p>}
+    {settings?.devices.length ? <ul className="hint">{settings.devices.map((device) => <li key={device.terminalId}><span dir="ltr">{device.terminalId}</span> ← <span dir="ltr">{device.serialNo}</span> {device.active ? "(نشطة)" : "(متوقفة)"}</li>)}</ul> : <p className="hint">لم تُربط أي ماكينة بعد.</p>}
+  </section>;
+}
+
+interface CloudflareConnectionView {
+  enabled: boolean;
+  autoStart: boolean;
+  configured: boolean;
+  tunnelTokenConfigured: boolean;
+  commerceSecretConfigured: boolean;
+  terminalRelaySecretConfigured: boolean;
+  terminalRelayUrl: string;
+  cloudflaredBundled: boolean;
+  publicApiUrl: string;
+  cloudCoreUrl: string;
+  cloudStoreConfigured: boolean;
+  cloudMigrationState: "NOT_STARTED" | "PENDING" | "IMPORTED";
+  running: boolean;
+}
+
+type CloudMigrationProgressView = {
+  phase: string;
+  percent: number;
+  messageAr: string;
+  completedChunks?: number;
+  totalChunks?: number;
+};
+
+function CloudflareConnectionPanel({ currentUser }: { currentUser?: User | undefined }): ReactNode {
+  const [connection, setConnection] = useState<CloudflareConnectionView | null>(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState<CloudMigrationProgressView | null>(null);
+  const [deviceMode, setDeviceMode] = useState<"PRIMARY" | "SECONDARY">("PRIMARY");
+  const refresh = async (): Promise<void> => {
+    try {
+      const [nextConnection, config] = await Promise.all([
+        invoke<CloudflareConnectionView>({ operation: "cloudflare.connection.get" }),
+        invoke<Config>({ operation: "config.get" }),
+      ]);
+      setConnection(nextConnection);
+      setDeviceMode(config.deviceMode === "SECONDARY" ? "SECONDARY" : "PRIMARY");
+    }
+    catch (cause) { setMessage(errorMessage(cause)); }
+  };
+  useEffect(() => { void refresh(); }, []);
+  useEffect(() => window.nabta.onCloudMigrationProgress((progress) => setMigrationProgress(progress)), []);
+  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      const result = await invoke<CloudflareConnectionView>({
+        operation: "cloudflare.connection.update",
+        payload: {
+          enabled: data.get("enabled") === "on",
+          autoStart: data.get("autoStart") === "on",
+          ...(String(data.get("tunnelToken") ?? "").trim() ? { tunnelToken: String(data.get("tunnelToken")).trim() } : {}),
+          ...(String(data.get("commerceSharedSecret") ?? "").trim() ? { commerceSharedSecret: String(data.get("commerceSharedSecret")).trim() } : {}),
+          ...(String(data.get("terminalRelaySharedSecret") ?? "").trim() ? { terminalRelaySharedSecret: String(data.get("terminalRelaySharedSecret")).trim() } : {}),
+          terminalRelayUrl: String(data.get("terminalRelayUrl") ?? "").trim(),
+          publicApiUrl: String(data.get("publicApiUrl") ?? "").trim(),
+        },
+      });
+      setConnection(result);
+      setMessage(result.configured ? "تم حفظ الاتصال وإعادة تشغيل Cloudflare Tunnel تلقائيًا." : "تم حفظ الإعدادات. أدخل رمز النفق ومفتاح تطبيق العملاء لتفعيل الاتصال.");
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function makePrimary(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const pin = String(new FormData(event.currentTarget).get("enrollmentPin") ?? "");
+    setBusy(true);
+    try {
+      await invoke({ operation: "multi-terminal.primary.enable", payload: { enrollmentPin: pin } });
+      setDeviceMode("PRIMARY");
+      setMessage("تم تعيين هذا الجهاز رئيسيًا. ستبقى قاعدة البيانات هنا، وتستطيع الآن ربط أجهزة الكاشير الأخرى.");
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function joinPrimary(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      await invoke({ operation: "multi-terminal.join", payload: {
+        serverUrl: String(data.get("serverUrl") ?? "").trim(),
+        relayKey: String(data.get("relayKey") ?? "").trim(),
+        terminalName: String(data.get("terminalName") ?? "").trim(),
+        enrollmentPin: String(data.get("enrollmentPin") ?? "").trim(),
+      } });
+      setDeviceMode("SECONDARY");
+      setMessage("تم ربط هذا الكاشير بالمخزن الموحد. أعد تشغيل نبتة الآن ليستخدم قاعدة بيانات الجهاز الرئيسي.");
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+  async function migrateStoreToCloud(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    setMigrationProgress({ phase: "STARTING", percent: 0, messageAr: "يتم بدء فحص الاتصال السحابي…" });
+    try {
+      const result = await invoke<{ storeId: string; recordCount: number; chunkCount: number; status: "IMPORTED" }>({
+        operation: "cloud.migration.run",
+        payload: {
+          cloudUrl: String(data.get("cloudCoreUrl") ?? "").trim(),
+          ...(String(data.get("bootstrapKey") ?? "").trim() ? { bootstrapKey: String(data.get("bootstrapKey")).trim() } : {}),
+          ownerUsername: String(data.get("ownerUsername") ?? "").trim(),
+          ownerCloudPassword: String(data.get("ownerCloudPassword") ?? ""),
+        },
+      });
+      await refresh();
+      event.currentTarget.reset();
+      setMessage(`اكتمل نسخ ${result.recordCount} سجلًا على ${result.chunkCount} دفعة والتحقق منها في السحابة. النسخة المحلية ما زالت تعمل ولم يتم حذف أي بيانات.`);
+    } catch (cause) {
+      setMessage(errorMessage(cause));
+      setMigrationProgress(null);
+    }
+    finally { setBusy(false); }
+  }
+  const canEdit = currentUser?.role === "OWNER";
+  return <section className="panel operation-panel" dir="rtl">
+    <h2>ربط تطبيق العملاء وCloudflare</h2>
+    <p className="hint">الاتصال المحلي يظل يعمل بلا إنترنت. عند التفعيل، يبدأ Cloudflare Tunnel من نفس جهاز نبتة بعد تثبيت البرنامج وعند تسجيل دخول Windows. لا تُعرض المفاتيح المحفوظة مرة أخرى.</p>
+    {message && <div className="notice">{message}</div>}
+    <p className="hint">الحالة: {connection?.running ? "النفق يعمل الآن" : connection?.configured ? "جاهز وسيبدأ مع نبتة" : "غير مكتمل"} · برنامج Cloudflare: {connection?.cloudflaredBundled ? "مضمّن" : "غير موجود"}</p>
+    <form className="settings-form" onSubmit={(event) => void save(event)}>
+      <div className="two-columns">
+        <Field label="رابط تطبيق العملاء العام (اختياري)">
+          <input name="publicApiUrl" type="url" defaultValue={connection?.publicApiUrl ?? ""} placeholder="https://market.example.com" dir="ltr" />
+        </Field>
+        <Field label="رمز Cloudflare Tunnel الجديد">
+          <input name="tunnelToken" type="password" autoComplete="new-password" placeholder={connection?.tunnelTokenConfigured ? "اتركه فارغًا للإبقاء على الرمز الحالي" : "ضع Tunnel Token"} dir="ltr" />
+        </Field>
+        <Field label="مفتاح ربط تطبيق العملاء الجديد">
+          <input name="commerceSharedSecret" type="password" autoComplete="new-password" placeholder={connection?.commerceSecretConfigured ? "اتركه فارغًا للإبقاء على المفتاح الحالي" : "ضع المفتاح السري للـ Worker"} dir="ltr" />
+        </Field>
+        <Field label="رابط كاشيرات نبتة عبر Cloudflare">
+          <input name="terminalRelayUrl" type="url" defaultValue={connection?.terminalRelayUrl ?? ""} placeholder="https://pos.example.com" dir="ltr" />
+        </Field>
+        <Field label="مفتاح أجهزة نبتة الموحد">
+          <input name="terminalRelaySharedSecret" type="password" autoComplete="new-password" placeholder={connection?.terminalRelaySecretConfigured ? "اتركه فارغًا للإبقاء على المفتاح الحالي" : "مفتاح Worker الخاص بالكاشيرات"} dir="ltr" />
+        </Field>
+      </div>
+      <label className="toggle-row"><input name="enabled" type="checkbox" defaultChecked={connection?.enabled} disabled={!canEdit || busy} /><span>تفعيل Cloudflare Tunnel لهذا الجهاز الأساسي</span></label>
+      <label className="toggle-row"><input name="autoStart" type="checkbox" defaultChecked={connection?.autoStart} disabled={!canEdit || busy} /><span>تشغيل نبتة والاتصال تلقائيًا بعد تسجيل دخول Windows</span></label>
+      <p className="hint">عند تغيير Cloudflare: ضع رمز النفق الجديد، وضع نفس مفتاح تطبيق العملاء في سرّ Worker الجديد ثم هنا. لا تفعّل جهازين على نفس النفق في الوقت نفسه.</p>
+      <div className="modal-actions"><button className="primary" disabled={!canEdit || busy}>حفظ الاتصال وإعادة التشغيل</button><button type="button" disabled={busy} onClick={() => void refresh()}>تحديث الحالة</button></div>
+    </form>
+    <details className="panel">
+      <summary>نسخ بيانات هذا المتجر إلى نبتة السحابية</summary>
+      <p className="hint">يُستخدم هذا من جهاز نبتة الذي عليه البيانات الأصلية فقط. ينشئ نبتة نسخة احتياطية، يختبر استعادتها، ثم يرفع دفعات قابلة للاستكمال ويتحقق من كل جدول. عند التحديث تبقى آخر نسخة سحابية سليمة فعّالة حتى يكتمل التحقق من النسخة الجديدة؛ لا يحذف النسخة المحلية ولا يبدل تشغيل الكاشير تلقائيًا.</p>
+      <p className="hint">الحالة: {connection?.cloudMigrationState === "IMPORTED" ? "توجد نسخة سحابية محمية ومتحقق منها. يمكنك تحديثها دون مفتاح التهيئة أو تغيير كلمة مرور المالك." : connection?.cloudMigrationState === "PENDING" ? "تم حفظ بيانات الاستكمال؛ يمكن متابعة النقل من نفس الجهاز." : "لم يُنشأ مخزن سحابي لهذا المتجر بعد."}</p>
+      <form className="settings-form" onSubmit={(event) => void migrateStoreToCloud(event)}>
+        <div className="two-columns">
+          <Field label="رابط نواة نبتة السحابية"><input name="cloudCoreUrl" type="url" required defaultValue={connection?.cloudCoreUrl ?? ""} placeholder="https://nabta-cloud-core.mahmoudnabih989.workers.dev" dir="ltr" /></Field>
+          <Field label="مفتاح التهيئة الأول (مرة واحدة فقط)"><input name="bootstrapKey" type="password" autoComplete="new-password" placeholder={connection?.cloudStoreConfigured ? "اتركه فارغًا لإعادة النقل أو الاستكمال" : "المفتاح الذي عيّنته في Cloudflare"} dir="ltr" /></Field>
+          <Field label="اسم مستخدم المالك الموجود في نبتة"><input name="ownerUsername" required={!connection?.cloudStoreConfigured || connection?.cloudMigrationState !== "IMPORTED"} autoComplete="username" placeholder={connection?.cloudMigrationState === "IMPORTED" ? "اختياري عند تحديث النسخة" : "مطلوب عند التهيئة"} dir="ltr" /></Field>
+          <Field label="كلمة مرور سحابية جديدة للمالك (12 حرفًا على الأقل)"><input name="ownerCloudPassword" type="password" minLength={12} required={!connection?.cloudStoreConfigured || connection?.cloudMigrationState !== "IMPORTED"} autoComplete="new-password" placeholder={connection?.cloudMigrationState === "IMPORTED" ? "اختيارية عند تحديث النسخة" : "مطلوبة عند التهيئة"} dir="ltr" /></Field>
+        </div>
+        <div className="modal-actions"><button className="primary" disabled={!canEdit || busy || deviceMode !== "PRIMARY"}>{connection?.cloudMigrationState === "PENDING" ? "استكمال النقل للسحابة" : connection?.cloudMigrationState === "IMPORTED" ? "إنشاء نسخة جديدة والتحقق ثم تحديث السحابة" : "إنشاء نسخة والتحقق ثم النقل للسحابة"}</button></div>
+      </form>
+      {migrationProgress && <div className="cloud-migration-progress" role="status" aria-live="polite">
+        <div className="cloud-migration-progress-head"><strong>{migrationProgress.messageAr}</strong><b>{migrationProgress.percent}%</b></div>
+        <div className="cloud-migration-progress-track" aria-label={`تقدم النقل ${migrationProgress.percent}%`}><span style={{ width: `${migrationProgress.percent}%` }} /></div>
+        {typeof migrationProgress.completedChunks === "number" && typeof migrationProgress.totalChunks === "number" && <small>تمت معالجة {migrationProgress.completedChunks} من {migrationProgress.totalChunks} دفعة.</small>}
+      </div>}
+    </details>
+    <hr />
+    <h3>المخزن الموحد والكاشيرات</h3>
+    <p className="hint">الحالة الحالية: {deviceMode === "PRIMARY" ? "هذا هو الجهاز الرئيسي وصاحب قاعدة البيانات" : "هذا كاشير متصل بالجهاز الرئيسي"}. لا يُشغّل النفق أو قاعدة بيانات مشتركة على الأجهزة الثانوية.</p>
+    {deviceMode !== "PRIMARY" && <form className="two-columns" onSubmit={(event) => void makePrimary(event)}><Field label="رمز تعيين الجهاز الرئيسي"><input name="enrollmentPin" type="password" inputMode="numeric" required /></Field><div className="modal-actions"><button className="primary" disabled={!canEdit || busy}>تعيين هذا الجهاز رئيسيًا</button></div></form>}
+    {deviceMode === "PRIMARY" && <details className="panel"><summary>تحويل هذا التثبيت إلى كاشير ثانوي متصل بالجهاز الرئيسي</summary><p className="hint">نفّذ هذا على الجهاز الثاني أو الثالث فقط؛ لا تنفذه على جهاز المخزن الرئيسي. لا يحذف أي بيانات محلية، لكنه يتوقف عن استخدامها بعد الربط.</p><form className="two-columns" onSubmit={(event) => void joinPrimary(event)}>
+      <Field label="اسم الكاشير الجديد"><input name="terminalName" required placeholder="كاشير 2" /></Field>
+      <Field label="رابط Cloudflare للكاشيرات"><input name="serverUrl" type="url" required defaultValue={connection?.terminalRelayUrl ?? ""} dir="ltr" /></Field>
+      <Field label="مفتاح أجهزة نبتة"><input name="relayKey" type="password" required autoComplete="new-password" /></Field>
+      <Field label="رمز ربط الجهاز"><input name="enrollmentPin" type="password" inputMode="numeric" required /></Field>
+      <div className="modal-actions full"><button className="primary" disabled={!canEdit || busy}>ربط هذا الجهاز ككاشير ثانوي</button></div>
+    </form></details>}
+  </section>;
 }
 
 function ManagementPanel({
@@ -7027,7 +10131,7 @@ function ManagementPanel({
     id: string;
     displayName: string;
     username: string;
-    role: "OWNER" | "MANAGER" | "CASHIER" | "STOCK_KEEPER";
+    role: "OWNER" | "MANAGER" | "CASHIER" | "STOCK_KEEPER" | "EXPIRY_CLERK";
     active: boolean;
     discountLimitBps: number;
   };
@@ -7354,6 +10458,7 @@ function ManagementPanel({
               <select name="role">
                 <option value="CASHIER">كاشير</option>
                 <option value="STOCK_KEEPER">أمين مخزن</option>
+                <option value="EXPIRY_CLERK">موظف صلاحية</option>
                 <option value="MANAGER">مدير</option>
                 <option value="OWNER">مالك</option>
               </select>
@@ -7396,6 +10501,7 @@ function ManagementPanel({
                   <option value="MANAGER">مدير</option>
                   <option value="CASHIER">كاشير</option>
                   <option value="STOCK_KEEPER">أمين مخزن</option>
+                  <option value="EXPIRY_CLERK">موظف صلاحية</option>
                 </select>
                 <input
                   name="discountLimitBps"
@@ -7579,21 +10685,22 @@ function ManagementPanel({
 
 function ReportsScreen({
   storeName = "الشيماء",
+  shift,
 }: {
   storeName?: string;
+  shift?: Shift | null;
 }): ReactNode {
   const today = new Date().toISOString().slice(0, 10);
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(today);
-  const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [data, setData] = useState<ComprehensiveReportResponse | null>(null);
   const [message, setMessage] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [exportingExcel, setExportingExcel] = useState(false);
   const [printing, setPrinting] = useState(false);
   const load = useCallback(async () => {
     try {
-      setData(
-        await invoke({ operation: "reports.summary", payload: { from, to } }),
-      );
+      setData(await invoke<ComprehensiveReportResponse>({ operation: "reports.comprehensive", payload: { from, to } }));
       setMessage("");
     } catch (cause) {
       setMessage(errorMessage(cause));
@@ -7602,16 +10709,15 @@ function ReportsScreen({
   useEffect(() => {
     void load();
   }, [load]);
-  const number = (key: string) => Number(data?.[key] ?? 0);
   const summary: ReportSummary = {
-    netSalesMinor: number("net_sales_minor"),
-    netCogsMinor: number("net_cogs_minor"),
-    grossProfitMinor: number("gross_profit_minor"),
-    estimatedNetProfitMinor: number("estimated_net_profit_minor"),
-    returnsMinor: number("returns_minor"),
-    expensesMinor: number("expenses_minor"),
-    damagedLossMinor: number("damaged_loss_minor"),
-    invoiceCount: number("invoice_count"),
+    netSalesMinor: data?.summary.netSalesMinor ?? 0,
+    netCogsMinor: data?.summary.netCogsMinor ?? 0,
+    grossProfitMinor: data?.summary.grossProfitMinor ?? 0,
+    estimatedNetProfitMinor: data?.summary.estimatedNetProfitMinor ?? 0,
+    returnsMinor: data?.summary.returnsMinor ?? 0,
+    expensesMinor: data?.summary.expensesMinor ?? 0,
+    damagedLossMinor: data?.summary.damagedLossMinor ?? 0,
+    invoiceCount: data?.summary.invoiceCount ?? 0,
   };
   const cards: ReadonlyArray<readonly [string, number]> = [
     ["صافي المبيعات", summary.netSalesMinor],
@@ -7627,6 +10733,13 @@ function ReportsScreen({
       `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
     setFrom(date(start));
     setTo(date(end));
+  };
+  const setPreviousMonth = (): void => {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const end = new Date(now.getFullYear(), now.getMonth(), 0);
+    const date = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+    setFrom(date(start)); setTo(date(end));
   };
   async function printReport(): Promise<void> {
     if (!data) return;
@@ -7664,11 +10777,21 @@ function ReportsScreen({
       setExporting(false);
     }
   }
+  async function exportExcel(): Promise<void> {
+    setExportingExcel(true);
+    try {
+      const result = await invoke<{ cancelled: boolean; path?: string }>({ operation: "reports.export-xlsx", payload: { from, to } });
+      setMessage(result.cancelled ? "تم إلغاء حفظ ملف Excel." : `تم حفظ التقرير الشامل بصيغة Excel في: ${result.path}`);
+    } catch (cause) { setMessage(errorMessage(cause)); }
+    finally { setExportingExcel(false); }
+  }
+  const maximumDailySales = Math.max(1, ...(data?.dailySales.map((item) => item.netSalesMinor) ?? [0]));
+  const maximumPayment = Math.max(1, ...(data?.paymentMethods.map((item) => item.amountMinor) ?? [0]));
   return (
     <>
       <PageHead
         title="التقارير والأرباح"
-        subtitle="الفلاتر تعمل بتوقيت القاهرة، والأرقام قابلة للمصالحة مع الدفاتر."
+        subtitle="اختر الشهر أو أي مدة مخصصة، ثم صدّر تقرير Excel شاملًا بالتحليل والتفاصيل."
       />
       <div className="filters report-actions">
         <Field label="من">
@@ -7686,6 +10809,7 @@ function ReportsScreen({
           />
         </Field>
         <button onClick={setThisMonth}>هذا الشهر</button>
+        <button onClick={setPreviousMonth}>الشهر السابق</button>
         <button onClick={() => void load()}>تحديث</button>
         <button
           className="primary"
@@ -7696,6 +10820,9 @@ function ReportsScreen({
         </button>
         <button disabled={!data || exporting} onClick={() => void exportPdf()}>
           {exporting ? "جارٍ التصدير…" : "تصدير PDF"}
+        </button>
+        <button className="primary" disabled={!data || exportingExcel} onClick={() => void exportExcel()}>
+          {exportingExcel ? "جارٍ تجهيز Excel…" : "تقرير Excel شامل"}
         </button>
       </div>
       {message && <div className="notice">{message}</div>}
@@ -7717,6 +10844,14 @@ function ReportsScreen({
           <b>{formatMoney(summary.expensesMinor)}</b>
         </p>
         <p>
+          <span>الرواتب</span>
+          <b>{formatMoney(data?.summary.payrollMinor ?? 0)}</b>
+        </p>
+        <p>
+          <span>استهلاك المحل</span>
+          <b>{formatMoney(data?.summary.shopConsumptionMinor ?? 0)}</b>
+        </p>
+        <p>
           <span>خسارة مرتجع تالف</span>
           <b>{formatMoney(summary.damagedLossMinor)}</b>
         </p>
@@ -7724,9 +10859,86 @@ function ReportsScreen({
           <span>عدد الفواتير</span>
           <b>{new Intl.NumberFormat("ar-EG").format(summary.invoiceCount)}</b>
         </p>
+        <p><span>قيمة المخزون</span><b>{formatMoney(data?.inventory.inventoryValueMinor ?? 0)}</b></p>
+        <p><span>أصناف منخفضة/نافدة</span><b>{data ? `${data.inventory.lowStockCount} / ${data.inventory.outOfStockCount}` : "0 / 0"}</b></p>
       </section>
+      {data && <div className="two-columns">
+        <section className="panel report-details">
+          <h2>اتجاه المبيعات</h2>
+          {data.dailySales.length ? data.dailySales.map((item) => <div key={item.date} style={{ display: "grid", gridTemplateColumns: "88px 1fr 110px", gap: 8, alignItems: "center", marginBlock: 9 }}>
+            <small dir="ltr">{item.date}</small><span style={{ display: "block", height: 12, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><span style={{ display: "block", height: "100%", width: `${Math.max(3, (item.netSalesMinor / maximumDailySales) * 100)}%`, background: "#059669" }} /></span><b>{formatMoney(item.netSalesMinor)}</b>
+          </div>) : <p className="hint">لا توجد مبيعات في الفترة المختارة.</p>}
+        </section>
+        <section className="panel report-details">
+          <h2>وسائل الدفع</h2>
+          {data.paymentMethods.length ? data.paymentMethods.map((item) => <div key={item.method} style={{ display: "grid", gridTemplateColumns: "100px 1fr 100px", gap: 8, alignItems: "center", marginBlock: 9 }}>
+            <small>{item.method}</small><span style={{ display: "block", height: 12, borderRadius: 99, background: "#e2e8f0", overflow: "hidden" }}><span style={{ display: "block", height: "100%", width: `${Math.max(3, (item.amountMinor / maximumPayment) * 100)}%`, background: "#2563eb" }} /></span><b>{formatMoney(item.amountMinor)}</b>
+          </div>) : <p className="hint">لا توجد مدفوعات في الفترة المختارة.</p>}
+        </section>
+        <section className="panel report-details">
+          <h2>أفضل الأصناف</h2>
+          {data.topProducts.slice(0, 5).map((item) => <p key={`${item.nameAr}-${item.category}`}><span>{item.nameAr}<small> — {item.category}</small></span><b>{formatMoney(item.netSalesMinor)}</b></p>)}
+        </section>
+        <section className="panel report-details">
+          <h2>تحليل سريع</h2>
+          {data.insights.map((insight) => <p key={insight} className="hint">• {insight}</p>)}
+        </section>
+      </div>}
+      <PayrollPanel month={from.slice(0, 7)} shift={shift ?? null} />
     </>
   );
+}
+
+function PayrollPanel({ month, shift }: { month: string; shift: Shift | null }): ReactNode {
+  type ManagedEmployee = { id: string; displayName: string; active: boolean; role: string };
+  type PayrollRow = { id: string; employeeName: string; netMinor: number; paymentMethod: string; paidOn: string };
+  const [employees, setEmployees] = useState<ManagedEmployee[]>([]);
+  const [rows, setRows] = useState<PayrollRow[]>([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const today = new Date().toISOString().slice(0, 10);
+  const refresh = useCallback(async () => {
+    try {
+      const [users, payroll] = await Promise.all([
+        invoke<{ users: ManagedEmployee[] }>({ operation: "users.list" }),
+        invoke<{ items: PayrollRow[] }>({ operation: "payroll.list", payload: { month } }),
+      ]);
+      setEmployees(users.users.filter((user) => user.active));
+      setRows(payroll.items);
+    } catch (cause) { setMessage(errorMessage(cause)); }
+  }, [month]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  async function save(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const minor = (name: string): number => Math.max(0, Math.round(Number(form.get(name) || 0) * 100));
+    const paymentMethod = String(form.get("paymentMethod")) as "CASH" | "BANK_TRANSFER" | "WALLET";
+    setBusy(true);
+    try {
+      await invoke({ operation: "payroll.create", payload: {
+        employeeUserId: String(form.get("employeeUserId")), payrollMonth: month, baseMinor: minor("base"), overtimeMinor: minor("overtime"), bonusMinor: minor("bonus"), deductionMinor: minor("deduction"), advanceMinor: minor("advance"),
+        paymentMethod, ...(paymentMethod === "CASH" && shift ? { shiftId: shift.id } : {}), paidOn: String(form.get("paidOn")), note: String(form.get("note") || "") || undefined,
+      } });
+      event.currentTarget.reset(); setMessage("تم تسجيل الراتب ضمن مصروفات الشهر وسجل التدقيق."); await refresh();
+    } catch (cause) { setMessage(errorMessage(cause)); } finally { setBusy(false); }
+  }
+  return <section className="panel report-details">
+    <div className="panel-title-row"><div><h2>الرواتب الشهرية</h2><p>سجّل الاستحقاق والخصومات والسلف. الراتب النقدي يخصم من الدرج المفتوح، والتحويل والمحفظة يظهران في الربح دون تغيير الدرج.</p></div><button type="button" onClick={() => void refresh()} disabled={busy}>تحديث</button></div>
+    <form className="two-columns" onSubmit={(event) => void save(event)}>
+      <Field label="الموظف"><select name="employeeUserId" required defaultValue=""><option value="" disabled>اختر الموظف</option>{employees.map((employee) => <option value={employee.id} key={employee.id}>{employee.displayName} — {employee.role}</option>)}</select></Field>
+      <Field label="تاريخ الصرف"><input name="paidOn" type="date" required defaultValue={today} /></Field>
+      <Field label="الراتب الأساسي (ج.م)"><input name="base" type="number" min="0" step="0.01" required /></Field>
+      <Field label="إضافي / أوفر تايم (ج.م)"><input name="overtime" type="number" min="0" step="0.01" defaultValue="0" /></Field>
+      <Field label="مكافأة (ج.م)"><input name="bonus" type="number" min="0" step="0.01" defaultValue="0" /></Field>
+      <Field label="خصومات (ج.م)"><input name="deduction" type="number" min="0" step="0.01" defaultValue="0" /></Field>
+      <Field label="سلفة مستقطعة (ج.م)"><input name="advance" type="number" min="0" step="0.01" defaultValue="0" /></Field>
+      <Field label="طريقة الصرف"><select name="paymentMethod" defaultValue="BANK_TRANSFER"><option value="BANK_TRANSFER">تحويل بنكي</option><option value="WALLET">محفظة إلكترونية</option><option value="CASH" disabled={!shift}>نقدًا من الدرج{shift ? "" : " — لا توجد وردية مفتوحة"}</option></select></Field>
+      <Field label="ملاحظة"><input name="note" maxLength={250} placeholder="اختياري" /></Field>
+      <div className="modal-actions"><button className="primary" disabled={busy || employees.length === 0}>{busy ? "جارٍ الحفظ…" : "تسجيل الراتب"}</button></div>
+    </form>
+    {message && <p className="hint">{message}</p>}
+    <div className="table-wrap"><table><thead><tr><th>الموظف</th><th>الصافي</th><th>طريقة الصرف</th><th>التاريخ</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{row.employeeName}</td><td>{formatMoney(row.netMinor)}</td><td>{row.paymentMethod}</td><td dir="ltr">{row.paidOn}</td></tr>)}{!rows.length && <tr><td colSpan={4} className="empty">لا توجد رواتب مسجلة لهذا الشهر.</td></tr>}</tbody></table></div>
+  </section>;
 }
 
 function PageHead({
@@ -7771,8 +10983,9 @@ function Workspace({
   const [shift, setShift] = useState<Shift | null>(null);
   const [online, setOnline] = useState(true);
   const [pendingBarcode, setPendingBarcode] = useState("");
-  const [resumeReceiptAfterProduct, setResumeReceiptAfterProduct] =
-    useState(false);
+  const [resumeAfterProduct, setResumeAfterProduct] =
+    useState<"pos" | "inventory" | null>(null);
+  const [pendingProductEditQuery, setPendingProductEditQuery] = useState("");
   const [storeName, setStoreName] = useState("الشيماء");
   const [receiptBranding, setReceiptBranding] =
     useState<ReceiptBranding | undefined>(undefined);
@@ -7802,7 +11015,7 @@ function Workspace({
   const loadCatalogProducts = useCallback(async (query = "", cursor?: string): Promise<CatalogPage> => {
     const result = await invoke<CatalogPage>({
       operation: "catalog.list",
-      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 60 },
+      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 200 },
     });
     return result;
   }, []);
@@ -7842,16 +11055,17 @@ function Workspace({
       const barcode = String((event as CustomEvent<string>).detail || "");
       if (!barcode) return;
       setPendingBarcode(barcode);
-      setResumeReceiptAfterProduct(true);
+      setResumeAfterProduct("inventory");
       setScreen("products");
     }
     function receiptProductCreated(event: Event): void {
-      if (!resumeReceiptAfterProduct) return;
+      if (!resumeAfterProduct) return;
       const barcode = String((event as CustomEvent<string>).detail || "");
       if (!barcode) return;
-      localStorage.setItem(PENDING_RECEIPT_SCAN_KEY, barcode);
-      setResumeReceiptAfterProduct(false);
-      setScreen("inventory");
+      if (resumeAfterProduct === "inventory")
+        localStorage.setItem(PENDING_RECEIPT_SCAN_KEY, barcode);
+      setResumeAfterProduct(null);
+      setScreen(resumeAfterProduct);
     }
     window.addEventListener("nabta:purchase-scan", receiveScan);
     window.addEventListener("nabta:receipt-unknown-barcode", receiveUnknown);
@@ -7870,7 +11084,13 @@ function Workspace({
         receiptProductCreated,
       );
     };
-  }, [resumeReceiptAfterProduct]);
+  }, [resumeAfterProduct]);
+  const requestProductEdit = useCallback((query: string) => {
+    const normalized = query.trim();
+    if (!normalized) return;
+    setPendingProductEditQuery(normalized);
+    setScreen("products");
+  }, []);
   useEffect(() => {
     void Promise.all([
       refreshProducts(),
@@ -7914,7 +11134,68 @@ function Workspace({
     }
   }
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
+  const [scannedProductQuery, setScannedProductQuery] = useState("");
   const [clockNow, setClockNow] = useState(() => new Date());
+  useEffect(() => {
+    function routeBarcode(barcode: string): void {
+      const normalized = barcode.trim();
+      if (!normalized) return;
+      if (screen === "pos") {
+        window.dispatchEvent(
+          new CustomEvent("nabta:pos-barcode-scan", { detail: normalized }),
+        );
+        return;
+      }
+      if (screen === "inventory") {
+        window.dispatchEvent(
+          new CustomEvent("nabta:inventory-barcode-scan", { detail: normalized }),
+        );
+        return;
+      }
+      setGlobalSearchQuery(normalized);
+      setScannedProductQuery(normalized);
+      setScreen("products");
+    }
+
+    let buffer = "";
+    let startedAt = 0;
+    let lastKeyAt = 0;
+    function handleHid(event: KeyboardEvent): void {
+      if (event.key === "Enter" || event.key === "Tab") {
+        if (buffer.length >= 4 && Date.now() - startedAt <= 1_500) {
+          const barcode = buffer;
+          buffer = "";
+          startedAt = 0;
+          lastKeyAt = 0;
+          event.preventDefault();
+          routeBarcode(barcode);
+        }
+        return;
+      }
+      if (
+        event.key.length !== 1 ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey
+      )
+        return;
+      const now = Date.now();
+      if (!startedAt || now - lastKeyAt > 120) {
+        buffer = event.key;
+        startedAt = now;
+      } else buffer += event.key;
+      lastKeyAt = now;
+    }
+
+    const unsubscribe = window.nabta.onBarcodeScanned((scan) => {
+      routeBarcode(scan.barcode);
+    });
+    window.addEventListener("keydown", handleHid, true);
+    return () => {
+      unsubscribe();
+      window.removeEventListener("keydown", handleHid, true);
+    };
+  }, [screen]);
   useEffect(() => {
     const timer = setInterval(() => setClockNow(new Date()), 1000);
     return () => clearInterval(timer);
@@ -7953,6 +11234,9 @@ function Workspace({
   }, [currentUser.role]);
 
   const NAV_ICONS: Record<Screen, ReactNode> = {
+    "weight-labels": (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 7h16l2 13H2L4 7Z" /><path d="M8 7a4 4 0 0 1 8 0" /><path d="M12 11v5" /><path d="M10 14h4" /></svg>
+    ),
     pos: (
       <svg
         viewBox="0 0 24 24"
@@ -8097,6 +11381,7 @@ function Workspace({
     { id: "pos", label: "الرئيسية", testName: "الرئيسية نقطة البيع" },
     { id: "invoices", label: "المبيعات", testName: "المبيعات الفواتير" },
     { id: "products", label: "المنتجات", testName: "المنتجات الأصناف" },
+    { id: "weight-labels", label: "حاسبة الوزن", testName: "حاسبة الوزن والملصقات" },
     { id: "inventory", label: "المخزون", testName: "المخزون" },
     ...(user.permissions.includes("PARTNER_MANAGE")
       ? [{ id: "partners" as Screen, label: "العملاء", testName: "العملاء العلاقات" }]
@@ -8219,7 +11504,16 @@ function Workspace({
                 setGlobalSearchQuery(e.target.value);
                 if (screen !== "pos" && screen !== "products") setScreen("pos");
               }}
-              placeholder="ابحث عن منتج أو رقم باركود ..."
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setGlobalSearchQuery("");
+                } else if (event.key === "F3") {
+                  event.preventDefault();
+                  requestProductEdit(globalSearchQuery);
+                }
+              }}
+              placeholder="ابحث عن منتج أو باركود… Esc لمسح | F3 لتعديل"
               aria-label="ابحث عن منتج أو رقم باركود"
             />
           </div>
@@ -8316,8 +11610,8 @@ function Workspace({
 
             <ThemeToggle theme={theme} onThemeChange={onThemeChange} />
 
-            <span className={online ? "online" : "disconnected"}>
-              {online ? "النظام يعمل" : "النظام غير جاهز"}
+            <span className={online ? "online" : "disconnected"} title={online ? "البيع والبحث يعتمدان على بيانات هذا الجهاز ولا يتوقفان عند فقد الإنترنت." : "خادم البيانات المحلي غير جاهز الآن."}>
+              {online ? "البيانات المحلية جاهزة" : "البيانات المحلية غير جاهزة"}
             </span>
           </div>
         </header>
@@ -8333,10 +11627,8 @@ function Workspace({
               storeName={storeName}
               branding={receiptBranding}
               onOpenShift={() => setScreen("shift")}
-              onUnregisteredBarcode={(barcode) => {
-                setPendingBarcode(barcode);
-                setScreen("products");
-              }}
+              canViewCost={user.permissions.includes("VIEW_COST")}
+              onEditProductByQuery={requestProductEdit}
               globalSearch={globalSearchQuery}
               posMetrics={posMetrics}
               refreshPosMetrics={refreshPosMetrics}
@@ -8351,13 +11643,23 @@ function Workspace({
               clearSuggestedBarcode={() => setPendingBarcode("")}
               canViewCost={user.permissions.includes("VIEW_COST")}
               canExport={user.permissions.includes("EXPORT")}
+              editProductQuery={pendingProductEditQuery}
+              clearEditProductQuery={() => setPendingProductEditQuery("")}
+              scannedProductQuery={scannedProductQuery}
+              clearScannedProductQuery={() => setScannedProductQuery("")}
+              onEditProductByQuery={requestProductEdit}
             />
           )}
+          {screen === "weight-labels" && <WeightLabelsScreen products={products} />}
           {screen === "inventory" && (
             <InventoryScreen
               products={products}
               shift={shift}
               refresh={refreshProducts}
+              storeName={storeName}
+              receiptBranding={receiptBranding}
+              canViewCost={user.permissions.includes("VIEW_COST")}
+              onEditProductByQuery={requestProductEdit}
             />
           )}
           {screen === "reorder" && <ReorderListScreen storeName={storeName} />}
@@ -8374,7 +11676,7 @@ function Workspace({
           {screen === "expenses" && (
             <ExpensesScreen shift={shift} refresh={refreshShift} />
           )}
-          {screen === "reports" && <ReportsScreen storeName={storeName} />}
+          {screen === "reports" && <ReportsScreen storeName={storeName} shift={shift} />}
           {screen === "shift" && (
             <ShiftScreen
               shift={shift}
@@ -8387,6 +11689,7 @@ function Workspace({
           {screen === "settings" && (
             <SettingsScreen
               currentUser={currentUser}
+              terminalId={config.terminalId}
               onUserUpdated={setCurrentUser}
               taxSettings={taxSettings}
               onTaxSettingsChange={updateTaxSettings}
@@ -8428,7 +11731,7 @@ export function LegacyWorkspace({
   const loadCatalogProducts = useCallback(async (query = "", cursor?: string): Promise<CatalogPage> => {
     const result = await invoke<CatalogPage>({
       operation: "catalog.list",
-      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 60 },
+      payload: { ...(query ? { query } : {}), ...(cursor ? { cursor } : {}), limit: 200 },
     });
     return result;
   }, []);
@@ -8580,7 +11883,6 @@ export function App(): ReactNode {
   const [theme, setTheme] = useState<ThemeMode>(savedTheme);
   const [config, setConfig] = useState<Config>({
     serverUrl: "http://127.0.0.1:17443",
-    terminalId: "00000000-0000-4000-8000-000000000003",
     certificateFingerprint: "",
   });
   const [bootState, setBootState] = useState<"starting" | "ready" | "error">(
@@ -8588,6 +11890,18 @@ export function App(): ReactNode {
   );
   const [bootError, setBootError] = useState("");
   const [bootAttempt, setBootAttempt] = useState(0);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const restoreBackupAndStart = useCallback(async () => {
+    setRecoveryBusy(true);
+    try {
+      const result = await invoke<{ cancelled: boolean; restored?: boolean }>({ operation: "host.recovery.restore" });
+      if (result.restored) setBootAttempt((value) => value + 1);
+    } catch (cause) {
+      setBootError(errorMessage(cause));
+    } finally {
+      setRecoveryBusy(false);
+    }
+  }, []);
   useEffect(() => {
     void invoke<Config>({ operation: "config.get" })
       .then(setConfig)
@@ -8650,9 +11964,18 @@ export function App(): ReactNode {
           <button
             type="button"
             onClick={() => setBootAttempt((value) => value + 1)}
+            disabled={recoveryBusy}
           >
             إعادة المحاولة
           </button>
+          <button
+            type="button"
+            onClick={() => void restoreBackupAndStart()}
+            disabled={recoveryBusy}
+          >
+            {recoveryBusy ? "جارٍ الاستعادة…" : "استعادة نسخة احتياطية وتشغيل"}
+          </button>
+          <p className="muted">يتم فحص النسخة أولًا، والاحتفاظ بالبيانات الحالية في مجلد منفصل.</p>
         </div>
       </Centered>
     );

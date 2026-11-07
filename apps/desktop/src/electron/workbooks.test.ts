@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import ExcelJS, { type Workbook } from "exceljs";
-import { createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createShiftsWorkbook } from "./workbooks.js";
+import { createComprehensiveReportWorkbook, createInventoryPeriodicWorkbook, createInventoryWorkbook, createProductsWorkbook, createProductSyncWorkbook, createShiftsWorkbook, productSyncWorkbookToCsv } from "./workbooks.js";
 
 const { Workbook: WorkbookConstructor } = ExcelJS;
 
@@ -26,6 +26,44 @@ describe("Excel exports", () => {
     expect(sheet?.getCell("E5").value).toBe(1.25);
     expect(sheet?.getCell("F5").value).toBe(25);
     expect(sheet?.getCell("G5").value).toBe(30);
+  });
+
+  it("creates an editable product workbook with validated lists and converts it to import CSV", async () => {
+    const bytes = await createProductSyncWorkbook({
+      storeName: "نبتة", generatedAt: "2026-10-21T00:00:00.000Z", mode: "INTERNAL",
+      items: [{ nameAr: "أرز", category: "بقالة", barcode: "6220000000001", unitKind: "PIECE", availableQtyMilli: 27_000, wholesalePriceMinor: 1_500, priceMinor: 2_500, purchasePackSize: 12, cartonPriceMinor: 40_000, cartonContentsUnit: "BAG", barcodeMappings: [{ barcode: "6220000000001", saleUnit: "UNIT" }, { barcode: "6220000000018", saleUnit: "CARTON" }] }],
+    });
+    const workbook = await openWorkbook(bytes);
+    const sheet = workbook.getWorksheet("تعديل الأصناف");
+    expect(sheet?.getCell("A4").value).toBe("اسم الصنف");
+    expect(sheet?.getCell("C5").value).toBe("كرتونة");
+    expect(sheet?.getCell("F5").value).toBe("6220000000018");
+    expect(sheet?.getCell("G5").value).toBe(27);
+    expect(sheet?.getCell("H5").value).toBe(2);
+    expect(sheet?.getCell("I5").value).toBe(3);
+    expect(sheet?.getCell("J5").value).toBe(12);
+    expect(Object.keys(sheet?.dataValidations.model ?? {}).length).toBeGreaterThan(0);
+    expect(sheet).toBeDefined();
+    const editable = sheet!;
+    editable.getCell("A6").value = "عدس جديد";
+    editable.getCell("B6").value = "بقالة";
+    editable.getCell("C6").value = "كرتونة";
+    editable.getCell("D6").value = "6220000000002";
+    editable.getCell("F6").value = "6220000000019";
+    editable.getCell("G6").value = 27;
+    editable.getCell("H6").value = 2;
+    editable.getCell("I6").value = 3;
+    editable.getCell("J6").value = 12;
+    editable.getCell("L6").value = "كيس";
+    editable.getCell("M6").value = 14.5;
+    editable.getCell("O6").value = 180;
+    editable.getCell("P6").value = 9.25;
+    editable.getCell("R6").value = 4;
+    editable.getCell("S6").value = "صنف كرتونة جديد";
+    const edited = Buffer.from(await workbook.xlsx.writeBuffer());
+    const csv = await productSyncWorkbookToCsv(edited);
+    expect(csv).toContain("أرز,بقالة,PIECE,2500,6220000000001,0,27000,1500,1500,27000,KILOGRAM,,12,40000,BAG,,,,PACKAGE,,6220000000018,2026-10-21T00:00:00.000Z,0");
+    expect(csv).toContain("عدس جديد,بقالة,PIECE,1450,6220000000002,4000,27000,925,925,27000,KILOGRAM,صنف كرتونة جديد,12,18000,BAG,,,,PACKAGE,,6220000000019,,");
   });
 
   it("creates an Excel inventory file that can be opened without repair", async () => {
@@ -102,5 +140,24 @@ describe("Excel exports", () => {
     expect(sheet?.getCell("F5").value).toBe(100);
     expect(sheet?.getCell("I5").value).toBe(-5);
     expect(sheet?.getCell("J5").value).toBe(12);
+  });
+
+  it("creates a comprehensive report with analytical sheets and numeric totals", async () => {
+    const bytes = await createComprehensiveReportWorkbook({
+      storeName: "نبتة", generatedAt: "2026-10-18T00:00:00.000Z", period: { from: "2026-10-01", to: "2026-10-31", timezone: "Africa/Cairo" },
+      summary: { grossSalesMinor: 12_000, discountsMinor: 500, returnsMinor: 1_000, netSalesMinor: 10_500, netCogsMinor: 6_000, grossProfitMinor: 4_500, estimatedNetProfitMinor: 3_800, expensesMinor: 500, payrollMinor: 0, operatingExpensesMinor: 500, shopConsumptionMinor: 0, damagedLossMinor: 200, invoiceCount: 7 },
+      dailySales: [{ date: "2026-10-01", netSalesMinor: 10_500, grossProfitMinor: 4_500, invoiceCount: 7 }],
+      paymentMethods: [{ method: "CASH", amountMinor: 10_500, transactionCount: 7 }],
+      topProducts: [{ nameAr: "أرز", category: "بقالة", netQtyMilli: 2_000, netSalesMinor: 10_500, grossProfitMinor: 4_500 }],
+      categories: [{ category: "بقالة", netSalesMinor: 10_500, grossProfitMinor: 4_500 }],
+      expenseCategories: [], shopConsumptions: [], payroll: [],
+      inventory: { inventoryValueMinor: 20_000, lowStockCount: 2, outOfStockCount: 1, activeProductCount: 15 }, insights: ["متوسط الفاتورة: 1500 قرش."],
+    });
+    const workbook = await openWorkbook(bytes);
+    expect(workbook.getWorksheet("لوحة التقرير")?.getCell("A4").value).toBe("المؤشر");
+    expect(workbook.getWorksheet("لوحة التقرير")?.getCell("B5").value).toBe(120);
+    expect(workbook.getWorksheet("اتجاه المبيعات")?.getCell("A5").value).toBe("2026-10-01");
+    expect(workbook.getWorksheet("وسائل الدفع")?.getCell("A5").value).toBe("CASH");
+    expect(workbook.getWorksheet("أفضل الأصناف")?.getCell("A5").value).toBe("أرز");
   });
 });

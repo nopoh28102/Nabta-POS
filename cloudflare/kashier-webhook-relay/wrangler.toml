@@ -1,0 +1,8 @@
+name = "nabta-kashier-webhook-relay"
+main = "src/index.ts"
+compatibility_date = "2026-10-18"
+
+[[d1_databases]]
+binding = "EVENTS"
+database_name = "nabta-kashier-events"
+database_id = "e8d9b414-afa5-45eb-bd39-8036c34eed5b"

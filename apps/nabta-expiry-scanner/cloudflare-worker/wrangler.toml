@@ -1,0 +1,6 @@
+name = "nabta-expiry-scanner-relay"
+main = "src/index.ts"
+compatibility_date = "2026-10-26"
+
+# Set NABTA_MOBILE_ORIGIN as a Cloudflare Worker secret. It is the private
+# tunnel URL for Nabta's server and must never be embedded in the APK.

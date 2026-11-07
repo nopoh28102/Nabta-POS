@@ -10,15 +10,19 @@ import { canonicalJson, sha256 } from "../security.js";
 
 interface QuoteLine {
   lineId: string;
-  productId: string;
+  productId?: string;
+  manualItem?: boolean;
   nameAr: string;
   unitKind: "PIECE" | "WEIGHT";
+  saleUnit: "UNIT" | "PACKAGE" | "CARTON";
+  packageSize?: number;
   qtyMilli: number;
   unitPriceMinor: number;
   grossMinor: number;
   discountMinor: number;
   netMinor: number;
-  stockVersion: number;
+  stockVersion?: number;
+  weightedLabelBarcode?: string;
 }
 
 interface QuoteRow {
@@ -37,9 +41,14 @@ interface QuoteRow {
 interface BalanceRow {
   product_id: string;
   qty_milli: number;
+  available_qty_milli: number;
   inventory_value_minor: number;
   version: number;
   price_minor: number;
+  carton_price_minor: number | null;
+  purchase_pack_size: number;
+  retail_package_price_minor: number | null;
+  retail_package_size: number | null;
   active: boolean;
   prevent_expired_sales: boolean;
   warehouse_id: string;
@@ -58,6 +67,23 @@ interface IdempotencyRow {
   response_status: number | null;
   response_body: unknown | null;
 }
+
+interface PaymentIntentRow {
+  id: string;
+  quote_id: string;
+  terminal_id: string;
+  shift_id: string;
+  user_id: string;
+  method: string;
+  status: string;
+  amount_minor: number;
+  sale_id: string | null;
+}
+
+const electronicMethods = new Set([
+  "KASHIER_POS_CARD", "FAWRY_REFERENCE", "ONLINE_CARD", "MOBILE_WALLET", "PAYMENT_LINK",
+  "INSTAPAY_QR", "INSTAPAY_R2P", "BANK_INSTALLMENTS", "BNPL", "MEEZA_CARD",
+]);
 
 export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
   app.post("/v1/sales", async (request, reply) => {
@@ -91,6 +117,23 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
       if (!shift.rows[0]) throw new ApiError(409, "SHIFT_CLOSED", "الوردية مغلقة أو لا تخص هذا الكاشير");
 
       const paymentTotal = body.payments.reduce((sum, payment) => sum + payment.amountMinor, 0);
+      const requestedElectronic = body.payments.filter((payment) => electronicMethods.has(payment.method));
+      let confirmedIntent: PaymentIntentRow | null = null;
+      if (requestedElectronic.length > 0) {
+        if (!body.paymentIntentId) throw new ApiError(422, "PAYMENT_INTENT_REQUIRED", "لا يمكن تسجيل دفع إلكتروني من دون تأكيد Kashier موثوق");
+        const intent = await client.query<PaymentIntentRow>(`SELECT id, quote_id, terminal_id, shift_id, user_id, method, status, amount_minor, sale_id
+          FROM payment_intents WHERE id = $1 FOR UPDATE`, [body.paymentIntentId]);
+        confirmedIntent = intent.rows[0] ?? null;
+        if (!confirmedIntent || confirmedIntent.quote_id !== quote.id || confirmedIntent.terminal_id !== auth.terminalId || confirmedIntent.shift_id !== body.shiftId || confirmedIntent.user_id !== auth.userId) {
+          throw new ApiError(409, "PAYMENT_INTENT_MISMATCH", "طلب الدفع لا يخص هذه الفاتورة أو نقطة البيع");
+        }
+        if (confirmedIntent.status !== "SUCCEEDED" || confirmedIntent.sale_id) throw new ApiError(409, "PAYMENT_NOT_CONFIRMED", "لم يصل تأكيد موثوق لنجاح الدفع الإلكتروني بعد");
+        if (requestedElectronic.length !== 1 || requestedElectronic[0]!.method !== confirmedIntent.method || requestedElectronic[0]!.amountMinor !== confirmedIntent.amount_minor) {
+          throw new ApiError(422, "PAYMENT_INTENT_ALLOCATION_MISMATCH", "توزيع الدفع لا يطابق العملية الإلكترونية المؤكدة");
+        }
+      } else if (body.paymentIntentId) {
+        throw new ApiError(422, "PAYMENT_INTENT_NOT_USED", "لا تستخدم طلب دفع إلكتروني مع وسيلة دفع مختلفة");
+      }
       if (paymentTotal !== quote.total_minor) throw new ApiError(422, "PAYMENT_MISMATCH", "مجموع وسائل الدفع لا يساوي إجمالي الفاتورة");
       const branchSettings = await client.query<{ credit_sales_enabled: boolean }>(`
         SELECT b.credit_sales_enabled FROM terminals t JOIN branches b ON b.id = t.branch_id WHERE t.id = $1
@@ -114,9 +157,23 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
         }
       }
 
-      const productIds = quote.lines_json.map((line) => line.productId).sort();
+      const productLines = quote.lines_json.filter((line): line is QuoteLine & { productId: string; stockVersion: number } => Boolean(line.productId) && !line.manualItem);
+      const terminal = await client.query<{ branch_id: string; warehouse_id: string }>("SELECT branch_id, warehouse_id FROM terminals WHERE id = $1", [auth.terminalId]);
+      if (!terminal.rows[0]) throw new ApiError(409, "TERMINAL_INVALID", "نقطة البيع غير صالحة");
+      const productIds = [...new Set(productLines.map((line) => line.productId))].sort();
       const balances = await client.query<BalanceRow>(`
-        SELECT sb.product_id, sb.qty_milli, sb.inventory_value_minor, sb.version, p.price_minor, p.active,
+        SELECT sb.product_id, sb.qty_milli,
+               sb.qty_milli - COALESCE((
+                 SELECT SUM(pr.qty_milli) FROM payment_reservations pr
+                 WHERE pr.warehouse_id = sb.warehouse_id AND pr.product_id = sb.product_id
+                   AND pr.released_at IS NULL AND pr.expires_at > now()
+                   AND ($3::uuid IS NULL OR pr.payment_intent_id <> $3::uuid)
+               ), 0)::bigint - COALESCE((
+                 SELECT SUM(cor.qty_milli) FROM customer_order_reservations cor
+                 WHERE cor.warehouse_id = sb.warehouse_id AND cor.product_id = sb.product_id
+                   AND cor.released_at IS NULL
+               ), 0)::bigint AS available_qty_milli,
+               sb.inventory_value_minor, sb.version, p.price_minor, p.carton_price_minor, p.purchase_pack_size, p.retail_package_price_minor, p.retail_package_size, p.active,
                b.prevent_expired_sales, sb.warehouse_id, b.id AS branch_id
         FROM stock_balances sb
         JOIN products p ON p.id = sb.product_id
@@ -126,34 +183,78 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
         WHERE t.id = $1 AND sb.product_id = ANY($2::uuid[])
         ORDER BY sb.product_id
         FOR UPDATE OF sb
-      `, [auth.terminalId, productIds]);
+      `, [auth.terminalId, productIds, confirmedIntent?.id ?? null]);
       if (balances.rows.length !== productIds.length) throw new ApiError(409, "PRODUCT_NOT_FOUND", "أحد الأصناف لم يعد متاحًا");
       const balanceByProduct = new Map(balances.rows.map((row) => [row.product_id, row]));
+      const requestedQtyByProduct = new Map<string, number>();
+      for (const line of productLines) requestedQtyByProduct.set(line.productId, (requestedQtyByProduct.get(line.productId) ?? 0) + line.qtyMilli);
+      for (const [productId, qtyMilli] of requestedQtyByProduct) {
+        const balance = balanceByProduct.get(productId)!;
+        if (balance.available_qty_milli < qtyMilli) throw new ApiError(409, "INSUFFICIENT_STOCK", "Insufficient stock for the combined weighed labels.", { productId, availableQtyMilli: balance.available_qty_milli });
+      }
 
-      for (const line of quote.lines_json) {
+      for (const line of productLines) {
         const balance = balanceByProduct.get(line.productId)!;
+        const catalogUnitPriceMinor = balance.price_minor;
+        if (line.saleUnit === "CARTON") {
+          const cartonQtyMilli = balance.purchase_pack_size * 1000;
+          if (!balance.carton_price_minor || cartonQtyMilli <= 0 || line.packageSize !== balance.purchase_pack_size || line.qtyMilli % cartonQtyMilli !== 0) {
+            throw new ApiError(409, "CARTON_CHANGED", `Retail carton settings changed for ${line.nameAr}`);
+          }
+          balance.price_minor = balance.carton_price_minor;
+        } else if (line.saleUnit === "PACKAGE") {
+          const packageQtyMilli = (balance.retail_package_size ?? 0) * 1000;
+          if (!balance.retail_package_price_minor || packageQtyMilli <= 0 || line.packageSize !== balance.retail_package_size || line.qtyMilli % packageQtyMilli !== 0) {
+            throw new ApiError(409, "PACKAGE_CHANGED", `Retail package settings changed for ${line.nameAr}`);
+          }
+          // Reuse the existing immutable price check below against the package price.
+          balance.price_minor = balance.retail_package_price_minor;
+        }
         if (balance.price_minor <= 0 || line.unitPriceMinor <= 0) throw new ApiError(422, "PRICE_NOT_SET", `\u062d\u062f\u062f \u0633\u0639\u0631 \u0628\u064a\u0639 \u0644\u0644\u0635\u0646\u0641 ${line.nameAr} \u0642\u0628\u0644 \u0625\u062a\u0645\u0627\u0645 \u0627\u0644\u0628\u064a\u0639`);
         if (!balance.active || balance.price_minor !== line.unitPriceMinor) throw new ApiError(409, "PRICE_CHANGED", `تغير سعر الصنف ${line.nameAr}؛ راجع السلة`);
         if (balance.version !== line.stockVersion) throw new ApiError(409, "STOCK_CHANGED", `تغير مخزون الصنف ${line.nameAr}؛ راجع السلة`);
-        if (balance.qty_milli < line.qtyMilli) throw new ApiError(409, "INSUFFICIENT_STOCK", `المخزون غير كافٍ: ${line.nameAr}`, { productId: line.productId, availableQtyMilli: balance.qty_milli });
+        if (balance.available_qty_milli < line.qtyMilli) throw new ApiError(409, "INSUFFICIENT_STOCK", `المخزون غير كافٍ: ${line.nameAr}`, { productId: line.productId, availableQtyMilli: balance.available_qty_milli });
+        balance.price_minor = catalogUnitPriceMinor;
       }
 
-      const firstBalance = balances.rows[0]!;
-      const counter = await client.query<{ invoice_counter: number }>("UPDATE branches SET invoice_counter = invoice_counter + 1 WHERE id = $1 RETURNING invoice_counter", [firstBalance.branch_id]);
+      const counter = await client.query<{ invoice_counter: number }>("UPDATE branches SET invoice_counter = invoice_counter + 1 WHERE id = $1 RETURNING invoice_counter", [terminal.rows[0].branch_id]);
       const invoiceNo = `INV-${new Date().getUTCFullYear()}-${String(counter.rows[0]!.invoice_counter).padStart(8, "0")}`;
       const sale = await client.query<{ id: string; posted_at: Date }>(`
         INSERT INTO sales(branch_id, warehouse_id, terminal_id, shift_id, user_id, customer_id, quote_id, invoice_no,
           subtotal_minor, discount_minor, total_minor, cost_minor)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0) RETURNING id, posted_at
-      `, [firstBalance.branch_id, firstBalance.warehouse_id, auth.terminalId, body.shiftId, auth.userId, body.customerId ?? null, quote.id, invoiceNo, quote.subtotal_minor, quote.discount_minor, quote.total_minor]);
+      `, [terminal.rows[0].branch_id, terminal.rows[0].warehouse_id, auth.terminalId, body.shiftId, auth.userId, body.customerId ?? null, quote.id, invoiceNo, quote.subtotal_minor, quote.discount_minor, quote.total_minor]);
       const saleId = sale.rows[0]!.id;
       if (process.env.NODE_ENV === "test" && request.headers["x-nabta-test-fail"] === "after-sale-header") {
         throw new Error("injected rollback after sale header");
       }
       let totalCostMinor = 0;
+      const labelCodes = productLines.flatMap((line) => line.weightedLabelBarcode ? [line.weightedLabelBarcode] : []);
+      const labelsByBarcode = new Map<string, { barcode: string; product_id: string; qty_milli: number; unit_price_minor: number; used_sale_id: string | null }>();
+      if (labelCodes.length > 0) {
+        const labels = await client.query<{ barcode: string; product_id: string; qty_milli: number; unit_price_minor: number; used_sale_id: string | null }>(
+          "SELECT barcode, product_id, qty_milli, unit_price_minor, used_sale_id FROM weighted_product_labels WHERE barcode = ANY($1::text[]) FOR UPDATE", [labelCodes],
+        );
+        if (labels.rows.length !== labelCodes.length) throw new ApiError(409, "WEIGHT_LABEL_INVALID", "Weighted label is unavailable for sale.");
+        for (const label of labels.rows) labelsByBarcode.set(label.barcode, label);
+      }
 
       for (const line of quote.lines_json) {
+        if (!line.productId || line.manualItem) {
+          await client.query(`
+            INSERT INTO sale_lines(id, sale_id, product_id, name_snapshot, unit_kind_snapshot, sale_unit_snapshot, sale_package_size_snapshot, qty_milli,
+              unit_price_minor, gross_minor, discount_minor, net_minor, cost_minor)
+            VALUES ($1, $2, NULL, $3, 'PIECE', 'UNIT', NULL, $4, $5, $6, $7, $8, 0)
+          `, [line.lineId, saleId, line.nameAr, line.qtyMilli, line.unitPriceMinor, line.grossMinor, line.discountMinor, line.netMinor]);
+          continue;
+        }
         const balance = balanceByProduct.get(line.productId)!;
+        if (line.weightedLabelBarcode) {
+          const label = labelsByBarcode.get(line.weightedLabelBarcode);
+          if (!label || label.used_sale_id || label.product_id !== line.productId || label.qty_milli !== line.qtyMilli || label.unit_price_minor !== line.unitPriceMinor) throw new ApiError(409, "WEIGHT_LABEL_INVALID", "Weighted label was already used or changed.");
+          // A label carries the approved price snapshot; an intervening catalog price change does not invalidate it.
+          balance.price_minor = line.unitPriceMinor;
+        }
         const costMinor = Number(calculateInventoryIssueValue(BigInt(balance.inventory_value_minor), BigInt(balance.qty_milli), BigInt(line.qtyMilli)));
         totalCostMinor += costMinor;
         let remaining = line.qtyMilli;
@@ -177,10 +278,11 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
           throw new ApiError(409, code, code === "STOCK_EXPIRED" ? `المتاح من ${line.nameAr} منتهي الصلاحية وفق سياسة الفرع` : `المخزون غير كافٍ: ${line.nameAr}`);
         }
         await client.query(`
-          INSERT INTO sale_lines(id, sale_id, product_id, name_snapshot, unit_kind_snapshot, qty_milli,
+          INSERT INTO sale_lines(id, sale_id, product_id, name_snapshot, unit_kind_snapshot, sale_unit_snapshot, sale_package_size_snapshot, qty_milli,
             unit_price_minor, gross_minor, discount_minor, net_minor, cost_minor)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        `, [line.lineId, saleId, line.productId, line.nameAr, line.unitKind, line.qtyMilli, line.unitPriceMinor, line.grossMinor, line.discountMinor, line.netMinor, costMinor]);
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        `, [line.lineId, saleId, line.productId, line.nameAr, line.unitKind, line.saleUnit, line.packageSize ?? null, line.qtyMilli, line.unitPriceMinor, line.grossMinor, line.discountMinor, line.netMinor, costMinor]);
+        if (line.weightedLabelBarcode) await client.query("UPDATE weighted_product_labels SET used_sale_id = $2, used_at = now() WHERE barcode = $1 AND used_sale_id IS NULL", [line.weightedLabelBarcode, saleId]);
         for (const allocation of allocations) {
           await client.query("UPDATE stock_lots SET qty_milli = qty_milli - $2 WHERE id = $1", [allocation.lotId, allocation.qtyMilli]);
           await client.query("INSERT INTO sale_lot_allocations(sale_line_id, lot_id, qty_milli) VALUES ($1, $2, $3)", [line.lineId, allocation.lotId, allocation.qtyMilli]);
@@ -188,6 +290,8 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
         const newQty = balance.qty_milli - line.qtyMilli;
         const newValue = newQty === 0 ? 0 : balance.inventory_value_minor - costMinor;
         await client.query("UPDATE stock_balances SET qty_milli = $3, inventory_value_minor = $4, version = version + 1, updated_at = now() WHERE warehouse_id = $1 AND product_id = $2", [balance.warehouse_id, line.productId, newQty, newValue]);
+        balance.qty_milli = newQty;
+        balance.inventory_value_minor = newValue;
         await client.query(`
           INSERT INTO stock_movements(warehouse_id, product_id, movement_type, qty_delta_milli, value_delta_minor,
             balance_qty_milli, balance_value_minor, reference_type, reference_id, actor_user_id)
@@ -203,8 +307,22 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
         await client.query(`INSERT INTO payments(sale_id, method, amount_minor, tendered_minor, change_minor, reference)
           VALUES ($1, $2, $3, $4, $5, $6)`, [saleId, payment.method, payment.amountMinor, tendered, change, payment.reference ?? null]);
       }
+      if (confirmedIntent) {
+        await client.query("UPDATE payment_intents SET sale_id = $2, updated_at = now() WHERE id = $1", [confirmedIntent.id, saleId]);
+        await client.query("UPDATE payment_reservations SET released_at = now() WHERE payment_intent_id = $1 AND released_at IS NULL", [confirmedIntent.id]);
+        await client.query("INSERT INTO payment_audit_log(payment_intent_id, actor_user_id, action, metadata) VALUES ($1, $2, 'PAYMENT_SALE_POSTED', $3::jsonb)", [confirmedIntent.id, auth.userId, JSON.stringify({ saleId, invoiceNo })]);
+      }
       if (creditMinor > 0 && body.customerId) {
         await client.query("INSERT INTO customer_ledger(customer_id, type, amount_minor, sale_id, reference_id, note, actor_user_id) VALUES ($1, 'SALE_CREDIT', $2, $3, $3, $4, $5)", [body.customerId, creditMinor, saleId, invoiceNo, auth.userId]);
+      }
+      // The receipt request is committed with the sale.  A retry with the same
+      // idempotency key cannot create a second paper receipt.
+      if (body.printOnPrimary) {
+        await client.query(`
+          INSERT INTO mobile_sale_receipt_print_jobs(sale_id, requested_by_user_id)
+          VALUES ($1, $2)
+          ON CONFLICT (sale_id) DO NOTHING
+        `, [saleId, auth.userId]);
       }
       await client.query("UPDATE quotes SET consumed_at = now() WHERE id = $1", [quote.id]);
       await audit(client, auth, "SALE_POSTED", "sale", saleId, { invoiceNo, totalMinor: quote.total_minor, costMinor: totalCostMinor, idempotencyKey: keyHeader });
@@ -233,7 +351,7 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
     const auth = requireAuth(request);
     const sale = await db.query(`
       SELECT s.id, s.invoice_no, s.subtotal_minor, s.discount_minor, s.total_minor, s.posted_at,
-             jsonb_agg(jsonb_build_object('id', sl.id, 'nameAr', sl.name_snapshot, 'unitKind', sl.unit_kind_snapshot,
+             jsonb_agg(jsonb_build_object('id', sl.id, 'nameAr', sl.name_snapshot, 'unitKind', sl.unit_kind_snapshot, 'saleUnit', sl.sale_unit_snapshot, 'packageSize', sl.sale_package_size_snapshot,
                'qtyMilli', sl.qty_milli, 'unitPriceMinor', sl.unit_price_minor, 'grossMinor', sl.gross_minor,
                'discountMinor', sl.discount_minor, 'netMinor', sl.net_minor) ORDER BY sl.id) AS lines
       FROM sales s JOIN sale_lines sl ON sl.sale_id = s.id
@@ -258,8 +376,12 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
         WHERE s.id = $1 AND t.id = $2 FOR SHARE
       `, [request.params.id, auth.terminalId]);
       if (!sale.rows[0]) throw new ApiError(404, "SALE_NOT_FOUND", "الفاتورة غير موجودة");
-      const lines = await client.query<QuoteLine>(`
-        SELECT product_id AS "productId", name_snapshot AS "nameAr", unit_kind_snapshot AS "unitKind", qty_milli AS "qtyMilli",
+      // Older sales predate package/carton support, so PostgreSQL correctly
+      // returns NULL for their optional package fields.  The desktop IPC
+      // contract uses optional fields (not nullable fields); normalize those
+      // legacy snapshots before a receipt is sent to the printer.
+      const lines = await client.query<QuoteLine & { saleUnit: QuoteLine["saleUnit"] | null; packageSize: number | null }>(`
+        SELECT product_id AS "productId", name_snapshot AS "nameAr", unit_kind_snapshot AS "unitKind", sale_unit_snapshot AS "saleUnit", sale_package_size_snapshot AS "packageSize", qty_milli AS "qtyMilli",
           unit_price_minor AS "unitPriceMinor", gross_minor AS "grossMinor", discount_minor AS "discountMinor",
           net_minor AS "netMinor", 0 AS "stockVersion", id AS "lineId"
         FROM sale_lines WHERE sale_id = $1 ORDER BY id
@@ -270,7 +392,11 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
       const row = sale.rows[0];
       return { saleId: row.id, invoiceNo: row.invoice_no, postedAt: row.posted_at.toISOString(), subtotalMinor: row.subtotal_minor,
         discountMinor: row.discount_minor, totalMinor: row.total_minor, paidMinor: row.paid_minor, changeMinor: row.change_minor,
-        lines: lines.rows.map(({ lineId: _lineId, ...line }) => line), reprintCount: count };
+        lines: lines.rows.map(({ lineId: _lineId, saleUnit, packageSize, ...line }) => ({
+          ...line,
+          ...(saleUnit ? { saleUnit } : {}),
+          ...(packageSize !== null && packageSize !== undefined ? { packageSize: Number(packageSize) } : {}),
+        })), reprintCount: count };
     });
   });
 
@@ -280,7 +406,7 @@ export function registerSaleRoutes(app: FastifyInstance, db: Database): void {
     if (!invoiceNo) throw new ApiError(400, "INVOICE_REQUIRED", "رقم الفاتورة مطلوب");
     const sale = await db.query(`
       SELECT s.id AS sale_id, s.invoice_no, s.subtotal_minor, s.discount_minor, s.total_minor, s.posted_at,
-             jsonb_agg(jsonb_build_object('id', sl.id, 'nameAr', sl.name_snapshot, 'unitKind', sl.unit_kind_snapshot,
+             jsonb_agg(jsonb_build_object('id', sl.id, 'nameAr', sl.name_snapshot, 'unitKind', sl.unit_kind_snapshot, 'saleUnit', sl.sale_unit_snapshot, 'packageSize', sl.sale_package_size_snapshot,
                'qtyMilli', sl.qty_milli, 'unitPriceMinor', sl.unit_price_minor, 'grossMinor', sl.gross_minor,
                'discountMinor', sl.discount_minor, 'netMinor', sl.net_minor,
                'returnedQtyMilli', sl.returned_qty_milli) ORDER BY sl.id) AS lines

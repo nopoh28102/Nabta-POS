@@ -1,6 +1,6 @@
 {
   "name": "@nabta/desktop",
-  "version": "0.1.64",
+  "version": "0.2.36",
   "private": true,
   "description": "نبتة — تطبيق نقاط بيع عربي محلي",
   "author": "Nabta POS",
@@ -14,7 +14,8 @@
     "dev": "vite",
     "build": "tsc -p tsconfig.electron.json && esbuild src/electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist-electron/preload.cjs && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
-    "package:win": "pnpm --filter @nabta/server... build && node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && electron-builder --win nsis --x64 --publish never",
+    "package:win": "pnpm --filter @nabta/server... build && node ../../scripts/generate-icon-assets.mjs && pnpm build && node ../../scripts/prepare-server-runtime.mjs && node ../../scripts/prepare-cloudflared-runtime.mjs && node ../../scripts/prepare-primary-bootstrap.mjs && electron-builder --win nsis --x64 --publish never && node ../../scripts/verify-windows-package.mjs release-0.2.36",
+    "package:primary:win": "set NABTA_PRIMARY_INSTALLER=1&& pnpm package:win",
     "release:win": "node -e \"console.error('Unsigned publication disabled: create a version tag and use the SignPath GitHub Actions release workflow.'); process.exit(1)\""
   },
   "dependencies": {
@@ -50,18 +51,20 @@
     "productName": "نبتة",
     "artifactName": "Nabta-POS-${version}-${arch}.${ext}",
     "directories": {
-      "output": "release"
+      "output": "release-0.2.36"
     },
     "icon": "build/icon.ico",
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
       "build/icon.png",
+      "server-runtime/**/*",
       "package.json"
     ],
     "asar": true,
     "asarUnpack": [
-      "node_modules/@serialport/**"
+      "node_modules/@serialport/**",
+      "server-runtime/**"
     ],
     "compression": "maximum",
     "win": {
@@ -86,11 +89,26 @@
     "extraResources": [
       {
         "from": "server-runtime",
-        "to": "server-runtime"
+        "to": "server-runtime",
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "build/drivers",
         "to": "drivers"
+      },
+      {
+        "from": "build/cloudflared",
+        "to": "cloudflared"
+      },
+      {
+        "from": "build/primary-bootstrap",
+        "to": "primary-bootstrap"
+      },
+      {
+        "from": "build/installer-tools",
+        "to": "installer-tools"
       }
     ],
     "electronFuses": {

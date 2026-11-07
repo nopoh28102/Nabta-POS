@@ -1,0 +1,7 @@
+name = "nabta-pos-terminal-relay"
+main = "src/index.ts"
+compatibility_date = "2026-10-25"
+
+# Secrets only; never put values here:
+# wrangler secret put NABTA_TERMINAL_ORIGIN
+# wrangler secret put NABTA_TERMINAL_RELAY_KEY

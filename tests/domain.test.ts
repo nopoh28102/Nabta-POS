@@ -9,6 +9,7 @@ import {
   matchesArabicGuessing,
   normalizeArabicSearch,
   roundHalfUp,
+  scoreArabicFuzzyMatch,
 } from "@nabta/domain";
 
 describe("money and quantity rules", () => {
@@ -81,6 +82,8 @@ describe("Arabic search", () => {
     expect(extractTokenVariants("الجبنة")).toContain("الجبنة");
     expect(extractTokenVariants("الجبنة")).toContain("جبنة");
     expect(extractTokenVariants("بالشوكولاتة")).toContain("شوكولاتة");
+    expect(extractTokenVariants("كيس")).toContain("اكياس");
+    expect(extractTokenVariants("ابيض")).toContain("بيضه");
   });
 
   it("matches products by middle word, last word, or out-of-order guessing", () => {
@@ -91,5 +94,15 @@ describe("Arabic search", () => {
     expect(matchesArabicGuessing(product, "متبلة شيبسي")).toBe(true);
     expect(matchesArabicGuessing(product, "50 عائلي")).toBe(true);
     expect(matchesArabicGuessing(product, "طماطم")).toBe(false);
+  });
+
+  it("matches common retail singular/plural and color wording", () => {
+    expect(matchesArabicGuessing("اكياس بيضة صغيرة", "كيس ابيض")).toBe(true);
+    expect(scoreArabicFuzzyMatch("اكياس بيضة صغيرة", "كيس ابيض")).toBeGreaterThanOrEqual(0.52);
+  });
+
+  it("scores a short Arabic typo but rejects an unrelated product", () => {
+    expect(scoreArabicFuzzyMatch("شيبسي بطاطس بالجبنة", "شبس")).toBeGreaterThanOrEqual(0.7);
+    expect(scoreArabicFuzzyMatch("شيبسي بطاطس بالجبنة", "طماطم")).toBe(0);
   });
 });

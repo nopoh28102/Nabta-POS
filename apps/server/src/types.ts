@@ -1,6 +1,6 @@
 import type { DbClient } from "./db.js";
 
-export type Role = "OWNER" | "MANAGER" | "CASHIER" | "STOCK_KEEPER";
+export type Role = "OWNER" | "MANAGER" | "CASHIER" | "STOCK_KEEPER" | "EXPIRY_CLERK";
 
 export interface AuthContext {
   sessionId: string;

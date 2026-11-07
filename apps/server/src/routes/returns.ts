@@ -10,7 +10,7 @@ import { canonicalJson, sha256 } from "../security.js";
 
 interface SaleLineRow {
   id: string;
-  product_id: string;
+  product_id: string | null;
   qty_milli: number;
   net_minor: number;
   cost_minor: number;
@@ -82,7 +82,9 @@ export function registerReturnRoutes(app: FastifyInstance, db: Database): void {
         await client.query(`UPDATE sale_lines SET returned_qty_milli = returned_qty_milli + $2,
           refunded_minor = refunded_minor + $3, returned_cost_minor = returned_cost_minor + $4 WHERE id = $1`,
         [item.saleLineId, item.qtyMilli, item.refundMinor, item.costMinor]);
-        if (item.condition === "RESTOCK") {
+        // A direct cashier item has no catalogue identity, therefore a refund
+        // returns money but never fabricates stock or a product record.
+        if (item.condition === "RESTOCK" && item.line.product_id) {
           const balance = await client.query<{ qty_milli: number; inventory_value_minor: number }>("SELECT qty_milli, inventory_value_minor FROM stock_balances WHERE warehouse_id = $1 AND product_id = $2 FOR UPDATE", [item.line.warehouse_id, item.line.product_id]);
           const newQty = balance.rows[0]!.qty_milli + item.qtyMilli;
           const newValue = balance.rows[0]!.inventory_value_minor + item.costMinor;
